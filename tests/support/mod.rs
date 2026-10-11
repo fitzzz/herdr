@@ -24,6 +24,24 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+/// Expected public identity includes the compile-time channel and build ID.
+/// Keep exact comparisons for stable, preview and downstream builds alike.
+pub fn expected_build_version() -> String {
+    let base = env!("CARGO_PKG_VERSION");
+    let channel = option_env!("HERDR_BUILD_CHANNEL")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("stable");
+    let build_id = option_env!("HERDR_BUILD_ID")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (channel, build_id) {
+        ("stable", _) => base.to_owned(),
+        (channel, Some(build_id)) => format!("{base}-{channel}.{build_id}"),
+        (channel, None) => format!("{base}-{channel}"),
+    }
+}
+
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
