@@ -22,9 +22,45 @@ case "${1:-}" in
     ;;
   linux-check)
     # Parent must record that this deliberately omits Windows cross-lint.
-    just ci
-    just docs-contract-test
-    python3 -m unittest scripts.fast_api.test_packaging
+    check_status=0
+    run_check() {
+      local label="$1"
+      shift
+      printf 'check %s: %s\n' "$label" "$*"
+      if "$@"; then
+        printf 'check %s: passed\n' "$label"
+      else
+        local code=$?
+        printf 'check %s: FAILED (exit %s)\n' "$label" "$code" >&2
+        check_status=1
+      fi
+    }
+    run_recipe() {
+      local recipe="$1" commands line index=0
+      # Render the authoritative recipe rather than duplicate its command list.
+      # Each line runs even if an earlier line fails (maintenance has two suites).
+      if commands="$(just --dry-run "$recipe" 2>&1)"; then
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          index=$((index + 1))
+          run_check "$recipe/$index" bash -c "$line"
+        done <<< "$commands"
+      else
+        printf 'recipe %s could not be read: %s\n' "$recipe" "$commands" >&2
+        check_status=1
+      fi
+    }
+    # Same Linux CI suite, collecting every failure with explicit parallelism.
+    run_recipe lint
+    run_check nextest cargo nextest run --locked -E 'all()' --no-fail-fast \
+      --test-threads 8 --status-level fail --final-status-level slow \
+      --failure-output final --success-output never
+    run_recipe maintenance-test
+    run_recipe ui-hot-path-architecture-test
+    run_recipe integration-assets-test
+    run_recipe docs-contract-test
+    run_check packaging python3 -m unittest scripts.fast_api.test_packaging
+    exit "$check_status"
     ;;
   build)
     just build

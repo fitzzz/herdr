@@ -83,9 +83,13 @@ The parent uploads the exact integrated source archive to
 `hf/artifacts/candidate-source.txt`, and keeps distinct Cargo target directories.
 The `check` mode runs repository `just check` and the new packaging regressions.
 Windows SDK setup is separate and requires acceptance of Microsoft's license;
-checks never download it. If the parent elects Linux-only `just ci` plus
-`just docs-contract-test`, record Windows lint as unrun. Do not silently label
-that narrower run `just check`. The `build` and `package` modes run `just build`
+checks never download it. The `linux-check` mode runs the same Linux CI suite
+with nextest `--no-fail-fast --test-threads 8`. It renders the repository's lint,
+maintenance, hotpath, integration-assets and docs recipes, runs each command
+even after failures, and runs the packaging regressions. It returns failure if
+any command fails. Record Windows lint as unrun; do not label this narrower run
+`just check`. Cargo compilation also uses eight jobs. The `build` and `package`
+modes run `just build`
 and stage a versioned read-only package. No upstream release recipe is invoked.
 
 ## 174-pane old-to-candidate rehearsal
