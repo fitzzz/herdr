@@ -11,6 +11,8 @@ pub(crate) fn apply_keybindings(
     app: &mut app::App,
     keybindings: &crate::config::LiveKeybindConfig,
 ) {
-    app.state.prefix_keys = keybindings.prefix.clone();
+    // Explicit config restoration only. Foreground presentation synchronization
+    // must not copy the unchanged server keymap on each API read or input event.
+    app.state.prefix_keys.clone_from(&keybindings.prefix);
     app.state.keybinds = keybindings.keybinds.clone();
 }

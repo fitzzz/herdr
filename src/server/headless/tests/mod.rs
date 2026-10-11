@@ -1,6 +1,7 @@
 use super::*;
 
 mod api_status_projection;
+pub(super) mod api_wrapper;
 mod event_fairness;
 mod native_graphics;
 #[path = "pane_move.rs"]
