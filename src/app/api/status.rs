@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn status_projection_matches_public_status_fields_with_adversarial_identity_and_seen_state() {
         let mut app = projection_app();
-        assert!(app.terminal_runtimes.is_empty());
+        assert_eq!(app.terminal_runtimes.len(), 0);
         let pane_ids = app.state.workspaces[0]
             .tabs
             .iter()
@@ -155,7 +155,7 @@ mod tests {
             }
         }
         app.state.assert_invariants_for_test();
-        assert!(app.terminal_runtimes.is_empty());
+        assert_eq!(app.terminal_runtimes.len(), 0);
     }
 
     #[test]
