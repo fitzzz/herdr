@@ -9,6 +9,7 @@ mod panes;
 pub(crate) mod plugins;
 pub(super) mod responses;
 mod session;
+mod status;
 mod tabs;
 mod workspaces;
 mod worktrees;
@@ -1232,6 +1233,29 @@ impl App {
         };
 
         serde_json::to_string(&response).unwrap()
+    }
+
+    pub(crate) fn handle_api_projection_after_internal_events_drained(
+        &mut self,
+        request: crate::api::schema::Request,
+        projection: crate::api::ApiRequestProjection,
+    ) -> String {
+        match (projection, request.method) {
+            (
+                crate::api::ApiRequestProjection::PaneAgentStatus,
+                crate::api::schema::Method::PaneGet(target),
+            ) => {
+                // Preserve the preparation performed for ordinary API reads.
+                // The headless wrapper already expired metadata and drained events.
+                self.sync_pending_terminal_titles();
+                self.handle_pane_agent_status_projection(request.id, target)
+            }
+            _ => responses::encode_error(
+                request.id,
+                "internal_error",
+                "invalid internal API projection request",
+            ),
+        }
     }
 
     fn handle_notification_show(

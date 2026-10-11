@@ -559,7 +559,7 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -1001,7 +1001,16 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None, None)
+}
+
+pub(super) fn dispatch_projection_to_app_with_timeout(
+    request: Request,
+    projection: crate::api::ApiRequestProjection,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+) -> String {
+    dispatch_to_app(request, api_tx, timeout, None, None, Some(projection))
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1015,6 +1024,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         timeout,
         None,
         Some(("timeout", "timed out waiting for agent status")),
+        None,
     )
 }
 
@@ -1024,11 +1034,13 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
+    projection: Option<crate::api::ApiRequestProjection>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
+        projection,
         respond_to,
         response_write_complete,
     }) {
@@ -1223,25 +1235,41 @@ mod tests {
         }
     }
 
-    fn spawn_pane_get_responder(
+    fn pane_status_projection_response(id: String, pane: crate::api::schema::PaneInfo) -> String {
+        serde_json::to_string(&crate::api::PaneAgentStatusProjectionResponse {
+            id,
+            result: crate::api::schema::PaneAgentStatusChangedEvent {
+                pane_id: pane.pane_id,
+                workspace_id: pane.workspace_id,
+                agent_status: pane.agent_status,
+                agent: pane.agent,
+                title: pane.title,
+                display_agent: pane.display_agent,
+                state_labels: pane.state_labels,
+            },
+        })
+        .unwrap()
+    }
+
+    fn spawn_pane_status_responder(
         agent_status: crate::api::schema::AgentStatus,
     ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
             while let Some(msg) = api_rx.blocking_recv() {
                 match msg.request.method {
-                    Method::PaneGet(_) => msg
-                        .respond_to
-                        .send(
-                            serde_json::to_string(&SuccessResponse {
-                                id: msg.request.id,
-                                result: ResponseResult::PaneInfo {
-                                    pane: pane_info("pane_1", agent_status),
-                                },
-                            })
-                            .unwrap(),
-                        )
-                        .unwrap(),
+                    Method::PaneGet(_) => {
+                        assert_eq!(
+                            msg.projection,
+                            Some(crate::api::ApiRequestProjection::PaneAgentStatus)
+                        );
+                        msg.respond_to
+                            .send(pane_status_projection_response(
+                                msg.request.id,
+                                pane_info("pane_1", agent_status),
+                            ))
+                            .unwrap();
+                    }
                     Method::EventsWait(_) => msg
                         .respond_to
                         .send(error_response_json(
@@ -1559,7 +1587,7 @@ mod tests {
     #[test]
     fn events_wait_agent_status_returns_initial_match() {
         let (api_tx, responder) =
-            spawn_pane_get_responder(crate::api::schema::AgentStatus::Blocked);
+            spawn_pane_status_responder(crate::api::schema::AgentStatus::Blocked);
 
         let (mut client, server, _path) = local_stream_pair("api-events-wait-initial");
         client
@@ -1586,7 +1614,7 @@ mod tests {
     #[test]
     fn events_wait_agent_status_times_out_server_side() {
         let (api_tx, responder) =
-            spawn_pane_get_responder(crate::api::schema::AgentStatus::Unknown);
+            spawn_pane_status_responder(crate::api::schema::AgentStatus::Unknown);
 
         let (mut client, server, _path) = local_stream_pair("api-events-wait-timeout");
         client
@@ -1621,15 +1649,16 @@ mod tests {
                 let Method::PaneGet(_) = msg.request.method else {
                     panic!("unexpected request: {:?}", msg.request.method);
                 };
+                assert_eq!(
+                    msg.projection,
+                    Some(crate::api::ApiRequestProjection::PaneAgentStatus)
+                );
                 pane_get_count += 1;
                 let response = if pane_get_count == 1 {
-                    serde_json::to_string(&SuccessResponse {
-                        id: msg.request.id,
-                        result: ResponseResult::PaneInfo {
-                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
-                        },
-                    })
-                    .unwrap()
+                    pane_status_projection_response(
+                        msg.request.id,
+                        pane_info("pane_1", crate::api::schema::AgentStatus::Unknown),
+                    )
                 } else {
                     if pane_get_count == 2 {
                         responder_event_hub.push(crate::api::schema::EventEnvelope {

@@ -201,16 +201,51 @@ fn output_subscription() -> Value {
 }
 
 fn reply(request: ApiRequestMessage, result: ResponseResult) {
-    request
-        .respond_to
-        .send(
-            serde_json::to_string(&SuccessResponse {
+    let response = match request.projection {
+        Some(crate::api::ApiRequestProjection::PaneAgentStatus) => {
+            let ResponseResult::PaneInfo { pane } = result else {
+                panic!("expected status projection fixture");
+            };
+            serde_json::to_string(&crate::api::PaneAgentStatusProjectionResponse {
                 id: request.request.id,
-                result,
+                result: crate::api::schema::PaneAgentStatusChangedEvent {
+                    pane_id: pane.pane_id,
+                    workspace_id: pane.workspace_id,
+                    agent_status: pane.agent_status,
+                    agent: pane.agent,
+                    title: pane.title,
+                    display_agent: pane.display_agent,
+                    state_labels: pane.state_labels,
+                },
             })
-            .unwrap(),
-        )
-        .unwrap();
+            .unwrap()
+        }
+        None => serde_json::to_string(&SuccessResponse {
+            id: request.request.id,
+            result,
+        })
+        .unwrap(),
+    };
+    request.respond_to.send(response).unwrap();
+}
+
+#[test]
+fn public_json_cannot_select_internal_status_projection() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "public-pane-get",
+        "method": "pane.get",
+        "params": {"pane_id": "pane_1"},
+        "projection": "pane_agent_status"
+    }));
+    let request = test.app_request();
+    assert_eq!(request.projection, None);
+    reply_to_probe(request);
+    let response = client.response();
+    assert_eq!(response["id"], "public-pane-get");
+    assert_eq!(response["result"]["type"], "pane_info");
+    assert_eq!(response["result"]["pane"]["terminal_id"], "term_1");
 }
 
 fn reply_to_probe(request: ApiRequestMessage) {

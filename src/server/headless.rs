@@ -2844,6 +2844,13 @@ impl HeadlessServer {
             return false;
         }
 
+        // Reject invalid internal markers before any method-specific side effects.
+        if let Err(error) = msg.validate_projection() {
+            let response = serde_json::to_string(&error).unwrap_or_else(|_| "{}".to_string());
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
@@ -3008,6 +3015,9 @@ impl HeadlessServer {
                 })
                 .unwrap_or_else(|_| "{}".to_string())
             })
+        } else if let Some(projection) = msg.projection {
+            self.app
+                .handle_api_projection_after_internal_events_drained(msg.request, projection)
         } else {
             self.app
                 .handle_api_request_after_internal_events_drained(msg.request)

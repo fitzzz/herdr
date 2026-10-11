@@ -82,8 +82,38 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 
 pub struct ApiRequestMessage {
     pub request: Request,
+    // In-process dispatch only. This is absent from Request/Method and cannot be
+    // selected by a JSON client or change an advertised endpoint method.
+    pub(crate) projection: Option<ApiRequestProjection>,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiRequestProjection {
+    PaneAgentStatus,
+}
+
+impl ApiRequestMessage {
+    pub(crate) fn validate_projection(&self) -> Result<(), schema::ErrorResponse> {
+        match (self.projection, &self.request.method) {
+            (None, _) | (Some(ApiRequestProjection::PaneAgentStatus), Method::PaneGet(_)) => Ok(()),
+            _ => Err(schema::ErrorResponse {
+                id: self.request.id.clone(),
+                error: schema::ErrorBody {
+                    code: "internal_error".into(),
+                    message: "invalid internal API projection request".into(),
+                },
+            }),
+        }
+    }
+}
+
+// Reuse the event's exact fields without adding a public ResponseResult variant.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PaneAgentStatusProjectionResponse {
+    pub(crate) id: String,
+    pub(crate) result: schema::PaneAgentStatusChangedEvent,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

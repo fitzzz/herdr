@@ -6,7 +6,9 @@ use crate::api::schema::{
     PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription,
     SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
-use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
+use crate::api::server::{
+    dispatch_projection_to_app_with_timeout, dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT,
+};
 use crate::api::{ApiRequestSender, EventHub};
 
 pub(super) fn output_match_read_source(
@@ -71,7 +73,7 @@ struct PanePresentationSnapshot {
 }
 
 impl PanePresentationSnapshot {
-    fn from(pane: &crate::api::schema::PaneInfo) -> Self {
+    fn from(pane: &PaneAgentStatusChangedEvent) -> Self {
         Self {
             title: pane.title.clone(),
             display_agent: pane.display_agent.clone(),
@@ -208,24 +210,18 @@ impl ActiveSubscription {
                 agent_status,
             } => {
                 let last_sequence = event_hub.current_sequence();
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let probe =
+                    pane_agent_status(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
+                let pane_id = probe.pane_id.clone();
                 let initial_event = agent_status
                     .is_some_and(|wanted| wanted == probe.agent_status)
-                    .then_some(PaneAgentStatusChangedEvent {
-                        pane_id: probe.pane_id.clone(),
-                        workspace_id: probe.workspace_id,
-                        agent_status: probe.agent_status,
-                        agent: probe.agent,
-                        title: probe.title,
-                        display_agent: probe.display_agent,
-                        state_labels: probe.state_labels,
-                    });
+                    .then_some(probe);
 
                 Ok(Self::AgentStatusChanged(Box::new(
                     ActiveAgentStatusChangedSubscription {
-                        pane_id: probe.pane_id,
+                        pane_id,
                         status_filter: agent_status,
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
@@ -483,7 +479,7 @@ impl ActiveAgentStatusChangedSubscription {
         }
 
         let before_snapshot_sequence = self.last_sequence;
-        let pane = pane_get(
+        let pane = pane_agent_status(
             format!("{}:pane", self.request_prefix),
             &self.pane_id,
             api_tx,
@@ -503,7 +499,7 @@ impl ActiveAgentStatusChangedSubscription {
 
     fn event_from_snapshot(
         &mut self,
-        pane: crate::api::schema::PaneInfo,
+        pane: PaneAgentStatusChangedEvent,
     ) -> Option<SubscriptionEventEnvelope> {
         let current_status = pane.agent_status;
         let current_presentation = PanePresentationSnapshot::from(&pane);
@@ -525,15 +521,7 @@ impl ActiveAgentStatusChangedSubscription {
 
         Some(SubscriptionEventEnvelope {
             event: SubscriptionEventKind::PaneAgentStatusChanged,
-            data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
-                pane_id: pane.pane_id,
-                workspace_id: pane.workspace_id,
-                agent_status: current_status,
-                agent: pane.agent,
-                title: pane.title,
-                display_agent: pane.display_agent,
-                state_labels: pane.state_labels,
-            }),
+            data: SubscriptionEventData::PaneAgentStatusChanged(pane),
         })
     }
 }
@@ -617,6 +605,51 @@ fn pane_read(
             message: "failed to decode pane read result".into(),
         },
     })
+}
+
+fn pane_agent_status(
+    request_id: String,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<PaneAgentStatusChangedEvent, ErrorResponse> {
+    let response = dispatch_projection_to_app_with_timeout(
+        Request {
+            id: request_id.clone(),
+            method: Method::PaneGet(crate::api::schema::PaneTarget {
+                pane_id: pane_id.to_string(),
+            }),
+        },
+        crate::api::ApiRequestProjection::PaneAgentStatus,
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
+        id: request_id.clone(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: "failed to decode pane status response".into(),
+        },
+    })?;
+    if value.get("error").is_some() {
+        let response =
+            serde_json::from_value::<ErrorResponse>(value).map_err(|_| ErrorResponse {
+                id: request_id.clone(),
+                error: ErrorBody {
+                    code: "internal_error".into(),
+                    message: "failed to decode pane status error".into(),
+                },
+            })?;
+        return Err(response);
+    }
+    serde_json::from_value::<crate::api::PaneAgentStatusProjectionResponse>(value)
+        .map(|response| response.result)
+        .map_err(|_| ErrorResponse {
+            id: request_id,
+            error: ErrorBody {
+                code: "internal_error".into(),
+                message: "failed to decode pane status result".into(),
+            },
+        })
 }
 
 fn pane_get(
@@ -715,6 +748,322 @@ mod tests {
             scroll,
             revision: 0,
         }
+    }
+
+    fn status_snapshot(status: AgentStatus, title: Option<&str>) -> PaneAgentStatusChangedEvent {
+        PaneAgentStatusChangedEvent {
+            pane_id: "pane_1".into(),
+            workspace_id: "workspace_1".into(),
+            agent_status: status,
+            agent: Some("pi".into()),
+            title: title.map(str::to_owned),
+            display_agent: Some("Reviewer".into()),
+            state_labels: HashMap::from([("working".into(), "Reviewing".into())]),
+        }
+    }
+
+    fn status_subscription(
+        pane: &PaneAgentStatusChangedEvent,
+        status_filter: Option<AgentStatus>,
+        event_hub: &EventHub,
+    ) -> ActiveAgentStatusChangedSubscription {
+        ActiveAgentStatusChangedSubscription {
+            pane_id: pane.pane_id.clone(),
+            status_filter,
+            last_status: Some(pane.agent_status),
+            last_presentation: Some(PanePresentationSnapshot::from(pane)),
+            last_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        }
+    }
+
+    fn status_responder(
+        mut respond: impl FnMut(&crate::api::ApiRequestMessage) -> String + Send + 'static,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(request) = api_rx.blocking_recv() {
+                assert!(matches!(request.request.method, Method::PaneGet(_)));
+                assert_eq!(
+                    request.projection,
+                    Some(crate::api::ApiRequestProjection::PaneAgentStatus)
+                );
+                request.respond_to.send(respond(&request)).unwrap();
+            }
+        });
+        (api_tx, responder)
+    }
+
+    fn status_response(id: &str, pane: PaneAgentStatusChangedEvent) -> String {
+        serde_json::to_string(&crate::api::PaneAgentStatusProjectionResponse {
+            id: id.into(),
+            result: pane,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_status_setup_and_quiet_polls_preserve_initial_filter_and_read_cadence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for filter in [None, Some(AgentStatus::Working), Some(AgentStatus::Idle)] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&reads);
+            let snapshot = status_snapshot(AgentStatus::Working, Some("review"));
+            let (api_tx, responder) = status_responder(move |request| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                status_response(&request.request.id, snapshot.clone())
+            });
+            let hub = EventHub::default();
+            let mut subscription = ActiveSubscription::new(
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: "pane_1".into(),
+                    agent_status: filter,
+                },
+                "setup",
+                0,
+                &api_tx,
+                &hub,
+                hub.current_sequence(),
+            )
+            .unwrap();
+            assert_eq!(reads.load(Ordering::Relaxed), 1);
+            let first = subscription.poll_for_wait(&api_tx, &hub).unwrap();
+            let initial_matches = filter == Some(AgentStatus::Working);
+            assert_eq!(first.is_some(), initial_matches);
+            if let Some(event) = first {
+                assert_eq!(event["data"]["agent"], "pi");
+                assert_eq!(event["data"]["title"], "review");
+                assert_eq!(event["data"]["display_agent"], "Reviewer");
+                assert_eq!(event["data"]["state_labels"]["working"], "Reviewing");
+            }
+            let expected_reads = if initial_matches { 1 } else { 2 };
+            assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
+            for poll in 1..=3 {
+                assert!(subscription.poll_for_wait(&api_tx, &hub).unwrap().is_none());
+                assert_eq!(reads.load(Ordering::Relaxed), expected_reads + poll);
+            }
+            drop(api_tx);
+            responder.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn agent_status_fallback_preserves_all_event_fields_and_presentation_changes() {
+        let hub = EventHub::default();
+        let original = status_snapshot(AgentStatus::Working, None);
+        let mut subscription = status_subscription(&original, None, &hub);
+        let mut changed = original.clone();
+        changed.title = Some("renamed".into());
+        changed.display_agent = Some("Auditor".into());
+        changed
+            .state_labels
+            .insert("working".into(), "Auditing".into());
+        let event = subscription.event_from_snapshot(changed.clone()).unwrap();
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("expected status event");
+        };
+        assert_eq!(data.pane_id, changed.pane_id);
+        assert_eq!(data.workspace_id, changed.workspace_id);
+        assert_eq!(data.agent_status, changed.agent_status);
+        assert_eq!(data.agent, changed.agent);
+        assert_eq!(data.title, changed.title);
+        assert_eq!(data.display_agent, changed.display_agent);
+        assert_eq!(data.state_labels, changed.state_labels);
+        assert!(subscription.event_from_snapshot(changed).is_none());
+
+        // These fields are delivered on an event but have never triggered a
+        // fallback event on their own. Preserve that distinction.
+        let mut identity_only = original.clone();
+        identity_only.agent = Some("codex".into());
+        identity_only.workspace_id = "workspace_2".into();
+        let mut subscription = status_subscription(&original, None, &hub);
+        assert!(subscription.event_from_snapshot(identity_only).is_none());
+    }
+
+    #[test]
+    fn agent_status_fallback_tracks_filtered_out_changes_before_the_next_match() {
+        let hub = EventHub::default();
+        let working = status_snapshot(AgentStatus::Working, None);
+        let blocked = status_snapshot(AgentStatus::Blocked, Some("approval"));
+        let mut subscription = status_subscription(&working, Some(AgentStatus::Working), &hub);
+        assert!(subscription.event_from_snapshot(blocked).is_none());
+        assert_eq!(subscription.last_status, Some(AgentStatus::Blocked));
+        assert!(subscription.event_from_snapshot(working.clone()).is_some());
+        assert!(subscription.event_from_snapshot(working).is_none());
+    }
+
+    #[test]
+    fn agent_status_snapshot_race_defers_to_history_without_loss_or_duplicates() {
+        for error_during_snapshot in [false, true] {
+            let hub = EventHub::default();
+            let working = status_snapshot(AgentStatus::Working, None);
+            let mut subscription = status_subscription(&working, None, &hub);
+            let responder_hub = hub.clone();
+            let mut reads = 0;
+            let (api_tx, responder) = status_responder(move |request| {
+                reads += 1;
+                if reads == 1 {
+                    let mut event = presentation_event(Some("approval"));
+                    let EventData::PaneAgentStatusChanged { agent_status, .. } = &mut event.data
+                    else {
+                        panic!("expected status event");
+                    };
+                    *agent_status = AgentStatus::Blocked;
+                    responder_hub.push(event);
+                    if error_during_snapshot {
+                        return serde_json::to_string(&ErrorResponse {
+                            id: request.request.id.clone(),
+                            error: ErrorBody {
+                                code: "pane_not_found".into(),
+                                message: "pane not found".into(),
+                            },
+                        })
+                        .unwrap();
+                    }
+                }
+                let mut pane = status_snapshot(AgentStatus::Blocked, Some("approval"));
+                pane.display_agent = None;
+                pane.state_labels.clear();
+                status_response(&request.request.id, pane)
+            });
+            assert!(subscription.poll_result(&api_tx, &hub).unwrap().is_none());
+            assert_eq!(subscription.last_status, Some(AgentStatus::Working));
+            assert_eq!(subscription.last_sequence, 0);
+            let event = subscription.poll_result(&api_tx, &hub).unwrap().unwrap();
+            let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+                panic!("expected status event");
+            };
+            assert_eq!(data.agent_status, AgentStatus::Blocked);
+            assert_eq!(data.title.as_deref(), Some("approval"));
+            assert_eq!(subscription.last_sequence, hub.current_sequence());
+            assert!(subscription.poll_result(&api_tx, &hub).unwrap().is_none());
+            drop(api_tx);
+            responder.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn agent_status_missing_pane_errors_propagate_to_wait_but_stream_poll_suppresses_them() {
+        let hub = EventHub::default();
+        let pane = status_snapshot(AgentStatus::Working, None);
+        let (api_tx, responder) = status_responder(|request| {
+            serde_json::to_string(&ErrorResponse {
+                id: request.request.id.clone(),
+                error: ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: "pane pane_1 not found".into(),
+                },
+            })
+            .unwrap()
+        });
+        let mut subscription = status_subscription(&pane, None, &hub);
+        let error = subscription.poll_result(&api_tx, &hub).unwrap_err();
+        assert_eq!(error.id, "test:pane");
+        assert_eq!(error.error.code, "pane_not_found");
+        assert!(subscription.poll(&api_tx, &hub).is_none());
+        let mut stream = ActiveSubscription::AgentStatusChanged(Box::new(subscription));
+        assert!(stream.poll_batch(&api_tx, &hub).unwrap().is_empty());
+        drop(api_tx);
+        responder.join().unwrap();
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(closed_rx);
+        let mut subscription = status_subscription(&pane, None, &hub);
+        let error = subscription.poll_result(&closed_tx, &hub).unwrap_err();
+        assert_eq!(error.error.code, "server_unavailable");
+    }
+
+    #[test]
+    fn agent_status_setup_rejects_missing_panes_and_disconnected_application_queue() {
+        let hub = EventHub::default();
+        let (api_tx, responder) = status_responder(|request| {
+            serde_json::to_string(&ErrorResponse {
+                id: request.request.id.clone(),
+                error: ErrorBody {
+                    code: "pane_not_found".into(),
+                    message: "pane missing not found".into(),
+                },
+            })
+            .unwrap()
+        });
+        let setup = |sender: &ApiRequestSender| {
+            ActiveSubscription::new(
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: "missing".into(),
+                    agent_status: Some(AgentStatus::Working),
+                },
+                "setup-error",
+                4,
+                sender,
+                &hub,
+                hub.current_sequence(),
+            )
+        };
+        let Err(error) = setup(&api_tx) else {
+            panic!("expected missing pane error")
+        };
+        assert_eq!(error.id, "setup-error:sub:4:probe");
+        assert_eq!(error.error.code, "pane_not_found");
+        drop(api_tx);
+        responder.join().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(closed_rx);
+        let Err(error) = setup(&closed_tx) else {
+            panic!("expected disconnected queue error")
+        };
+        assert_eq!(error.id, "setup-error:sub:4:probe");
+        assert_eq!(error.error.code, "server_unavailable");
+    }
+
+    #[test]
+    fn many_quiet_agent_status_subscriptions_read_once_per_poll() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let (api_tx, responder) = status_responder(move |request| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let Method::PaneGet(target) = &request.request.method else {
+                unreachable!()
+            };
+            let mut pane = status_snapshot(AgentStatus::Working, None);
+            pane.pane_id = target.pane_id.clone();
+            status_response(&request.request.id, pane)
+        });
+        let hub = EventHub::default();
+        let mut subscriptions = (0..121)
+            .map(|index| {
+                ActiveSubscription::new(
+                    Subscription::PaneAgentStatusChanged {
+                        pane_id: format!("pane_{index}"),
+                        agent_status: None,
+                    },
+                    "many",
+                    index,
+                    &api_tx,
+                    &hub,
+                    hub.current_sequence(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.load(Ordering::Relaxed), subscriptions.len());
+        for poll in 1..=3 {
+            for subscription in &mut subscriptions {
+                assert!(subscription.poll_batch(&api_tx, &hub).unwrap().is_empty());
+            }
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                subscriptions.len() * (poll + 1)
+            );
+        }
+        drop(api_tx);
+        responder.join().unwrap();
     }
 
     #[test]
