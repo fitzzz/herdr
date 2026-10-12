@@ -90,6 +90,33 @@ fn changed_rows(
     Some(rows)
 }
 
+// A clipped wide lead cannot be updated independently of the dense renderer:
+// ratatui's flat-buffer diff may skip the first cell of the following row.
+// Preserve that existing dense behavior here; this does not repair its clipping.
+// Inspect one edge cell per row, never the complete recipient grid.
+fn terminal_has_clipped_wide_edge(
+    frame: &FrameData,
+    patch: Option<&crate::pane::TerminalDirtyPatch>,
+) -> bool {
+    let width = usize::from(frame.width);
+    if width == 0 {
+        return false;
+    }
+    let edge_is_wide =
+        |cell: &protocol::CellData| crate::protocol::render_ansi::cell_width(cell) > 1;
+    if let Some(patch) = patch {
+        patch
+            .rows
+            .iter()
+            .any(|(y, cells)| *y < frame.height && cells.get(width - 1).is_some_and(edge_is_wide))
+    } else {
+        frame
+            .cells
+            .chunks_exact(width)
+            .any(|row| edge_is_wide(&row[width - 1]))
+    }
+}
+
 fn retained_scrollbar_patch(
     app: &app::App,
     frame: &FrameData,
@@ -294,6 +321,9 @@ impl HeadlessServer {
                     || !frame.graphics.is_empty()
                 {
                     fallback!("terminal_baseline_mismatch");
+                }
+                if terminal_has_clipped_wide_edge(frame, None) {
+                    fallback!("terminal_clipped_wide_baseline");
                 }
                 let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
                     fallback!("runtime_missing");
@@ -540,6 +570,9 @@ impl HeadlessServer {
             if collected_pane.graphics_may_have_placements {
                 fallback!("terminal_graphics");
             }
+            if terminal_has_clipped_wide_edge(recipient.frame, Some(&collected_pane.patch)) {
+                fallback!("terminal_clipped_wide_patch");
+            }
             let area = protocol::SurfaceRect {
                 x: 0,
                 y: 0,
@@ -771,6 +804,31 @@ mod tests {
             skip: false,
             hyperlink: None,
         }
+    }
+
+    #[test]
+    fn terminal_clipped_wide_edge_uses_ansi_grapheme_width() {
+        let voiced = cell("ｶ\u{ff9e}");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(voiced.symbol.as_str()),
+            1
+        );
+        assert_eq!(crate::protocol::render_ansi::cell_width(&voiced), 2);
+        let mut frame = FrameData {
+            width: 2,
+            height: 1,
+            cells: vec![cell(" "), voiced.clone()],
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        assert!(terminal_has_clipped_wide_edge(&frame, None));
+        frame.cells[1] = cell(" ");
+        assert!(!terminal_has_clipped_wide_edge(&frame, None));
+        let patch = crate::pane::TerminalDirtyPatch {
+            rows: vec![(0, vec![cell(" "), voiced])],
+        };
+        assert!(terminal_has_clipped_wide_edge(&frame, Some(&patch)));
     }
 
     #[test]

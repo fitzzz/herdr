@@ -281,10 +281,16 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
         assert_eq!((small.width, small.height), (80, 24));
         assert_dense_parity(server, &target, 8);
         assert_dense_parity(server, &target, 9);
-        for bytes in [
-            "\x1b[3;79H\x1b[31;44;1m界\x1b[0m".as_bytes(),
-            "\x1b[5;1HROW_START\x1b[4;80H\x1b[32;45m界\x1b[0m".as_bytes(),
-            b"\x1b[4;80Hx",
+        for (bytes, retained_expected) in [
+            ("\x1b[3;79H\x1b[31;44;1m界\x1b[0m".as_bytes(), true),
+            (
+                "\x1b[5;1HROW_START\x1b[4;80H\x1b[32;45m界\x1b[0m".as_bytes(),
+                false,
+            ),
+            // Clearing the clipped lead must also use the dense renderer: it
+            // reveals the following row's unchanged first cell.
+            (b"\x1b[4;80Hx".as_slice(), false),
+            (b"\x1b[6;4HAFTER_EDGE".as_slice(), true),
         ] {
             server
                 .app
@@ -292,7 +298,12 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
                 .get(&id)
                 .unwrap()
                 .test_process_pty_bytes(bytes);
-            assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+            let retained =
+                server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id]));
+            assert_eq!(retained, retained_expected);
+            if !retained {
+                server.render_and_stream();
+            }
             let _ = replay_terminal_frame(&controller, &large_displays);
             let _ = replay_terminal_frame(&observer, &small_displays);
             for (display, setup) in large_displays.iter().zip(ANSI_HOST_SETUPS) {

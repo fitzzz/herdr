@@ -745,7 +745,7 @@ fn repeat_ime_anchor_after_sync() -> bool {
 }
 
 /// Writes all cells in the frame (full redraw).
-fn cell_width(cell: &CellData) -> usize {
+pub(crate) fn cell_width(cell: &CellData) -> usize {
     if is_halfwidth_katakana_voiced_grapheme(&cell.symbol) {
         return 2;
     }
