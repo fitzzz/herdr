@@ -341,10 +341,16 @@ async fn observational_reads_expire_metadata_tokens_and_sync_terminal_titles() {
         server.app.sync_agent_metadata_deadline();
         assert!(server.app.agent_metadata_deadline.is_some());
         let before = hub.current_sequence();
-        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(
-            80,
-            24,
-            b"\x1b]0;latest title\x07",
+        // Screen-seeding writes directly to Ghostty before Herdr's OSC tracker
+        // exists. Feed the title through PTY processing so it is an observation
+        // the API can synchronize, as in the production reader path.
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        assert_eq!(runtime.terminal_title(), None);
+        runtime.test_process_pty_bytes(b"\x1b]0;latest title\x07");
+        assert_eq!(runtime.terminal_title().as_deref(), Some("latest title"));
+        assert_eq!(
+            server.app.state.terminals[&terminal_id].terminal_title,
+            None
         );
         server
             .app
