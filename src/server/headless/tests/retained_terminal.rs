@@ -504,8 +504,11 @@ fn writer_recovery_for_direct_and_observer_skips_unrelated_runtime_after_output_
             assert!(server.has_pending_presentation_work(false, false));
             assert!(server.render_pending_work(false, false, &HashSet::new()));
             assert_eq!(terminal_frame(&slow).seq, initial.seq + 2);
-            assert_eq!(server.app.test_metadata_observation_counts(), metadata_before,
-                "direct-only recovery must not construct a shared shell snapshot");
+            assert_eq!(
+                server.app.test_metadata_observation_counts(),
+                metadata_before,
+                "direct-only recovery must not construct a shared shell snapshot"
+            );
             assert_dense_parity(server, &target, 8);
             assert_eq!(server.clients[&8].deferred_render(), DeferredRender::None);
             assert!(server.pending_render_recoveries.is_empty());
