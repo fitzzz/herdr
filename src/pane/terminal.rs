@@ -16,6 +16,8 @@ use crate::layout::PaneId;
 use crate::protocol::CellData;
 
 #[cfg(test)]
+mod full_render_parity_tests;
+#[cfg(test)]
 mod migration_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
@@ -2362,9 +2364,13 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        let mut profile = crate::render_prof::timer().map(FullViewportProfile::new);
         let Ok(mut core) = self.core.lock() else {
             return;
         };
+        if let Some(profile) = profile.as_mut() {
+            profile.lock_wait = Some(profile.started.elapsed());
+        }
         if core
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -2396,6 +2402,9 @@ impl GhosttyPaneTerminal {
             .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
         let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
 
+        if let Some(profile) = profile.as_mut() {
+            profile.conversion_started = Some(Instant::now());
+        }
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
             Err(_) => return,
@@ -2420,6 +2429,13 @@ impl GhosttyPaneTerminal {
                 };
                 let mut x = 0u16;
                 while x < area.width && cells.next() {
+                    if let Some(profile) = profile.as_mut() {
+                        match cells.is_default_blank() {
+                            Ok(true) => profile.blank_cells += 1,
+                            Ok(false) => profile.nonblank_cells += 1,
+                            Err(_) => profile.blank_read_errors += 1,
+                        }
+                    }
                     let basic = cells.basic_data().unwrap_or_default();
                     let style = ghostty_cell_style(
                         &cells,
@@ -2451,6 +2467,9 @@ impl GhosttyPaneTerminal {
                     x += 1;
                 }
                 while x < area.width {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.padding_cells += 1;
+                    }
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                     x += 1;
@@ -2459,6 +2478,9 @@ impl GhosttyPaneTerminal {
             }
             while y < area.height {
                 for x in 0..area.width {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.padding_cells += 1;
+                    }
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                 }
@@ -2466,6 +2488,10 @@ impl GhosttyPaneTerminal {
             }
         }
 
+        if let Some(profile) = profile.as_mut() {
+            profile.conversion_elapsed =
+                profile.conversion_started.map(|started| started.elapsed());
+        }
         ghostty_clear_render_dirty(render_state, area.height);
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
@@ -2503,6 +2529,53 @@ impl GhosttyPaneTerminal {
                 ghostty_collect_dirty_patch(&mut core, area_width, area_height)
             })
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
+    }
+}
+
+// Declared before the core lock in render(), so metrics publish after that lock
+// drops, including early exits. Disabled profiling performs no blank-cell probes.
+struct FullViewportProfile {
+    started: Instant,
+    lock_wait: Option<Duration>,
+    conversion_started: Option<Instant>,
+    conversion_elapsed: Option<Duration>,
+    blank_cells: u64,
+    nonblank_cells: u64,
+    blank_read_errors: u64,
+    padding_cells: u64,
+}
+
+impl FullViewportProfile {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            lock_wait: None,
+            conversion_started: None,
+            conversion_elapsed: None,
+            blank_cells: 0,
+            nonblank_cells: 0,
+            blank_read_errors: 0,
+            padding_cells: 0,
+        }
+    }
+}
+
+impl Drop for FullViewportProfile {
+    fn drop(&mut self) {
+        crate::render_prof::duration(
+            "full_viewport.core_lock_wait",
+            self.lock_wait.unwrap_or_else(|| self.started.elapsed()),
+        );
+        if let Some(started) = self.conversion_started {
+            crate::render_prof::duration(
+                "full_viewport.conversion",
+                self.conversion_elapsed.unwrap_or_else(|| started.elapsed()),
+            );
+        }
+        crate::render_prof::counter("full_viewport.blank_cells", self.blank_cells);
+        crate::render_prof::counter("full_viewport.nonblank_cells", self.nonblank_cells);
+        crate::render_prof::counter("full_viewport.blank_read_errors", self.blank_read_errors);
+        crate::render_prof::counter("full_viewport.padding_cells", self.padding_cells);
     }
 }
 

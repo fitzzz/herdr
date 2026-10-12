@@ -3619,6 +3619,91 @@ impl<'a> RowCellIter<'a> {
 
     pub fn grapheme_text_into(&self, bytes: &mut Vec<u8>, text: &mut String) -> Result<(), Error> {
         text.clear();
+        // Offer only initialized elements, not allocation capacity. Keep one byte
+        // for a cold/empty ASCII read; grow only when native code reports its size.
+        // Truncating after a long grapheme keeps later ASCII reads bounded to one byte.
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        let mut buffer = ffi::GhosttyBuffer {
+            ptr: bytes.as_mut_ptr(),
+            cap: bytes.len(),
+            len: 0,
+        };
+        match self.read_graphemes_utf8_buffer(&mut buffer) {
+            ffi::GhosttyResult_GHOSTTY_SUCCESS => {}
+            ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE => {
+                if buffer.len == 0 {
+                    bytes.clear();
+                    return self.raw_cell_text_into(text);
+                }
+                bytes.resize(buffer.len, 0);
+                buffer = ffi::GhosttyBuffer {
+                    ptr: bytes.as_mut_ptr(),
+                    cap: bytes.len(),
+                    len: 0,
+                };
+                self.read_graphemes_utf8_buffer(&mut buffer).into_result()?;
+            }
+            other => {
+                bytes.clear();
+                return Err(Error(other));
+            }
+        }
+        if buffer.len > bytes.len() {
+            return Err(Error(ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE));
+        }
+        if buffer.len == 0 {
+            bytes.clear();
+            return self.raw_cell_text_into(text);
+        }
+        bytes.truncate(buffer.len);
+        match std::str::from_utf8(bytes) {
+            Ok(value) => text.push_str(value),
+            Err(_) => text.push_str(&String::from_utf8_lossy(bytes)),
+        }
+        Ok(())
+    }
+
+    fn read_graphemes_utf8_buffer(&self, buffer: &mut ffi::GhosttyBuffer) -> ffi::GhosttyResult {
+        #[cfg(test)]
+        {
+            tests::GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(reads.get() + 1));
+            tests::GRAPHEME_UTF8_OFFERED_BYTES
+                .with(|offered| offered.set(offered.get() + buffer.cap));
+        }
+        // SAFETY: the iterator is live and the buffer describes initialized, writable
+        // bytes for the duration of this call (or a null pointer with zero capacity).
+        unsafe {
+            ffi::ghostty_render_state_row_cells_get(
+                self.cells.raw,
+                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
+                (buffer as *mut ffi::GhosttyBuffer).cast(),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // Count only actual GRAPHEMES_UTF8 native calls on this test's thread. The
+    // reference and candidate share the native call boundary, not the algorithm.
+    thread_local! {
+        pub(super) static GRAPHEME_UTF8_NATIVE_READS: Cell<usize> = const { Cell::new(0) };
+        pub(super) static GRAPHEME_UTF8_OFFERED_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // Frozen null-buffer/two-call algorithm from c7169f2. Only the native call
+    // boundary is factored so both paths increment the same per-thread counter.
+    fn grapheme_text_into_c716(
+        cells: &RowCellIter<'_>,
+        bytes: &mut Vec<u8>,
+        text: &mut String,
+    ) -> Result<(), Error> {
+        text.clear();
         bytes.clear();
 
         let mut buffer = ffi::GhosttyBuffer {
@@ -3626,16 +3711,10 @@ impl<'a> RowCellIter<'a> {
             cap: 0,
             len: 0,
         };
-        let result = unsafe {
-            ffi::ghostty_render_state_row_cells_get(
-                self.cells.raw,
-                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
-                (&mut buffer as *mut ffi::GhosttyBuffer).cast(),
-            )
-        };
+        let result = cells.read_graphemes_utf8_buffer(&mut buffer);
         match result {
             ffi::GhosttyResult_GHOSTTY_SUCCESS if buffer.len == 0 => {
-                return self.raw_cell_text_into(text);
+                return cells.raw_cell_text_into(text);
             }
             ffi::GhosttyResult_GHOSTTY_SUCCESS => {
                 return Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE));
@@ -3645,7 +3724,7 @@ impl<'a> RowCellIter<'a> {
         }
 
         if buffer.len == 0 {
-            return self.raw_cell_text_into(text);
+            return cells.raw_cell_text_into(text);
         }
         bytes.resize(buffer.len, 0);
         let mut buffer = ffi::GhosttyBuffer {
@@ -3653,14 +3732,9 @@ impl<'a> RowCellIter<'a> {
             cap: bytes.len(),
             len: 0,
         };
-        unsafe {
-            ffi::ghostty_render_state_row_cells_get(
-                self.cells.raw,
-                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
-                (&mut buffer as *mut ffi::GhosttyBuffer).cast(),
-            )
+        cells
+            .read_graphemes_utf8_buffer(&mut buffer)
             .into_result()?;
-        }
         if buffer.len > bytes.len() {
             return Err(Error(ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE));
         }
@@ -3671,12 +3745,154 @@ impl<'a> RowCellIter<'a> {
         }
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
+    fn assert_grapheme_reads(
+        cells: &RowCellIter<'_>,
+        legacy_bytes: &mut Vec<u8>,
+        candidate_bytes: &mut Vec<u8>,
+        expected: &str,
+        legacy_reads: usize,
+        candidate_reads: usize,
+    ) {
+        let mut legacy_text = String::from("stale legacy text");
+        let mut candidate_text = String::from("stale candidate text");
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        grapheme_text_into_c716(cells, legacy_bytes, &mut legacy_text).unwrap();
+        assert_eq!(
+            GRAPHEME_UTF8_NATIVE_READS.with(Cell::get),
+            legacy_reads,
+            "reference native reads for {expected:?}"
+        );
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        cells
+            .grapheme_text_into(candidate_bytes, &mut candidate_text)
+            .unwrap();
+        assert_eq!(
+            GRAPHEME_UTF8_NATIVE_READS.with(Cell::get),
+            candidate_reads,
+            "candidate native reads for {expected:?}"
+        );
+        assert_eq!(legacy_text, expected);
+        assert_eq!(candidate_text, legacy_text);
+        assert_eq!(candidate_bytes, legacy_bytes);
+    }
+
+    #[test]
+    fn grapheme_scratch_warm_ascii_uses_one_real_native_read() {
+        let mut terminal = Terminal::new(8, 3, 0).unwrap();
+        terminal.write(b"A");
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        assert!(cells.next());
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::new();
+        let mut text = String::new();
+        grapheme_text_into_c716(&cells, &mut legacy, &mut text).unwrap();
+        cells.grapheme_text_into(&mut candidate, &mut text).unwrap();
+        assert_eq!(candidate.len(), 1);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+    }
+
+    #[test]
+    fn grapheme_scratch_reuses_initialized_bytes_across_real_native_reads() {
+        let mut terminal = Terminal::new(48, 3, 0).unwrap();
+        let long = format!("e{}", "\u{301}".repeat(20));
+        terminal.write(
+            format!("\x1b[1;1HA\x1b[1;3Hz\x1b[1;5He\u{301}\x1b[1;9H👩‍💻\x1b[1;15H{long}").as_bytes(),
+        );
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::new();
+
+        cells.select(0).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+        cells.select(2).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "z", 2, 1);
+        cells.select(4).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "e\u{301}", 2, 2);
+        cells.select(8).unwrap();
+        assert!(candidate.len() < "👩‍💻".len());
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "👩‍💻", 2, 2);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "👩‍💻", 2, 1);
+        cells.select(14).unwrap();
+        assert!(candidate.len() < long.len());
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, &long, 2, 2);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, &long, 2, 1);
+        cells.select(0).unwrap();
+        let retained_capacity = candidate.capacity();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+        assert_eq!(candidate.len(), 1);
+        for _ in 0..512 {
+            let mut text = String::new();
+            GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+            GRAPHEME_UTF8_OFFERED_BYTES.with(|offered| offered.set(0));
+            cells.grapheme_text_into(&mut candidate, &mut text).unwrap();
+            assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+            assert_eq!(GRAPHEME_UTF8_OFFERED_BYTES.with(Cell::get), 1);
+            assert_eq!(candidate.len(), 1);
+            assert_eq!(candidate.capacity(), retained_capacity);
+            assert_eq!(text, "A");
+        }
+        cells.select(30).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "", 1, 1);
+        assert!(candidate.is_empty());
+        cells.select(2).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "z", 2, 1);
+
+        // Capacity without initialized elements must be made writable safely.
+        let mut reserved = Vec::with_capacity(64);
+        let mut reference = Vec::new();
+        assert_grapheme_reads(&cells, &mut reference, &mut reserved, "z", 2, 1);
+        assert_eq!(reserved.len(), 1);
+    }
+
+    #[test]
+    fn grapheme_scratch_cold_empty_and_invalid_native_position_match_c716() {
+        let terminal = Terminal::new(8, 3, 0).unwrap();
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::with_capacity(8);
+        let mut legacy_text = String::from("legacy");
+        let mut candidate_text = String::from("candidate");
+
+        // populate_cells leaves the native position at its sentinel until next
+        // or select. Both algorithms must propagate that native rejection.
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        let old_error = grapheme_text_into_c716(&cells, &mut legacy, &mut legacy_text);
+        assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        let new_error = cells.grapheme_text_into(&mut candidate, &mut candidate_text);
+        assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+        assert_eq!(
+            old_error,
+            Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))
+        );
+        assert_eq!(new_error, old_error);
+        assert_eq!(candidate_text, legacy_text);
+        assert!(candidate.is_empty());
+
+        cells.select(0).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "", 1, 1);
+        let mut cold = Vec::new();
+        assert_grapheme_reads(&cells, &mut legacy, &mut cold, "", 1, 1);
+    }
 
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {
