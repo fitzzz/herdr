@@ -18,7 +18,7 @@ export HERDR_BUILD_ID="${HERDR_BUILD_COMMIT:0:12}"
 case "${1:-}" in
   check)
     just check
-    python3 -m unittest scripts.fast_api.test_packaging
+    python3 -m unittest scripts.fast_api.test_packaging scripts.fast_api.test_rehearsal
     ;;
   linux-check)
     # Parent must record that this deliberately omits Windows cross-lint.
@@ -59,7 +59,7 @@ case "${1:-}" in
     run_recipe ui-hot-path-architecture-test
     run_recipe integration-assets-test
     run_recipe docs-contract-test
-    run_check packaging python3 -m unittest scripts.fast_api.test_packaging
+    run_check packaging python3 -m unittest scripts.fast_api.test_packaging scripts.fast_api.test_rehearsal
     exit "$check_status"
     ;;
   build)

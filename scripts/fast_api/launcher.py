@@ -8,6 +8,19 @@ import re
 import sys
 
 SESSION = "fast"
+# Explicit directory selectors in src/integration/env.rs. Keep the source-backed
+# contract in test_packaging.py aligned when Herdr adds a provider selector.
+PROVIDER_HOME_OVERRIDES = frozenset({
+    "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "KIMI_CODE_HOME", "COPILOT_HOME", "QODER_CONFIG_DIR", "QWEN_HOME",
+    "CURSOR_CONFIG_DIR", "ANTIGRAVITY_CLI_CONFIG_DIR", "GROK_CONFIG_DIR",
+    "GROK_HOME", "HERMES_HOME",
+})
+# These are also home/config fallbacks in integration/env.rs and config/io.rs.
+# HOME and XDG homes are replaced below; Windows fallbacks must not survive.
+HOME_FALLBACK_OVERRIDES = frozenset({
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PROGRAMDATA",
+})
 
 
 def reject_routing(args):
@@ -63,6 +76,7 @@ def private_environment(package, namespace, inherited):
     # No inherited pane identity, remote target, API overrides or provider homes.
     env = {key: value for key, value in inherited.items()
            if not key.startswith(("HERDR_", "CLAUDE_", "CODEX_", "OPENAI_", "ANTHROPIC_"))
+           and key not in PROVIDER_HOME_OVERRIDES | HOME_FALLBACK_OVERRIDES
            and key not in {"SSH_AUTH_SOCK", "SSH_AGENT_PID", "BASH_ENV", "ENV", "ZDOTDIR"}}
     env.update(HOME=str(home), XDG_CONFIG_HOME=str(config),
                XDG_STATE_HOME=str(namespace_root / "s"),

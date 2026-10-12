@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -9,6 +10,16 @@ import unittest
 
 from scripts.fast_api.launcher import private_environment, reject_routing
 from scripts.fast_api.package import package
+
+PROVIDER_OVERRIDE_FIXTURE = (
+    "PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "KIMI_CODE_HOME", "COPILOT_HOME", "QODER_CONFIG_DIR", "QWEN_HOME",
+    "CURSOR_CONFIG_DIR", "ANTIGRAVITY_CLI_CONFIG_DIR", "GROK_CONFIG_DIR",
+    "GROK_HOME", "HERMES_HOME",
+)
+HOME_FALLBACK_FIXTURE = (
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PROGRAMDATA",
+)
 
 
 class NamespaceTests(unittest.TestCase):
@@ -22,6 +33,8 @@ class NamespaceTests(unittest.TestCase):
                           "HERDR_CONFIG_PATH": "/live/config.toml",
                           "CODEX_HOME": "/live/codex", "CLAUDE_CONFIG_DIR": "/live/claude",
                           "XDG_CONFIG_HOME": "/live/config", "XDG_STATE_HOME": "/live/state"}
+        self.inherited.update({key: "/external/" + key for key in
+                               PROVIDER_OVERRIDE_FIXTURE + HOME_FALLBACK_FIXTURE})
 
     def tearDown(self):
         shutil.rmtree(self.base)
@@ -29,7 +42,7 @@ class NamespaceTests(unittest.TestCase):
     def test_inherited_live_routes_and_provider_homes_cannot_escape(self):
         env, data = private_environment(self.package, "main", self.inherited)
         for key in ("HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH", "HERDR_PANE_ID",
-                    "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+                    *PROVIDER_OVERRIDE_FIXTURE, *HOME_FALLBACK_FIXTURE):
             self.assertNotIn(key, env)
         for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
                     "XDG_DATA_HOME", "HERDR_CONFIG_PATH"):
@@ -38,6 +51,13 @@ class NamespaceTests(unittest.TestCase):
         self.assertTrue(str(data).endswith("/c/herdr/sessions/fast"))
         self.assertEqual(os.stat(data).st_mode & 0o777, 0o700)
         self.assertEqual(env["PATH"].split(":")[0], str(self.package / "bin"))
+
+    def test_provider_override_fixture_covers_actual_integration_selectors(self):
+        source = Path(__file__).resolve().parents[2] / "src/integration/env.rs"
+        selectors = set(re.findall(r'_ENV_VAR: &str = "([A-Z_]+)"', source.read_text()))
+        selectors = {key for key in selectors if not key.startswith("HERDR_")}
+        self.assertEqual(selectors, set(PROVIDER_OVERRIDE_FIXTURE),
+                         "audit launcher scrubbing when Herdr adds a provider-home selector")
 
     def test_child_cli_keeps_the_same_namespace(self):
         first, first_data = private_environment(self.package, "scratch", self.inherited)

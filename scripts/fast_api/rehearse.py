@@ -26,11 +26,14 @@ def wait_marker(path, predicate):
     if fd < 0:
         raise OSError(ctypes.get_errno(), "inotify_init1")
     try:
-        if libc.inotify_add_watch(fd, os.fsencode(path.parent), 0x100 | 0x8 | 0x80) < 0:
+        # IN_MODIFY matters: the stand-in flushes but keeps its receipt log open.
+        if libc.inotify_add_watch(fd, os.fsencode(path.parent), 0x2 | 0x100 | 0x8 | 0x80) < 0:
             raise OSError(ctypes.get_errno(), "inotify_add_watch")
         while True:
-            if path.exists() and predicate(path.read_text()):
-                return path.read_text()
+            if path.exists():
+                text = path.read_text()
+                if predicate(text):
+                    return text
             os.read(fd, 65536)
     finally:
         os.close(fd)
@@ -63,6 +66,33 @@ def pane_identity(result):
     panes = result["result"]["panes"]
     return sorted((p["pane_id"], p["tab_id"], p["workspace_id"], p["terminal_id"])
                   for p in panes)
+
+
+def assert_output_markers(text, tokens, pane):
+    lines = [line.strip() for line in text.splitlines()]
+    markers = ["got:" + token for token in tokens]
+    for marker in markers:
+        assert lines.count(marker) == 1, f"pane {pane}: missing or duplicated output {marker!r}"
+    positions = [lines.index(marker) for marker in markers]
+    assert positions == sorted(positions), f"pane {pane}: output reordered"
+
+
+def verify_pane_output(api, pane, tokens):
+    # The supported wait API observes parsed terminal output, with no client-side
+    # delay or deadline. Waiting for the final line establishes an output barrier;
+    # pane.read must then contain every unique line, including the earlier ones.
+    request(api, "pane.wait_for_output", {
+        "pane_id": pane, "source": "recent_unwrapped", "lines": 100,
+        "match": {"type": "substring", "value": "got:" + tokens[-1]},
+        "strip_ansi": True,
+    })
+    read = request(api, "pane.read", {
+        "pane_id": pane, "source": "recent_unwrapped", "lines": 100,
+        "format": "text", "strip_ansi": True,
+    })["result"]["read"]
+    assert read["pane_id"] == pane, "output read resolved a different pane"
+    assert_output_markers(read["text"], tokens, pane)
+    return read
 
 
 def client_reconnect(path):
@@ -119,7 +149,9 @@ def client_reconnect(path):
         assert welcome["generation"] == 1 and not welcome.get("error"), welcome
 
 
-def run(old, candidate, root, failure):
+def run(old, candidate, root, failure, suppress_output_pane=None):
+    if suppress_output_pane is not None and not 0 <= suppress_output_pane < PANES:
+        raise ValueError("suppressed-output pane index must be within the synthetic pane set")
     root = root.absolute()
     for path in [root, *root.parents]:
         if path.is_symlink():
@@ -163,13 +195,19 @@ def run(old, candidate, root, failure):
         for index, pane in enumerate(panes):
             folder = root / f"p{index}"
             folder.mkdir()
-            command = shlex.join([sys.executable, str(standin), str(folder)])
+            command_args = [sys.executable, str(standin), str(folder)]
+            if index == suppress_output_pane:
+                # The receipt is still written, and the final output line still
+                # establishes the barrier. A successful rehearsal must reject this.
+                command_args += ["--suppress-output", f"after-{index}-0"]
+            command = shlex.join(command_args)
             request(api, "pane.send_input", {"pane_id": pane, "text": command, "keys": ["Enter"]})
             text = wait_marker(folder / "pid.json", lambda s: s.endswith("}"))
             children.append(json.loads(text))
         before = pane_identity(request(api, "pane.list"))
         assert len(before) == PANES
         client_reconnect(data / "herdr-client.sock")
+        output_reads = []
         for phase in ("before", "after"):
             if phase == "after":
                 params = {"import_exe": str(candidate)}
@@ -201,6 +239,9 @@ def run(old, candidate, root, failure):
                 if phase == "after":
                     expected += tokens
                 assert received.read_text().splitlines() == expected, "input lost, reordered or duplicated"
+                output_reads.append({"phase": phase, "pane_id": pane,
+                                     "read": verify_pane_output(api, pane, tokens)})
+        (root / "terminal-output.json").write_text(json.dumps(output_reads, indent=2))
         if failure == "post-commit":
             victim = peer_pid(api)
             assert Path(f"/proc/{victim}/exe").resolve() == candidate
@@ -262,5 +303,8 @@ if __name__ == "__main__":
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--failure", choices=["none", "protocol", "missing-executable", "after-restored", "post-commit"], default="none")
+    parser.add_argument("--suppress-output-pane", type=int,
+                        help="negative control: omit one post-handoff got: line; must fail")
     args = parser.parse_args()
-    run(args.old.resolve(strict=True), args.candidate.resolve(strict=True), args.root, args.failure)
+    run(args.old.resolve(strict=True), args.candidate.resolve(strict=True), args.root,
+        args.failure, args.suppress_output_pane)

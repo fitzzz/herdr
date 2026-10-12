@@ -8,7 +8,8 @@ A next-day live swap remains a separate action requiring Fitz's explicit approva
 ## Namespace and update protection
 
 The packaged `bin/herdr-fast-api` launcher verifies the artifact hash, removes
-inherited Herdr routing and pane identities, removes common provider-home and
+inherited Herdr routing and pane identities, removes all provider-home selectors
+recognized by `src/integration/env.rs` and platform home fallbacks, clears
 SSH-agent overrides, and sets a private HOME and XDG config/state/data/cache/runtime
 hierarchy. It always supplies `--session fast`. These are existing supported
 settings; no wire protocol changes are needed. Its default hierarchy is
@@ -105,6 +106,22 @@ any command fails. Record Windows lint as unrun; do not label this narrower run
 modes run `just build`
 and stage a versioned read-only package. No upstream release recipe is invoked.
 
+Focused remote packaging proof (after the parent hands over the exclusive lane):
+
+```sh
+python3 -m unittest scripts.fast_api.test_packaging scripts.fast_api.test_rehearsal
+HERDR_FAST_API_TEST_BINARY="$R/hf/target-candidate/release/herdr" \
+  python3 -m unittest scripts.fast_api.test_launcher_integration
+```
+
+The second command requires an explicit prebuilt downstream artifact; missing
+input is an error. It stages a disposable package, seeds synthetic external
+provider directories, and installs Pi's integration through the private launcher.
+It verifies the private extension was written and every external directory and
+sentinel remained unchanged. No real provider is launched or configured. The
+receipt contract synchronizes an append after the waiter starts, flushes while
+the writer remains open, and checks the queued filesystem event without a delay.
+
 ## 174-pane old-to-candidate rehearsal
 
 Run only remotely, after builds finish, using release binaries. The rehearsal
@@ -126,12 +143,35 @@ python3 scripts/fast_api/rehearse.py \
 ```
 
 Success verifies all 174 canonical pane/workspace/tab/terminal identities, child
-PIDs plus process start ticks, no HUP, six ordered input records per child across
+PIDs plus process start ticks, no HUP, six ordered input records per child and
+every unique `got:` output line through `pane.read` across
 the transition, candidate ownership of the public socket, and fresh API connections and generation-1 client handshakes at 483×128. Failure cases verify the source retains ownership and every
 child continues consuming ordered input. The existing importer failure injection
 `HERDR_TEST_HANDOFF_IMPORT_FAIL=after_restored` exercises rollback after PTY
 restoration but before commit. Result JSON, child markers and logs stay in the
 owned run root. No successful claim is made until the parent inspects them.
+
+Output verification waits for each phase's final `got:` line with the supported
+`pane.wait_for_output` API, then reads the same pane's recent unwrapped terminal
+output. Every expected line must occur exactly once and in order; input echo or
+another pane's output cannot satisfy the check. `terminal-output.json` retains
+the successful snapshots. No client delay or automatic deadline is added.
+
+Run the missing-output negative control on another fresh root:
+
+```sh
+python3 scripts/fast_api/rehearse.py \
+  --old "$R/hf/artifacts/published-herdr" \
+  --candidate "$R/hf/target-candidate/release/herdr" \
+  --root "$R/hf/rh-no-output" --suppress-output-pane 0
+```
+
+This command must exit nonzero with `missing or duplicated output
+'got:after-0-0'`, after the receipt ledger passes. The synthetic child still
+records all input and emits the final output line, so absence is detected after
+an output barrier. No timeout is needed to make this negative control finish.
+The Python contract also exercises this suppression with an actual synthetic
+child, confirms its receipt is intact, and rejects its incomplete output.
 
 The large Python rehearsal negotiates the generation-1 client endpoint before
 and after handoff. It does not drive a full TUI. Run existing `just test-one live_handoff` remotely as the
