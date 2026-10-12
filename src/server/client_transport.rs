@@ -1706,26 +1706,34 @@ mod tests {
     fn observer_write_timeout_resets_when_sending_makes_progress() {
         use std::io::Read as _;
 
+        const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+        let timeout = Duration::from_millis(100);
         let (mut client, mut server, _path) = local_stream_pair("slow-observer");
-        server
-            .set_send_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        server.set_send_timeout(Some(timeout)).unwrap();
         server.set_nonblocking(true).unwrap();
         let worker = std::thread::spawn(move || {
-            assert!(write_framed_bytes(&mut server, &vec![b'x'; 1024 * 1024]));
+            let data = vec![b'x'; PAYLOAD_BYTES];
+            let started = std::time::Instant::now();
+            assert!(write_framed_bytes(&mut server, &data));
+            started.elapsed()
         });
         client
             .set_recv_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut received = 0;
-        let mut buffer = [0; 16 * 1024];
-        while received < 1024 * 1024 {
+        // Drain enough between sleeps to restore socket writability even when
+        // the host oversleeps. Small reads can leave POLLOUT below its threshold.
+        let mut buffer = [0; 128 * 1024];
+        while received < PAYLOAD_BYTES {
             let count = client.read(&mut buffer).unwrap();
             assert_ne!(count, 0, "observer disconnected while making progress");
             received += count;
             std::thread::sleep(Duration::from_millis(5));
         }
-        worker.join().unwrap();
+        assert!(
+            worker.join().unwrap() > timeout,
+            "transfer must outlast one timeout to exercise progress resets"
+        );
     }
 
     #[cfg(unix)]
