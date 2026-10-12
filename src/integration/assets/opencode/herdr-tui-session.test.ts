@@ -595,10 +595,21 @@ test("V2 aggregates root and child blockers and ignores other roots and child co
   await flushReports();
   expect(states().at(-1)).toBe("blocked");
   expect(requests.every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
+  const previousStates = states();
   tui.emit("form.cancelled", { sessionID: "child", id: "form-child" });
   tui.emit("session.execution.succeeded", { sessionID: "a" });
   await flushReports();
-  expect(states().slice(-2)).toEqual(["working", "idle"]);
+  // Selection retries can resend the latest state. Require the transitions,
+  // including the unblocked working report, without rejecting an idle resend.
+  const delivered = states().slice(previousStates.length);
+  const transitions = delivered.filter((state, index) =>
+    state !== (index === 0 ? previousStates.at(-1) : delivered[index - 1]));
+  expect(transitions).toEqual(["working", "idle"]);
+  expect(requests.every((r) => requestParam(r, "agent_session_id") === "a")).toBe(true);
+  const sequences = requests.filter((r) => requestParam(r, "state") !== undefined)
+    .map((r) => Number(requestParam(r, "seq")));
+  expect(sequences.every((seq, index) => Number.isSafeInteger(seq) &&
+    (index === 0 || seq > sequences[index - 1]))).toBe(true);
 });
 
 test("V2 discards queued reports after selection changes and stops on disposal", async () => {
