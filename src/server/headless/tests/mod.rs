@@ -3575,7 +3575,7 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
         11,
         ClientConnection::new_with_mode(
             ClientConnectionMode::ClientShell,
-            (80, 24),
+            (80, 2),
             crate::kitty_graphics::HostCellSize::default(),
             1,
             RenderEncoding::SemanticFrame,
@@ -3583,6 +3583,21 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
         ),
     );
     server.foreground_client_id = Some(11);
+
+    // This test covers a scroll reset on an already controlled terminal. First
+    // input on an unclaimed tab also changes geometry and correctly requires Full.
+    assert!(server.claim_unowned_shell_tab_geometry(11, false));
+    let runtime = server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .unwrap();
+    runtime.scroll_up(1);
+    assert!(runtime
+        .scroll_metrics()
+        .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+    let stable_size = runtime.current_size();
+    server.app.render_dirty.take();
 
     let render_impact =
         server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
@@ -3595,7 +3610,18 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
 
     assert_eq!(render_impact, RenderImpact::None);
     let damage = server.app.render_dirty.take();
+    assert!(!damage.generic);
     assert_eq!(damage.pty_sources, HashSet::from([pane_id]));
+    assert_eq!(
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap()
+            .current_size(),
+        stable_size,
+        "a scroll-only reset must leave the controlled geometry unchanged"
+    );
     assert_eq!(
         input_rx.try_recv().expect("text must reach the PTY"),
         Bytes::from_static(b"x")
