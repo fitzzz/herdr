@@ -81,25 +81,32 @@ def owned_socket_path(root, session):
 
 
 class JsonPeer:
-    """One FIFO JSON connection. Each workload thread owns its own peer."""
+    """Sequential ordinary calls or one stream, owned by one workload thread."""
 
     def __init__(self, path, expected_pid):
+        self.path, self.expected_pid = path, expected_pid
+        self.serial = 0
+        self.requests = 0
+        self.bytes_received = 0
+        self.stream = None
+        self.connect()
+
+    def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            self.sock.connect(str(path))
+            self.sock.connect(str(self.path))
             pid, uid, _ = struct.unpack("3i", self.sock.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-            if pid != expected_pid or uid != os.getuid():
+            if pid != self.expected_pid or uid != os.getuid():
                 raise RuntimeError(f"socket peer is not the owned server: {pid}/{uid}")
             self.stream = self.sock.makefile("rb")
         except BaseException:
             self.sock.close()
             raise
-        self.serial = 0
-        self.requests = 0
-        self.bytes_received = 0
 
     def send(self, method, params):
+        if self.stream is None:
+            self.connect()
         self.serial += 1
         request_id = f"bench-{self.serial}"
         data = json.dumps({"id": request_id, "method": method, "params": params})
@@ -115,8 +122,13 @@ class JsonPeer:
         return json.loads(line)
 
     def request(self, method, **params):
-        request_id = self.send(method, params)
-        response = self.receive()
+        # Ordinary API calls own one connection; only streaming subscriptions
+        # retain theirs. Reconnection also revalidates the owned server peer.
+        try:
+            request_id = self.send(method, params)
+            response = self.receive()
+        finally:
+            self.close()
         if response.get("id") != request_id:
             raise RuntimeError(f"response order/identity mismatch: {response}")
         if "error" in response:
@@ -128,7 +140,9 @@ class JsonPeer:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        self.stream.close()
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
         self.sock.close()
 
 
@@ -216,6 +230,13 @@ class TerminalCells:
             def __init__(self):
                 self.synchronized = False
                 super().__init__(cols, rows)
+
+            def report_device_status(self, mode, **kwargs):
+                # pyte 0.8.2's parser passes private=True for private DSRs,
+                # but its Screen handler accepts only mode. These queries do
+                # not draw cells; outer-terminal replies are handled by Tui.
+                if not kwargs.get("private"):
+                    super().report_device_status(mode)
 
             def set_mode(self, *modes, **kwargs):
                 super().set_mode(*modes, **kwargs)

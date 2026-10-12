@@ -183,6 +183,72 @@ class WorkloadTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "remote harness targets Linux")
 class JsonConnectionTest(unittest.TestCase):
+    def test_each_ordinary_request_reconnects_and_revalidates_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "one-request.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(path))
+                listener.listen(1)
+                listener.settimeout(.1)  # Let failing implementations cancel the fixture.
+                received = []
+                stopped = threading.Event()
+                def respond():
+                    accepted = 0
+                    while accepted < 3 and not stopped.is_set():
+                        try:
+                            connection, _ = listener.accept()
+                        except socket.timeout:
+                            continue
+                        accepted += 1
+                        with connection, connection.makefile("rb") as stream:
+                            line = stream.readline()
+                            if line:
+                                request = json.loads(line)
+                                received.append(request)
+                                connection.sendall(json.dumps({"id": request["id"],
+                                                               "result": {"type": "ok"}}).encode() + b"\n")
+                thread = threading.Thread(target=respond)
+                thread.start()
+                peer = bench.JsonPeer(path, os.getpid())
+                try:
+                    self.assertEqual(peer.request("workspace.list"), {"type": "ok"})
+                    self.assertEqual(peer.request("workspace.list"), {"type": "ok"})
+                    self.assertEqual([r["id"] for r in received], ["bench-1", "bench-2"])
+                    # A replacement server must be rejected on the next call.
+                    peer.expected_pid = os.getpid() + 1
+                    with self.assertRaisesRegex(RuntimeError, "not the owned server"):
+                        peer.request("workspace.list")
+                    self.assertEqual(len(received), 2)
+                finally:
+                    peer.close()
+                    stopped.set()
+                    thread.join()
+
+    def test_subscription_keeps_one_connection_for_multiple_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stream.sock"
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(path))
+                listener.listen(1)
+                def respond():
+                    connection, _ = listener.accept()
+                    with connection, connection.makefile("rb") as stream:
+                        request = json.loads(stream.readline())
+                        for value in [{"id": request["id"], "result": {"type": "subscription_started"}},
+                                      {"event": 1}, {"event": 2}]:
+                            connection.sendall(json.dumps(value).encode() + b"\n")
+                thread = threading.Thread(target=respond)
+                thread.start()
+                peer = bench.JsonPeer(path, os.getpid())
+                try:
+                    request_id = peer.send("events.subscribe", {"subscriptions": []})
+                    self.assertEqual(peer.receive()["id"], request_id)
+                    self.assertEqual(peer.receive(), {"event": 1})
+                    self.assertEqual(peer.receive(), {"event": 2})
+                finally:
+                    peer.close()
+                    thread.join()
+
     def exercise(self, response_id, expected_pid=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fake-api.sock"
@@ -272,6 +338,16 @@ class ProducerProtocolTest(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "linux" and importlib.util.find_spec("pyte"),
                      "cell-observer contracts require remote pyte dependency")
 class CellObserverTest(unittest.TestCase):
+    def test_private_device_status_query_does_not_change_cells_or_break_parser(self):
+        cells = bench.TerminalCells(20, 3)
+        cells.feed(b"\x1b[1;1HREADY")
+        before = tuple(cells.screen.display)
+        cells.feed(b"\x1b[?99")
+        cells.feed(b"6n")
+        self.assertEqual(tuple(cells.screen.display), before)
+        commits = cells.feed(b"\x1b[2;1HECHO00000001")
+        self.assertTrue(any("ECHO00000001" in text for text, _ in commits))
+
     def test_synchronized_update_never_publishes_partial_frame_cells(self):
         cells = bench.TerminalCells(20, 3)
         self.assertEqual(cells.feed(b"\x1b[?2026h\x1b[1;1HECHO00000001"), [])
