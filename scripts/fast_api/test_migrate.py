@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import stat
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -201,6 +202,71 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             migrate.decode(b'{"map":{"id":"old","id":"new"}}')
         self.assertEqual(migrate.decode(b'{"sequence":18446744073709551615}')["sequence"], 2 ** 64 - 1)
+
+
+class SourceAPITests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="herdr-migration-api-test-")
+        self.path = Path(self.temporary.name) / "fixture.sock"
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        self.listener.listen(1)
+        self.api = migrate.SourceAPI(self.path, migrate.sha("/proc/self/exe"), {})
+
+    def tearDown(self):
+        self.listener.close()
+        self.temporary.cleanup()
+
+    def request_fixture(self, response):
+        observed = []
+        def serve():
+            with self.listener.accept()[0] as connection:
+                with connection.makefile("rb") as reader:
+                    line = reader.readline()
+                if line:
+                    request = migrate.decode(line)
+                    observed.append(request)
+                    connection.sendall(response(request))
+        worker = threading.Thread(target=serve)
+        worker.start()
+        try:
+            with patch.object(migrate, "source_context", return_value={}):
+                result = self.api.request("pane.list", {})
+            return result, observed
+        finally:
+            worker.join()
+
+    def test_raw_request_authenticates_peer_and_keeps_exact_request_id(self):
+        result, requests = self.request_fixture(lambda request: migrate.encoded({"id": request["id"], "result": {"panes": []}}))
+        self.assertEqual(result, {"panes": []})
+        self.assertEqual(requests[0]["method"], "pane.list")
+        self.assertEqual(self.api.source["pid"], os.getpid())
+
+    def test_wrong_response_id_is_not_accepted(self):
+        with self.assertRaisesRegex(ValueError, "source API rejected"):
+            self.request_fixture(lambda _request: migrate.encoded({"id": "another-request", "result": {"panes": []}}))
+
+    def test_replaced_socket_or_wrong_executable_is_not_accepted(self):
+        left, right = socket.socketpair()
+        try:
+            with patch.object(migrate, "source_context", return_value={}):
+                self.api.expected_hash = "0" * 64
+                with self.assertRaisesRegex(ValueError, "artifact/session context"):
+                    self.api.authenticate(left)
+                self.api.expected_hash = migrate.sha("/proc/self/exe")
+                replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                replacement_path = self.path.with_name("replacement.sock")
+                try:
+                    replacement.bind(str(replacement_path))
+                    self.path.unlink()
+                    replacement_path.rename(self.path)
+                    with self.assertRaisesRegex(ValueError, "socket/peer ownership"):
+                        self.api.authenticate(left)
+                finally:
+                    replacement.close()
+        finally:
+            left.close()
+            right.close()
 
 
 if __name__ == "__main__":

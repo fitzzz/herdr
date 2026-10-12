@@ -62,6 +62,11 @@ type RestoredTab = (
 );
 type RestoreFailures<T> = (T, usize);
 
+#[cfg(test)]
+thread_local! {
+    static RESTORE_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
 pub fn restore(
     snapshot: &SessionSnapshot,
@@ -338,6 +343,8 @@ fn restore_with_imports_and_failures(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
+    #[cfg(test)]
+    RESTORE_STARTS.with(|starts| starts.set(starts.get() + 1));
     let history = history.filter(|history| {
         let matches = history.layout_fingerprint.is_some()
             && history.layout_fingerprint == super::snapshot::layout_fingerprint(snapshot);
@@ -1109,6 +1116,49 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn identity_handoff_missing_later_runtime_never_enters_restore_or_resume() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let snapshot: crate::persist::SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "version":3,"active":0,"selected":0,"workspaces":[{"id":"wA","identity_cwd":"/tmp","tabs":[{
+                "layout":{"Split":{"direction":"Horizontal","ratio":0.5,"first":{"Pane":20},"second":{"Pane":30}}},
+                "panes":{"20":{"cwd":"/tmp"},"30":{"cwd":"/tmp","agent_session":{"source":"herdr:pi","agent":"pi","kind":"path","value":"/var/tmp/not-to-resume.jsonl"}}},"zoomed":false
+            }]}]
+        })).unwrap();
+        let state = serde_json::from_value(serde_json::json!({"pane_id":20,"child_pid":42,"rows":24,"cols":80,"cell_width_px":0,"cell_height_px":0})).unwrap();
+        let mut imports = HashMap::from([(
+            20,
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                preserved_terminal_id: Some(
+                    crate::terminal::TerminalId::checked_import("old-exact-id".into()).unwrap(),
+                ),
+                observation_epoch: Some("fresh-epoch".into()),
+                master_fd: std::fs::File::open("/dev/null").unwrap().into(),
+                state,
+            },
+        )]);
+        let before = super::RESTORE_STARTS.with(std::cell::Cell::get);
+        let (events, _receiver) = tokio::sync::mpsc::channel(1);
+        let result = super::restore_handoff(
+            &snapshot,
+            4096,
+            "/this-shell-must-never-be-spawned",
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(crate::render_signal::RenderSignal::new()),
+        );
+        assert!(result.is_err());
+        assert_eq!(super::RESTORE_STARTS.with(std::cell::Cell::get), before);
+        assert_eq!(
+            imports.len(),
+            1,
+            "no earlier runtime was consumed before discovering the later gap"
+        );
+    }
     use super::*;
 
     fn test_session_path(name: &str) -> String {

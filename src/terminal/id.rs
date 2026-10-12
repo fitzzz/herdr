@@ -33,6 +33,19 @@ fn reserve_ids(reserved: &mut HashSet<String>, ids: &[TerminalId]) -> io::Result
     Ok(())
 }
 
+fn allocate_unreserved(
+    micros: u128,
+    reserved: &HashSet<String>,
+    mut next_counter: impl FnMut() -> u64,
+) -> TerminalId {
+    loop {
+        let id = format!("term_{micros:x}{:x}", next_counter());
+        if !reserved.contains(&id) {
+            return TerminalId(id);
+        }
+    }
+}
+
 impl TerminalId {
     pub fn alloc() -> Self {
         let micros = SystemTime::now()
@@ -42,21 +55,16 @@ impl TerminalId {
         let reserved = imported_ids()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        loop {
-            let counter =
-                match NEXT_TERMINAL_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                }) {
-                    Ok(counter) => counter,
-                    // The infallible allocation API must never wrap into a reused
-                    // identity. Exhaustion is a process invariant failure.
-                    Err(_) => panic!("terminal identity counter exhausted"),
-                };
-            let id = format!("term_{micros:x}{counter:x}");
-            if !reserved.contains(&id) {
-                return Self(id);
+        allocate_unreserved(micros, &reserved, || {
+            match NEXT_TERMINAL_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            }) {
+                Ok(counter) => counter,
+                // The infallible allocation API must never wrap into a reused
+                // identity. Exhaustion is a process invariant failure.
+                Err(_) => panic!("terminal identity counter exhausted"),
             }
-        }
+        })
     }
 
     pub(crate) fn checked_import(value: String) -> io::Result<Self> {
@@ -115,6 +123,29 @@ mod tests {
         assert_eq!(reserved, before);
         assert!(TerminalId::checked_import(String::new()).is_err());
         assert!(reserve_ids(&mut reserved, &[ids[0].clone(), ids[0].clone()]).is_err());
+    }
+
+    #[test]
+    fn allocation_skips_imported_ids_even_with_ambiguous_suffix_and_reversing_clock() {
+        let old = TerminalId::checked_import("term_1234".into()).unwrap();
+        let mut reserved = HashSet::new();
+        reserve_ids(&mut reserved, &[old.clone()]).unwrap();
+        let mut counters = [4, 5].into_iter();
+        assert_eq!(
+            allocate_unreserved(0x123, &reserved, || counters.next().unwrap()).as_str(),
+            "term_1235"
+        );
+        let mut counters = [0x34, 0x35].into_iter();
+        assert_eq!(
+            allocate_unreserved(0x12, &reserved, || counters.next().unwrap()).as_str(),
+            "term_1235"
+        );
+        assert_eq!(allocate_unreserved(0, &reserved, || 1).as_str(), "term_01");
+        drop(old);
+        assert!(
+            reserved.contains("term_1234"),
+            "closing an imported identity must not free its reservation"
+        );
     }
 
     #[test]
