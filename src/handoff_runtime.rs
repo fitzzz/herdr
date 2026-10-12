@@ -52,3 +52,51 @@ pub(crate) struct ImportedHandoffRuntime {
     #[cfg(unix)]
     pub state: HandoffRuntimeState,
 }
+
+#[cfg(unix)]
+pub(crate) const SAVED_DIRECTORY_UNAVAILABLE: &str =
+    "Saved directory is unavailable. Restore the directory and restart this session.";
+
+/// Explicit capture of an existing unavailable pane, with no PTY or process.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UnavailableHandoffState {
+    pub restore_error: String,
+    pub cwd: std::path::PathBuf,
+    pub label: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct ImportedHandoffPlaceholder {
+    pub terminal_id: crate::terminal::TerminalId,
+    pub observation_epoch: String,
+    pub state: UnavailableHandoffState,
+}
+
+/// A continuing live runtime or a captured unavailable placeholder. Absence
+/// is explicit and can never be inferred from a missing live-runtime entry.
+#[derive(Debug)]
+pub(crate) enum HandoffImport {
+    Runtime(ImportedHandoffRuntime),
+    #[cfg(unix)]
+    Unavailable(ImportedHandoffPlaceholder),
+}
+
+impl HandoffImport {
+    #[cfg(unix)]
+    pub(crate) fn preserved_terminal_id(&self) -> Option<&crate::terminal::TerminalId> {
+        match self {
+            Self::Runtime(runtime) => runtime.preserved_terminal_id.as_ref(),
+            Self::Unavailable(placeholder) => Some(&placeholder.terminal_id),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn observation_epoch(&self) -> Option<&str> {
+        match self {
+            Self::Runtime(runtime) => runtime.observation_epoch.as_deref(),
+            Self::Unavailable(placeholder) => Some(&placeholder.observation_epoch),
+        }
+    }
+}

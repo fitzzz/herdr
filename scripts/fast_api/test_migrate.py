@@ -49,6 +49,9 @@ class FakeAPI:
             return {"snapshot": self.first_snapshot if self.snapshot_reads == 1 else self.second_snapshot}
         if method == "pane.process_info":
             address = params["pane_id"]
+            item = next(value for value in self.panes if value["pane_id"] == address)
+            if item.get("restore_error"):
+                raise migrate.SourceResponseError({"error": {"code": "pane_not_found"}})
             return {"process_info": {"pane_id": address, "shell_pid": 100 + next(index for index, value in enumerate(self.panes) if value["pane_id"] == address)}}
         raise AssertionError("unexpected API method: " + method)
 
@@ -114,6 +117,41 @@ class CaptureTests(unittest.TestCase):
         agent["agent_session"] = None
         with self.assertRaises(ValueError):
             migrate.identity_table([original], [agent])
+
+    def test_explicit_unavailable_placeholder_keeps_identity_and_proves_absence_twice(self):
+        placeholder = {**pane(2), "cwd": "/owned-fixture-missing-directory", "label": "saved label",
+                       "agent_status": "unknown", "restore_error": migrate.SAVED_DIRECTORY_UNAVAILABLE}
+        api = FakeAPI([pane(), placeholder])
+        with patch.object(migrate, "process_stamp", self.stamp):
+            _, result, _ = migrate.capture(api)
+        self.assertEqual(result[1]["terminal_id"], "opaque-2")
+        self.assertIsNone(result[1]["child"])
+        self.assertEqual(result[1]["unavailable"], {key: placeholder[key] for key in ("cwd", "label", "restore_error")})
+        self.assertEqual(sum(method == "pane.process_info" and params["pane_id"] == "wA:p2" for method, params in api.calls), 2)
+        api = FakeAPI([pane(), placeholder])
+        api.second_snapshot["panes"][1]["label"] = "changed"
+        with patch.object(migrate, "process_stamp", self.stamp), self.assertRaisesRegex(ValueError, "identity changed"):
+            migrate.capture(api)
+
+    def test_placeholder_does_not_mask_unexpected_runtime_or_other_errors(self):
+        placeholder = {**pane(), "cwd": "/owned-fixture-missing-directory", "agent_status": "unknown",
+                       "restore_error": migrate.SAVED_DIRECTORY_UNAVAILABLE}
+        api = FakeAPI([placeholder])
+        original = api.request
+        def request(method, params):
+            if method == "pane.process_info":
+                return {"process_info": {"pane_id": params["pane_id"], "shell_pid": 100}}
+            return original(method, params)
+        api.request = request
+        with self.assertRaisesRegex(ValueError, "unexpectedly has a runtime"):
+            migrate.capture(api)
+        for code in ("invalid_params", "connection_lost"):
+            with self.subTest(code=code):
+                with patch.object(api, "request", side_effect=migrate.SourceResponseError({"error": {"code": code}})), self.assertRaises(migrate.SourceResponseError):
+                    migrate.verify_runtime_absent(api, "wA:p1")
+        for change in ({"restore_error": "another restore failure"}, {"agent_session": {"kind": "id", "value": "native"}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                migrate.identity_table([{**placeholder, **change}], [])
 
 
 class ReceiptTests(unittest.TestCase):

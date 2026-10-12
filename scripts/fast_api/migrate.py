@@ -19,6 +19,13 @@ import tempfile
 import uuid
 
 MAX_JSON = 32 * 1024 * 1024
+SAVED_DIRECTORY_UNAVAILABLE = "Saved directory is unavailable. Restore the directory and restart this session."
+
+
+class SourceResponseError(ValueError):
+    def __init__(self, response):
+        super().__init__("source API rejected request: " + json.dumps(response))
+        self.code = response["error"].get("code")
 
 
 def unique_object(pairs):
@@ -160,7 +167,11 @@ class SourceAPI:
             if not line or len(line) > MAX_JSON or not line.endswith(b"\n"):
                 raise ValueError("source response is missing, oversized or incomplete")
             response = decode(line)
-            if response.get("id") != request_id or "error" in response or "result" not in response:
+            if response.get("id") != request_id or ("error" in response and "result" in response):
+                raise ValueError("source API rejected request: " + json.dumps(response))
+            if "error" in response and isinstance(response["error"], dict):
+                raise SourceResponseError(response)
+            if "result" not in response:
                 raise ValueError("source API rejected request: " + json.dumps(response))
             return response["result"]
 
@@ -176,14 +187,22 @@ def identity_table(panes, agents):
     terminals = set()
     for pane in panes:
         address, terminal = pane["pane_id"], pane["terminal_id"]
-        if not address or not terminal or address in result or terminal in terminals or pane.get("restore_error"):
+        if not address or not terminal or address in result or terminal in terminals:
             raise ValueError("pane capture is incomplete, duplicated or unavailable")
         agent = names.pop(terminal, None)
         if agent is not None and any(agent.get(key) != pane.get(key) for key in ("pane_id", "workspace_id", "tab_id", "agent_session")):
             raise ValueError("pane/agent identity association differs")
         result[address] = {key: pane[key] for key in ("pane_id", "terminal_id", "workspace_id", "tab_id")}
         result[address].update(agent_name=agent.get("name") if agent else None,
-                               agent_session=pane.get("agent_session"))
+                               agent_session=pane.get("agent_session"), unavailable=None)
+        if pane.get("restore_error"):
+            if (pane["restore_error"] != SAVED_DIRECTORY_UNAVAILABLE or agent is not None
+                    or pane.get("agent_session") is not None or pane.get("agent") is not None
+                    or pane.get("display_agent") is not None or pane.get("agent_status") != "unknown"
+                    or not isinstance(pane.get("cwd"), str) or not os.path.isabs(pane["cwd"])):
+                raise ValueError("unavailable pane is not the bounded saved-directory placeholder")
+            result[address]["unavailable"] = {"restore_error": pane["restore_error"],
+                                               "cwd": pane["cwd"], "label": pane.get("label")}
         terminals.add(terminal)
     if names:
         raise ValueError("unaccounted agents in capture")
@@ -221,6 +240,10 @@ def capture(api):
         raise ValueError("initial pane/snapshot capture differs")
     children = set()
     for address, pane in table.items():
+        if pane["unavailable"] is not None:
+            verify_runtime_absent(api, address)
+            pane["child"] = None
+            continue
         info = api.request("pane.process_info", {"pane_id": address})["process_info"]
         if info["pane_id"] != address:
             raise ValueError("process capture address differs")
@@ -235,9 +258,22 @@ def capture(api):
     if bare_table != identity_table(pane_b, snap_b["agents"]) or bare_table != identity_table(snap_b["panes"], snap_b["agents"]) or membership(snap_a) != membership(snap_b):
         raise ValueError("identity changed while bracketing capture")
     for pane in table.values():
+        if pane["unavailable"] is not None:
+            verify_runtime_absent(api, pane["pane_id"])
+            continue
         if process_stamp(pane["child"]["pid"]) != pane["child"]:
             raise ValueError("shell process changed after capture")
     return ping, list(table.values()), snap_b["agents"]
+
+
+def verify_runtime_absent(api, address):
+    try:
+        api.request("pane.process_info", {"pane_id": address})
+    except SourceResponseError as error:
+        if error.code == "pane_not_found":
+            return
+        raise
+    raise ValueError("unavailable placeholder unexpectedly has a runtime")
 
 
 def exclusive_write(directory_fd, name, data, mode=0o400):

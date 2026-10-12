@@ -100,7 +100,7 @@ pub fn restore(
 #[cfg(unix)]
 pub(crate) fn validate_identity_imports(
     snapshot: &SessionSnapshot,
-    imports: &HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imports: &HashMap<u32, crate::handoff_runtime::HandoffImport>,
 ) -> std::io::Result<()> {
     let mut raw_ids = HashSet::new();
     let mut terminal_ids = HashSet::new();
@@ -126,12 +126,11 @@ pub(crate) fn validate_identity_imports(
                         "identity handoff is missing a pane runtime; no restore may spawn",
                     )
                 })?;
-                let terminal_id = import.preserved_terminal_id.as_ref().ok_or_else(|| {
+                let terminal_id = import.preserved_terminal_id().ok_or_else(|| {
                     std::io::Error::other("identity handoff is missing an admitted terminal ID")
                 })?;
                 let observed_epoch = import
-                    .observation_epoch
-                    .as_deref()
+                    .observation_epoch()
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| {
                         std::io::Error::other("identity handoff has no observation epoch")
@@ -142,13 +141,36 @@ pub(crate) fn validate_identity_imports(
                     ));
                 }
                 epoch = Some(observed_epoch);
-                if import.state.pane_id != raw_id
-                    || import.state.child_pid == 0
-                    || !terminal_ids.insert(terminal_id)
-                {
+                if !terminal_ids.insert(terminal_id) {
                     return Err(std::io::Error::other(
                         "identity handoff runtime/terminal association differs",
                     ));
+                }
+                match import {
+                    crate::handoff_runtime::HandoffImport::Runtime(runtime)
+                        if runtime.state.pane_id == raw_id && runtime.state.child_pid != 0 => {}
+                    crate::handoff_runtime::HandoffImport::Unavailable(placeholder) => {
+                        let saved = &tab.panes[&raw_id];
+                        if placeholder.state.restore_error
+                            != crate::handoff_runtime::SAVED_DIRECTORY_UNAVAILABLE
+                            || !placeholder.state.cwd.is_absolute()
+                            || placeholder.state.cwd != saved.cwd
+                            || placeholder.state.label != saved.label
+                            || saved.agent_session.is_some()
+                            || saved.agent_name.is_some()
+                            || saved.managed_agent_kind.is_some()
+                            || saved.agent_resume.is_some()
+                        {
+                            return Err(std::io::Error::other(
+                                "identity handoff unavailable placeholder differs",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "identity handoff runtime/terminal association differs",
+                        ));
+                    }
                 }
             }
         }
@@ -167,14 +189,14 @@ pub fn restore_handoff(
     scrollback_limit_bytes: usize,
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
-    imports: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imports: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
     if imports
         .values()
-        .any(|import| import.preserved_terminal_id.is_some())
+        .any(|import| import.preserved_terminal_id().is_some())
     {
         validate_identity_imports(snapshot, imports)?;
     }
@@ -269,7 +291,7 @@ fn restore_with_imports_strict(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imported_panes: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -309,7 +331,7 @@ fn restore_with_imports(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imported_panes: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -338,7 +360,7 @@ fn restore_with_imports_and_failures(
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
     resume_agents_on_restore: bool,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imported_panes: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -396,7 +418,7 @@ fn restore_workspace(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imported_panes: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
 ) -> RestoreFailures<Option<RestoredWorkspace>> {
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
@@ -569,7 +591,7 @@ fn restore_tab(
     cols: u16,
     runtime_context: &RestoreRuntimeContext<'_>,
     resumed_agent_sessions: &mut HashSet<String>,
-    imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+    imported_panes: &mut HashMap<u32, crate::handoff_runtime::HandoffImport>,
     public_pane_ids_by_old_raw: &HashMap<u32, String>,
 ) -> RestoreFailures<Option<RestoredTab>> {
     let (node, id_map) = restore_node_remapped(&snap.layout);
@@ -591,11 +613,35 @@ fn restore_tab(
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
 
         let cwd = saved_cwd;
+        #[cfg(unix)]
+        if old_id.is_some_and(|raw| {
+            matches!(
+                imported_panes.get(raw),
+                Some(crate::handoff_runtime::HandoffImport::Unavailable(_))
+            )
+        }) {
+            let Some(crate::handoff_runtime::HandoffImport::Unavailable(placeholder)) =
+                old_id.and_then(|raw| imported_panes.remove(raw))
+            else {
+                unreachable!("validated unavailable handoff import changed");
+            };
+            // Preserve the captured failure even if its directory has since
+            // become available. This import never creates or resumes a PTY.
+            let terminal_id = placeholder.terminal_id;
+            let mut terminal = TerminalState::new(terminal_id.clone(), placeholder.state.cwd);
+            terminal.restore_error = Some(placeholder.state.restore_error);
+            terminal.manual_label = placeholder.state.label;
+            terminal.launch_argv = saved_pane.and_then(|pane| pane.launch_argv.clone());
+            terminal.begin_handoff_observation_epoch(placeholder.observation_epoch);
+            panes.insert(*id, PaneState::new(terminal_id));
+            terminals.push(terminal);
+            continue;
+        }
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
         #[cfg(unix)]
         let preserves_identity = old_id
             .and_then(|raw| imported_panes.get(raw))
-            .is_some_and(|import| import.preserved_terminal_id.is_some());
+            .is_some_and(|import| import.preserved_terminal_id().is_some());
         #[cfg(not(unix))]
         let preserves_identity = false;
         if !has_import && !cwd.is_dir() {
@@ -665,7 +711,17 @@ fn restore_tab(
                 )
             })
             .unwrap_or_default();
-        let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
+        let imported_runtime = old_pane_id
+            .and_then(|old_id| imported_panes.remove(&old_id))
+            .map(|import| match import {
+                crate::handoff_runtime::HandoffImport::Runtime(runtime) => runtime,
+                #[cfg(unix)]
+                crate::handoff_runtime::HandoffImport::Unavailable(_) => {
+                    unreachable!(
+                        "unavailable handoff import was not restored before runtime planning"
+                    )
+                }
+            });
         let was_imported = imported_runtime.is_some();
         #[cfg(unix)]
         let preserved_terminal_id = imported_runtime
@@ -1118,6 +1174,68 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
 mod tests {
     #[cfg(unix)]
     #[test]
+    fn identity_handoff_preserves_explicit_unavailable_placeholder_without_runtime() {
+        let snapshot: crate::persist::SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "version":3,"active":0,"selected":0,"workspaces":[{"id":"wA","identity_cwd":"/tmp",
+                "public_pane_numbers":{"20":48},"public_tab_numbers":[13],"tabs":[{
+                "layout":{"Pane":20},"panes":{"20":{"cwd":"/tmp","label":"saved label"}},
+                "zoomed":false,"focused":20,"root_pane":20
+            }]}]
+        }))
+        .unwrap();
+        let terminal_id =
+            crate::terminal::TerminalId::checked_import("exact-unavailable-ID".into()).unwrap();
+        let mut imports = std::collections::HashMap::from([(
+            20,
+            crate::handoff_runtime::HandoffImport::Unavailable(
+                crate::handoff_runtime::ImportedHandoffPlaceholder {
+                    terminal_id: terminal_id.clone(),
+                    observation_epoch: "fresh-placeholder-epoch".into(),
+                    state: crate::handoff_runtime::UnavailableHandoffState {
+                        restore_error: crate::handoff_runtime::SAVED_DIRECTORY_UNAVAILABLE.into(),
+                        cwd: "/tmp".into(),
+                        label: Some("saved label".into()),
+                    },
+                },
+            ),
+        )]);
+        let (events, _receiver) = tokio::sync::mpsc::channel(1);
+        let (workspaces, terminals, runtimes) = super::restore_handoff(
+            &snapshot,
+            4096,
+            "/this-shell-must-never-be-spawned",
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        assert!(imports.is_empty());
+        assert!(runtimes.is_empty());
+        assert_eq!(terminals.len(), 1);
+        let terminal = &terminals[&terminal_id];
+        assert_eq!(terminal.cwd, std::path::PathBuf::from("/tmp"));
+        assert_eq!(terminal.manual_label.as_deref(), Some("saved label"));
+        assert_eq!(
+            terminal.restore_error.as_deref(),
+            Some(crate::handoff_runtime::SAVED_DIRECTORY_UNAVAILABLE)
+        );
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("fresh-placeholder-epoch")
+        );
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        let workspace = &workspaces[0];
+        assert_eq!(workspace.tabs[0].number, 13);
+        let pane = workspace.tabs[0].panes.keys().next().copied().unwrap();
+        assert_eq!(workspace.tabs[0].terminal_id(pane), Some(&terminal_id));
+        assert_eq!(workspace.public_pane_numbers[&pane], 48);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn identity_handoff_missing_later_runtime_never_enters_restore_or_resume() {
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -1130,14 +1248,16 @@ mod tests {
         let state = serde_json::from_value(serde_json::json!({"pane_id":20,"child_pid":42,"rows":24,"cols":80,"cell_width_px":0,"cell_height_px":0})).unwrap();
         let mut imports = HashMap::from([(
             20,
-            crate::handoff_runtime::ImportedHandoffRuntime {
-                preserved_terminal_id: Some(
-                    crate::terminal::TerminalId::checked_import("old-exact-id".into()).unwrap(),
-                ),
-                observation_epoch: Some("fresh-epoch".into()),
-                master_fd: std::fs::File::open("/dev/null").unwrap().into(),
-                state,
-            },
+            crate::handoff_runtime::HandoffImport::Runtime(
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    preserved_terminal_id: Some(
+                        crate::terminal::TerminalId::checked_import("old-exact-id".into()).unwrap(),
+                    ),
+                    observation_epoch: Some("fresh-epoch".into()),
+                    master_fd: std::fs::File::open("/dev/null").unwrap().into(),
+                    state,
+                },
+            ),
         )]);
         let before = super::RESTORE_STARTS.with(std::cell::Cell::get);
         let (events, _receiver) = tokio::sync::mpsc::channel(1);
@@ -2068,14 +2188,18 @@ mod tests {
             let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
             let mut imports = HashMap::from([(
                 pane_id.raw(),
-                crate::handoff_runtime::ImportedHandoffRuntime {
-                    preserved_terminal_id: None,
-                    observation_epoch: None,
-                    master_fd: unsafe {
-                        std::os::fd::FromRawFd::from_raw_fd(runtime.duplicate_handoff_fd().unwrap())
+                crate::handoff_runtime::HandoffImport::Runtime(
+                    crate::handoff_runtime::ImportedHandoffRuntime {
+                        preserved_terminal_id: None,
+                        observation_epoch: None,
+                        master_fd: unsafe {
+                            std::os::fd::FromRawFd::from_raw_fd(
+                                runtime.duplicate_handoff_fd().unwrap(),
+                            )
+                        },
+                        state,
                     },
-                    state,
-                },
+                ),
             )]);
             let (_, mut restored_terminals, restored_runtimes) = restore_handoff(
                 &snapshot,

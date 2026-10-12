@@ -189,11 +189,16 @@ fn run_handoff_import_server(
         let pane_id = pane.pane_id;
         #[cfg(target_os = "linux")]
         let preserved_terminal_id = if let Some(identities) = &mut received.identities {
-            Some(
-                identities
-                    .remove(&pane_id)
-                    .ok_or_else(|| io::Error::other("admitted terminal identity is missing"))?,
-            )
+            match identities.remove(&pane_id) {
+                Some(crate::server::handoff_identity::AdmittedPaneIdentity::Runtime(id)) => {
+                    Some(id)
+                }
+                _ => {
+                    return Err(io::Error::other(
+                        "admitted live terminal identity is missing",
+                    ))
+                }
+            }
         } else {
             None
         };
@@ -207,12 +212,14 @@ fn run_handoff_import_server(
         let observation_epoch = None;
         let previous = imports.insert(
             pane_id,
-            crate::handoff_runtime::ImportedHandoffRuntime {
-                preserved_terminal_id,
-                observation_epoch,
-                master_fd: fd,
-                state: pane,
-            },
+            crate::handoff_runtime::HandoffImport::Runtime(
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    preserved_terminal_id,
+                    observation_epoch,
+                    master_fd: fd,
+                    state: pane,
+                },
+            ),
         );
         if previous.is_some() {
             return Err(io::Error::other("duplicate handoff raw pane ID"));
@@ -220,17 +227,30 @@ fn run_handoff_import_server(
     }
     #[cfg(target_os = "linux")]
     if identity_attempt.is_some() {
-        if received
-            .identities
-            .as_ref()
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            return Err(io::Error::other("unconsumed admitted terminal identities"));
+        for (raw, identity) in received.identities.take().unwrap_or_default() {
+            let crate::server::handoff_identity::AdmittedPaneIdentity::Unavailable(placeholder) =
+                identity
+            else {
+                return Err(io::Error::other(
+                    "unconsumed admitted live terminal identity",
+                ));
+            };
+            if imports
+                .insert(
+                    raw,
+                    crate::handoff_runtime::HandoffImport::Unavailable(placeholder),
+                )
+                .is_some()
+            {
+                return Err(io::Error::other(
+                    "unavailable/live handoff pane identity overlaps",
+                ));
+            }
         }
         crate::persist::validate_identity_imports(&received.manifest.snapshot, &imports)?;
         let ids: Vec<_> = imports
             .values()
-            .filter_map(|import| import.preserved_terminal_id.clone())
+            .filter_map(|import| import.preserved_terminal_id().cloned())
             .collect();
         crate::terminal::TerminalId::reserve_imported(&ids)?;
     }

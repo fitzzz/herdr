@@ -54,7 +54,8 @@ pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
     pub fds: Vec<OwnedFd>,
     #[cfg(target_os = "linux")]
-    pub identities: Option<std::collections::HashMap<u32, crate::terminal::TerminalId>>,
+    pub identities:
+        Option<std::collections::HashMap<u32, super::handoff_identity::AdmittedPaneIdentity>>,
     pub stream: UnixStream,
 }
 

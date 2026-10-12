@@ -637,10 +637,7 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
         snapshot: &crate::persist::SessionSnapshot,
-        imports: &mut std::collections::HashMap<
-            u32,
-            crate::handoff_runtime::ImportedHandoffRuntime,
-        >,
+        imports: &mut std::collections::HashMap<u32, crate::handoff_runtime::HandoffImport>,
     ) -> io::Result<Self> {
         let mut app = Self::new(
             config,

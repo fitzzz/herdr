@@ -23,7 +23,13 @@ pub(crate) struct CapturedPane {
     pub tab_id: String,
     pub agent_name: Option<String>,
     pub agent_session: Option<Value>,
-    pub child: MigrationProcessStamp,
+    pub child: Option<MigrationProcessStamp>,
+    pub unavailable: Option<crate::handoff_runtime::UnavailableHandoffState>,
+}
+
+pub(crate) enum AdmittedPaneIdentity {
+    Runtime(TerminalId),
+    Unavailable(crate::handoff_runtime::ImportedHandoffPlaceholder),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -175,7 +181,7 @@ impl IdentityAttempt {
         &self,
         manifest: &HandoffManifest,
         bytes: &[u8],
-    ) -> io::Result<HashMap<u32, TerminalId>> {
+    ) -> io::Result<HashMap<u32, AdmittedPaneIdentity>> {
         let identities = admit_manifest(&self.receipt, manifest)?;
         self.verify_processes()?;
         let record = serde_json::to_vec(&serde_json::json!({
@@ -196,8 +202,10 @@ impl IdentityAttempt {
     pub(crate) fn verify_processes(&self) -> io::Result<()> {
         self.verify_context()?;
         for pane in &self.receipt.panes {
-            if crate::platform::migration_process_stamp(pane.child.pid)? != pane.child {
-                return Err(mismatch("migration child identity changed"));
+            if let Some(child) = &pane.child {
+                if crate::platform::migration_process_stamp(child.pid)? != *child {
+                    return Err(mismatch("migration child identity changed"));
+                }
             }
         }
         Ok(())
@@ -233,7 +241,7 @@ fn layout_ids(layout: &crate::persist::LayoutSnapshot, ids: &mut Vec<u32>) {
 pub(crate) fn admit_manifest(
     receipt: &IdentityReceipt,
     manifest: &HandoffManifest,
-) -> io::Result<HashMap<u32, TerminalId>> {
+) -> io::Result<HashMap<u32, AdmittedPaneIdentity>> {
     if receipt.version != 1
         || receipt.operation_id.is_empty()
         || receipt.observation_epoch != receipt.operation_id
@@ -252,20 +260,33 @@ pub(crate) fn admit_manifest(
     let mut children = HashSet::new();
     for pane in &receipt.panes {
         if pane.pane_id.is_empty()
-            || pane.child.pid == 0
-            || pane.child.uid != receipt.source.uid
-            || pane.child.boot_id != receipt.source.boot_id
-            || pane.child.pid_namespace != receipt.source.pid_namespace
-            || pane.child.mount_namespace != receipt.source.mount_namespace
             || captured.insert(pane.pane_id.as_str(), pane).is_some()
             || !terminals.insert(pane.terminal_id.as_str())
-            || !children.insert(pane.child.pid)
         {
             return Err(mismatch(
                 "migration capture identities are incomplete or duplicated",
             ));
         }
         TerminalId::checked_import(pane.terminal_id.clone())?;
+        match (&pane.child, &pane.unavailable) {
+            (Some(child), None)
+                if child.pid != 0
+                    && child.uid == receipt.source.uid
+                    && child.boot_id == receipt.source.boot_id
+                    && child.pid_namespace == receipt.source.pid_namespace
+                    && child.mount_namespace == receipt.source.mount_namespace
+                    && children.insert(child.pid) => {}
+            (None, Some(state))
+                if state.restore_error == crate::handoff_runtime::SAVED_DIRECTORY_UNAVAILABLE
+                    && state.cwd.is_absolute()
+                    && pane.agent_name.is_none()
+                    && pane.agent_session.is_none() => {}
+            _ => {
+                return Err(mismatch(
+                    "migration runtime presence/absence capture differs",
+                ))
+            }
+        }
     }
     let mut runtime_by_raw = HashMap::new();
     for runtime in &manifest.panes {
@@ -322,9 +343,6 @@ pub(crate) fn admit_manifest(
                 let capture = captured
                     .get(pane_id.as_str())
                     .ok_or_else(|| mismatch("migration frozen pane is absent from capture"))?;
-                let runtime = runtime_by_raw
-                    .get(&raw)
-                    .ok_or_else(|| mismatch("migration frozen pane has no runtime"))?;
                 let saved = &tab.panes[&raw];
                 let native = saved
                     .agent_session
@@ -334,23 +352,55 @@ pub(crate) fn admit_manifest(
                     .map_err(io::Error::other)?;
                 if capture.workspace_id != workspace_id
                     || capture.tab_id != tab_id
-                    || capture.child.pid != runtime.child_pid
                     || capture.agent_session != native
                     || capture.agent_name != saved.agent_name
                 {
                     return Err(mismatch("migration frozen occupant differs from capture"));
                 }
-                identities.insert(
-                    raw,
-                    TerminalId::checked_import(capture.terminal_id.clone())?,
-                );
+                let terminal_id = TerminalId::checked_import(capture.terminal_id.clone())?;
+                let admitted = match (&capture.child, &capture.unavailable) {
+                    (Some(child), None) => {
+                        let runtime = runtime_by_raw
+                            .get(&raw)
+                            .ok_or_else(|| mismatch("migration frozen live pane has no runtime"))?;
+                        if child.pid != runtime.child_pid {
+                            return Err(mismatch("migration frozen child differs from capture"));
+                        }
+                        AdmittedPaneIdentity::Runtime(terminal_id)
+                    }
+                    (None, Some(state)) => {
+                        if runtime_by_raw.contains_key(&raw)
+                            || saved.cwd != state.cwd
+                            || saved.label != state.label
+                            || saved.managed_agent_kind.is_some()
+                            || saved.agent_resume.is_some()
+                        {
+                            return Err(mismatch(
+                                "migration frozen unavailable placeholder differs",
+                            ));
+                        }
+                        AdmittedPaneIdentity::Unavailable(
+                            crate::handoff_runtime::ImportedHandoffPlaceholder {
+                                terminal_id,
+                                observation_epoch: receipt.observation_epoch.clone(),
+                                state: state.clone(),
+                            },
+                        )
+                    }
+                    _ => return Err(mismatch("migration admitted runtime presence differs")),
+                };
+                identities.insert(raw, admitted);
             }
         }
         if workspace_raw_ids.len() != workspace.public_pane_numbers.len() {
             return Err(mismatch("migration public pane table has extra identities"));
         }
     }
-    if identities.len() != captured.len() || identities.len() != runtime_by_raw.len() {
+    let live_count = identities
+        .values()
+        .filter(|identity| matches!(identity, AdmittedPaneIdentity::Runtime(_)))
+        .count();
+    if identities.len() != captured.len() || live_count != runtime_by_raw.len() {
         return Err(mismatch(
             "migration capture/snapshot/runtime coverage differs",
         ));
@@ -452,7 +502,10 @@ mod tests {
     fn sparse_canonical_mapping_preserves_exact_terminal_id() {
         let (receipt, manifest) = fixtures();
         let admitted = admit_manifest(&receipt, &manifest).unwrap();
-        assert_eq!(admitted[&900].as_str(), "opaque-exact-old-ID");
+        let AdmittedPaneIdentity::Runtime(id) = &admitted[&900] else {
+            panic!("live pane was admitted as unavailable");
+        };
+        assert_eq!(id.as_str(), "opaque-exact-old-ID");
     }
     #[test]
     fn missing_runtime_duplicate_and_changed_occupant_are_not_admitted() {
@@ -464,9 +517,9 @@ mod tests {
         manifest.panes.push(manifest.panes[0].clone());
         assert!(admit_manifest(&receipt, &manifest).is_err());
         manifest.panes.pop();
-        receipt.panes[0].child.pid += 1;
+        receipt.panes[0].child.as_mut().unwrap().pid += 1;
         assert!(admit_manifest(&receipt, &manifest).is_err());
-        receipt.panes[0].child.pid -= 1;
+        receipt.panes[0].child.as_mut().unwrap().pid -= 1;
         receipt.panes[0].terminal_id.clear();
         assert!(admit_manifest(&receipt, &manifest).is_err());
     }
@@ -487,5 +540,37 @@ mod tests {
         assert!(parse_unique_json(br#"{"a":{"pane_id":1,"pane_id":2}}"#).is_err());
         let value = parse_unique_json(br#"{"sequence":18446744073709551615}"#).unwrap();
         assert_eq!(value["sequence"].as_u64(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn explicit_unavailable_placeholder_requires_exact_snapshot_and_no_runtime() {
+        let (mut receipt, mut manifest) = fixtures();
+        let saved = &mut manifest.snapshot.workspaces[0].tabs[0].panes;
+        saved.get_mut(&900).unwrap().label = Some("saved label".into());
+        receipt.panes[0].child = None;
+        receipt.panes[0].unavailable = Some(crate::handoff_runtime::UnavailableHandoffState {
+            restore_error: crate::handoff_runtime::SAVED_DIRECTORY_UNAVAILABLE.into(),
+            cwd: "/missing-is-valid-for-import".into(),
+            label: Some("saved label".into()),
+        });
+        let exported_runtime = manifest.panes.pop().unwrap();
+        let admitted = admit_manifest(&receipt, &manifest).unwrap();
+        let AdmittedPaneIdentity::Unavailable(placeholder) = &admitted[&900] else {
+            panic!("unavailable pane was admitted as live");
+        };
+        assert_eq!(placeholder.terminal_id.as_str(), "opaque-exact-old-ID");
+        assert_eq!(placeholder.observation_epoch, "fresh-epoch");
+        assert_eq!(
+            placeholder.state,
+            receipt.panes[0].unavailable.clone().unwrap()
+        );
+        manifest.panes.push(exported_runtime);
+        assert!(admit_manifest(&receipt, &manifest).is_err());
+        manifest.panes.clear();
+        receipt.panes[0].unavailable.as_mut().unwrap().cwd = "/changed".into();
+        assert!(admit_manifest(&receipt, &manifest).is_err());
+        receipt.panes[0].unavailable.as_mut().unwrap().cwd = "/missing-is-valid-for-import".into();
+        receipt.panes[0].unavailable.as_mut().unwrap().restore_error = "different failure".into();
+        assert!(admit_manifest(&receipt, &manifest).is_err());
     }
 }
