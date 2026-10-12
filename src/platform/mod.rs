@@ -349,6 +349,7 @@ pub(crate) fn end_cli_output() {}
 #[cfg(target_os = "linux")]
 mod linux;
 /// Kernel-backed identity checked only during explicit live migration.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MigrationProcessStamp {
     pub pid: u32,
@@ -359,6 +360,7 @@ pub(crate) struct MigrationProcessStamp {
     pub mount_namespace: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MigrationFileStamp {
     pub device: u64,

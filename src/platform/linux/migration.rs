@@ -127,6 +127,13 @@ pub(crate) fn migration_attempt_files(fds: [RawFd; 3]) -> io::Result<[File; 3]> 
             "migration descriptors must be distinct and nonstandard",
         ));
     }
+    // from_raw_fd requires an open descriptor; malformed explicit arguments
+    // must not turn a validation error into an invalid OwnedFd drop.
+    for fd in fds {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(io::Error::other("migration descriptor is not open"));
+        }
+    }
     let files = fds.map(|fd| unsafe { File::from_raw_fd(fd) });
     for (index, file) in files.iter().enumerate() {
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };

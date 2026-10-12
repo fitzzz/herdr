@@ -109,7 +109,7 @@ def source_context(pid):
         client = str(data_dir / "herdr-client.sock")
     elif selectors.get("HERDR_SOCKET_PATH"):
         api_path = Path(api)
-        client = str(api_path.with_name(api_path.stem + "-client" + api_path.suffix))
+        client = str(api_path.with_name(api_path.stem + "-client.sock"))
     else:
         client = selectors.get("HERDR_CLIENT_SOCKET_PATH") or str(data_dir / "herdr-client.sock")
     return {"session": session, "config_path": str(selectors.get("HERDR_CONFIG_PATH") or config_dir / "config.toml"),
