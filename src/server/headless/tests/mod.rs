@@ -4,6 +4,7 @@ mod api_status_projection;
 pub(super) mod api_wrapper;
 mod event_fairness;
 mod native_graphics;
+mod retained_terminal;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
 #[path = "pane_graphics.rs"]

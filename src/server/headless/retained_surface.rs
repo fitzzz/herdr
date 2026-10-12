@@ -186,8 +186,16 @@ struct RetainedRecipient<'a> {
     surface: &'a protocol::PaneSurfaceFrame,
 }
 
+struct RetainedTerminalRecipient<'a> {
+    client_id: u64,
+    terminal_id: &'a str,
+    frame: &'a FrameData,
+}
+
 struct CollectedPanePatch {
     pane_id: String,
+    terminal_id: Option<String>,
+    synchronized_epoch: u64,
     patch: crate::pane::TerminalDirtyPatch,
     content_revision: u64,
     scroll_metrics: Option<crate::pane::ScrollMetrics>,
@@ -264,20 +272,40 @@ impl HeadlessServer {
         if targets.is_empty() {
             success!("no_active_surface");
         }
-        if targets
-            .iter()
-            .any(|target| !matches!(target.4, ClientConnectionMode::ClientShell))
-        {
-            fallback!("non_shell_target");
-        }
-
         let mut recipients = Vec::with_capacity(targets.len());
-        for (client_id, (cols, rows), _, _, _) in &targets {
+        let mut terminal_recipients = Vec::new();
+        for (client_id, (cols, rows), _, _, mode) in &targets {
             let Some(client) = self.clients.get(client_id) else {
                 fallback!("client_missing");
             };
             if client.deferred_render() != DeferredRender::None {
                 crate::render_prof::event("retained_surface.recipient_deferred");
+                continue;
+            }
+            if let ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } = mode
+            {
+                let Some(frame) = client.render_state.last_terminal_frame() else {
+                    fallback!("terminal_no_baseline");
+                };
+                if frame.width != *cols
+                    || frame.height != *rows
+                    || !frame.hyperlinks.is_empty()
+                    || !frame.graphics.is_empty()
+                {
+                    fallback!("terminal_baseline_mismatch");
+                }
+                let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
+                    fallback!("runtime_missing");
+                };
+                if runtime.synchronized_output_active() {
+                    fallback!("synchronized_visible");
+                }
+                terminal_recipients.push(RetainedTerminalRecipient {
+                    client_id: *client_id,
+                    terminal_id,
+                    frame,
+                });
                 continue;
             }
             if client.render_state.requires_recompute() {
@@ -304,13 +332,14 @@ impl HeadlessServer {
                 surface,
             });
         }
-        if recipients.is_empty() {
+        if recipients.is_empty() && terminal_recipients.is_empty() {
             success!("all_recipients_deferred");
         }
 
         let mut collected = Vec::with_capacity(pty_sources.len());
         for source in pty_sources {
             let mut public_pane_id = None;
+            let terminal_id = self.terminal_id_for_pane(*source).map(ToString::to_string);
             let mut width = 0u16;
             let mut height = 0u16;
             for recipient in &recipients {
@@ -325,6 +354,21 @@ impl HeadlessServer {
                 width = width.max(pane.inner_rect.width);
                 height = height.max(pane.inner_rect.height);
             }
+            for recipient in &terminal_recipients {
+                if terminal_id.as_deref() != Some(recipient.terminal_id) {
+                    continue;
+                }
+                if public_pane_id.is_none() {
+                    public_pane_id =
+                        self.app
+                            .find_pane(*source)
+                            .and_then(|(workspace_index, _)| {
+                                self.app.public_pane_id(workspace_index, *source)
+                            });
+                }
+                width = width.max(recipient.frame.width);
+                height = height.max(recipient.frame.height);
+            }
             let Some(public_pane_id) = public_pane_id else {
                 continue;
             };
@@ -338,6 +382,10 @@ impl HeadlessServer {
             ) else {
                 fallback!("runtime_missing");
             };
+            let (synchronized, synchronized_epoch) = runtime.synchronized_output_state();
+            if synchronized {
+                fallback!("synchronized_visible");
+            }
             let Some(snapshot) = runtime.collect_dirty_patch_snapshot(width, height) else {
                 fallback!("terminal_snapshot");
             };
@@ -353,6 +401,8 @@ impl HeadlessServer {
             };
             collected.push(CollectedPanePatch {
                 pane_id: public_pane_id,
+                terminal_id,
+                synchronized_epoch,
                 patch,
                 content_revision: snapshot.content_revision,
                 scroll_metrics: snapshot.scroll_metrics,
@@ -477,7 +527,54 @@ impl HeadlessServer {
                 graphics,
             });
         }
-        if updates.is_empty() {
+        // All recipients share the collection above: a second collection would consume
+        // dirty rows already needed by another client, including clients of another size.
+        let mut terminal_updates = Vec::with_capacity(terminal_recipients.len());
+        for recipient in &terminal_recipients {
+            let Some(collected_pane) = collected
+                .iter()
+                .find(|pane| pane.terminal_id.as_deref() == Some(recipient.terminal_id))
+            else {
+                continue;
+            };
+            if collected_pane.graphics_may_have_placements {
+                fallback!("terminal_graphics");
+            }
+            let area = protocol::SurfaceRect {
+                x: 0,
+                y: 0,
+                width: recipient.frame.width,
+                height: recipient.frame.height,
+            };
+            let Some(rows) = changed_rows(recipient.frame, area, &collected_pane.patch) else {
+                fallback!("terminal_invalid_patch");
+            };
+            let Some(runtime) = self.runtime_for_terminal_id_string(recipient.terminal_id) else {
+                fallback!("runtime_missing");
+            };
+            let cursor = runtime
+                .cursor_state(Rect::new(0, 0, area.width, area.height), true)
+                .map(|cursor| protocol::CursorState {
+                    x: cursor.x,
+                    y: cursor.y,
+                    visible: cursor.visible
+                        && collected_pane
+                            .scroll_metrics
+                            .is_none_or(|metrics| metrics.offset_from_bottom == 0),
+                    shape: cursor.shape,
+                });
+            if rows.is_empty() && cursor == recipient.frame.cursor {
+                continue;
+            }
+            let Some(prepared) = self.clients[&recipient.client_id]
+                .render_state
+                .prepare_terminal_patch(rows, cursor)
+            else {
+                fallback!("terminal_prepare");
+            };
+            terminal_updates.push((recipient.client_id, prepared));
+        }
+        if updates.is_empty() && terminal_updates.is_empty() {
             success!("unchanged");
         }
         if recipients
@@ -485,6 +582,22 @@ impl HeadlessServer {
             .any(|recipient| has_synchronized_pane(&self.app, recipient.surface))
         {
             fallback!("synchronized_during_patch");
+        }
+        for collected_pane in &collected {
+            let Some((workspace_index, pane_id)) = self.app.parse_pane_id(&collected_pane.pane_id)
+            else {
+                fallback!("pane_missing");
+            };
+            let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
+                &self.app.terminal_runtimes,
+                workspace_index,
+                pane_id,
+            ) else {
+                fallback!("runtime_missing");
+            };
+            if runtime.synchronized_output_state() != (false, collected_pane.synchronized_epoch) {
+                fallback!("synchronized_during_patch");
+            }
         }
 
         let mut sent = 0u64;
@@ -598,6 +711,39 @@ impl HeadlessServer {
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     disconnected.push(client_id);
                 }
+            }
+        }
+        for (client_id, prepared) in terminal_updates {
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            let Some(writer) = client.writer.as_ref() else {
+                client.defer_full_render();
+                deferred += 1;
+                continue;
+            };
+            let serialized = match Self::frame_server_message(prepared.message()) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(client_id, %error, "failed to serialize retained terminal patch");
+                    client.render_state.request_repaint();
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
+            crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
+            match writer.render.try_send(serialized) {
+                Ok(()) => {
+                    client.render_state.commit_sent_frame(prepared);
+                    client.clear_deferred_render();
+                    sent += 1;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    client.defer_full_render();
+                    deferred += 1;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => disconnected.push(client_id),
             }
         }
         for client_id in disconnected {

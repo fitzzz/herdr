@@ -2589,7 +2589,36 @@ impl HeadlessServer {
     }
 
     fn handle_server_event_with_render_impact(&mut self, ev: ServerEvent) -> RenderImpact {
+        // These events affect one terminal's viewport or input, never shell layout.
+        // Keep the damage source so echoes, cursor changes and scroll resets can reuse
+        // both shell and direct-terminal baselines instead of repainting every grid.
+        let terminal_input_client = match &ev {
+            ServerEvent::ClientInput { client_id, .. }
+            | ServerEvent::ClientAttachScroll { client_id, .. }
+            | ServerEvent::ClientAttachMouse { client_id, .. } => Some(*client_id),
+            _ => None,
+        };
+        let pane_source = terminal_input_client.and_then(|client_id| {
+            let ClientConnectionMode::TerminalAttach { terminal_id } =
+                &self.clients.get(&client_id)?.mode
+            else {
+                return None;
+            };
+            self.app
+                .state
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs)
+                .flat_map(|tab| &tab.panes)
+                .find_map(|(pane_id, pane)| {
+                    (pane.attached_terminal_id.as_str() == terminal_id).then_some(*pane_id)
+                })
+        });
         if self.handle_server_event(ev) {
+            if let Some(pane_id) = pane_source {
+                self.app.render_dirty.request_pty(pane_id);
+                return RenderImpact::None;
+            }
             RenderImpact::Full
         } else {
             RenderImpact::None

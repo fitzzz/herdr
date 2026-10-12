@@ -160,6 +160,47 @@ impl ClientRenderState {
         }
     }
 
+    /// Only a committed, current-size ANSI baseline can accept terminal row damage.
+    pub(crate) fn last_terminal_frame(&self) -> Option<&FrameData> {
+        match self {
+            Self::TerminalAnsi {
+                blit_encoder,
+                repaint_pending: false,
+                ..
+            } => blit_encoder.last_frame(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepare_terminal_patch(
+        &self,
+        rows: Vec<crate::protocol::PaneSurfacePatchRow>,
+        cursor: Option<CursorState>,
+    ) -> Option<PreparedRender> {
+        let Self::TerminalAnsi {
+            blit_encoder,
+            seq,
+            repaint_pending: false,
+        } = self
+        else {
+            return None;
+        };
+        let frame = blit_encoder.last_frame()?;
+        let encoded = blit_encoder.encode_patch(&rows, cursor.clone(), false)?;
+        Some(PreparedRender::TerminalAnsiPatch {
+            message: ServerMessage::Terminal(TerminalFrame {
+                seq: *seq + 1,
+                width: frame.width,
+                height: frame.height,
+                full: false,
+                bytes: encoded.bytes.clone(),
+            }),
+            rows,
+            cursor,
+            encoded,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare_pane_surface(
         &mut self,
@@ -333,6 +374,24 @@ impl ClientRenderState {
                 *seq += 1;
                 *repaint_pending = false;
             }
+            (
+                Self::TerminalAnsi {
+                    blit_encoder,
+                    seq,
+                    repaint_pending,
+                },
+                PreparedRender::TerminalAnsiPatch {
+                    rows,
+                    cursor,
+                    encoded,
+                    ..
+                },
+            ) => {
+                let committed = blit_encoder.commit_patch(&rows, cursor, encoded);
+                debug_assert!(committed, "prepared ANSI patch baseline");
+                *seq += 1;
+                *repaint_pending = false;
+            }
             _ => {}
         }
     }
@@ -389,6 +448,12 @@ pub(crate) enum PreparedRender {
         frame: FrameData,
         encoded: Option<EncodedBlit>,
     },
+    TerminalAnsiPatch {
+        message: ServerMessage,
+        rows: Vec<crate::protocol::PaneSurfacePatchRow>,
+        cursor: Option<CursorState>,
+        encoded: EncodedBlit,
+    },
 }
 
 impl PreparedRender {
@@ -396,7 +461,8 @@ impl PreparedRender {
         match self {
             Self::Semantic { message, .. }
             | Self::SemanticPatch { message, .. }
-            | Self::TerminalAnsi { message, .. } => message,
+            | Self::TerminalAnsi { message, .. }
+            | Self::TerminalAnsiPatch { message, .. } => message,
         }
     }
 
@@ -412,7 +478,9 @@ impl PreparedRender {
                 queued_graphics_assets,
                 ..
             } => Some((&committed_surface.graphics, queued_graphics_assets)),
-            Self::SemanticPatch { .. } | Self::TerminalAnsi { .. } => None,
+            Self::SemanticPatch { .. }
+            | Self::TerminalAnsi { .. }
+            | Self::TerminalAnsiPatch { .. } => None,
         }
     }
 

@@ -137,6 +137,10 @@ impl BlitEncoder {
         self.last_frame.as_ref() == Some(frame)
     }
 
+    pub(crate) fn last_frame(&self) -> Option<&FrameData> {
+        self.last_frame.as_ref()
+    }
+
     pub(crate) fn encode_patch(
         &self,
         rows: &[PaneSurfacePatchRow],
