@@ -204,7 +204,10 @@ def run(old, candidate, root, failure, suppress_output_pane=None):
             request(api, "pane.send_input", {"pane_id": pane, "text": command, "keys": ["Enter"]})
             text = wait_marker(folder / "pid.json", lambda s: s.endswith("}"))
             children.append(json.loads(text))
-        before = pane_identity(request(api, "pane.list"))
+        before_response = request(api, "pane.list")
+        (root / "panes-before.json").write_text(json.dumps(before_response, indent=2))
+        (root / "children-before.json").write_text(json.dumps(children, indent=2))
+        before = pane_identity(before_response)
         assert len(before) == PANES
         client_reconnect(data / "herdr-client.sock")
         output_reads = []
@@ -225,7 +228,20 @@ def run(old, candidate, root, failure, suppress_output_pane=None):
                     assert Path(f"/proc/{current}/exe").resolve() == candidate
                 else:
                     assert current == server_pid and process_identity(current) == before_server
-                assert pane_identity(request(api, "pane.list")) == before
+                after_response = request(api, "pane.list")
+                (root / "panes-after.json").write_text(json.dumps(after_response, indent=2))
+                child_observations = []
+                for index, child in enumerate(children):
+                    try:
+                        ticks = process_identity(child["pid"])
+                    except FileNotFoundError:
+                        ticks = None
+                    child_observations.append({"pane_id": panes[index], **child,
+                        "observed_start_ticks": ticks,
+                        "hup": (root / f"p{index}/hup").exists(),
+                        "received": (root / f"p{index}/received").read_text().splitlines()})
+                (root / "children-after.json").write_text(json.dumps(child_observations, indent=2))
+                assert pane_identity(after_response) == before, "handoff changed pane identity; see panes-before/after.json"
                 client_reconnect(data / "herdr-client.sock")
             for index, (pane, child) in enumerate(zip(panes, children)):
                 assert process_identity(child["pid"]) == child["start_ticks"]
@@ -241,6 +257,8 @@ def run(old, candidate, root, failure, suppress_output_pane=None):
                 assert received.read_text().splitlines() == expected, "input lost, reordered or duplicated"
                 output_reads.append({"phase": phase, "pane_id": pane,
                                      "read": verify_pane_output(api, pane, tokens)})
+                # Preserve output evidence even if a later identity/output check fails.
+                (root / "terminal-output.json").write_text(json.dumps(output_reads, indent=2))
         (root / "terminal-output.json").write_text(json.dumps(output_reads, indent=2))
         if failure == "post-commit":
             victim = peer_pid(api)
