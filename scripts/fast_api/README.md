@@ -60,13 +60,22 @@ are not test targets.
 
 `remote_baseline.sh` installs Rust 1.96.1 with clippy/rustfmt in private tool homes,
 Zig 0.16.0 verified against the official download index checksum, and private
-just/nextest/Bun runners. Both CI and `vendor/libghostty-vt/build.zig.zon` require
+just 1.58.0, cargo-nextest 0.9.148 and Bun 1.3.14 runners, matching the retained
+lane receipts. Both CI and `vendor/libghostty-vt/build.zig.zon` require
 Zig 0.16.0. There is no conflicting version at the pinned source. It builds the
 pinned source with `just build`, preserves a read-only copy of the installed
 published binary, and records same-toolchain baseline, lockfile/tool hashes and
 logs. The installed binary is copied as a file only; no local execution, socket
-access or update is involved. Installation runner versions are recorded; future
-runs should reuse that record rather than silently adopting newer just/nextest.
+access or update is involved. Exact version checks apply even to preexisting
+tools. Cargo runner installations use pinned `--version` and `--locked`; rustup
+1.29.1 installs the pinned toolchain with self-update disabled. The versioned
+rustup installer replaces the mutable shell bootstrap and is checked against
+its [official SHA256](https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init.sha256).
+Bun's archive is checked against the digest of the
+[official release asset](https://api.github.com/repos/oven-sh/bun/releases/assets/418773972),
+including when a retained archive is reused. Installed tool hashes are recorded.
+These checks do not retroactively establish the integrity of the original
+unchecked installer download; its recorded tool versions remain separate evidence.
 
 The pinned Arch image lacks Node and OpenSSH. `remote_dependencies.sh` adds real
 Node 22.13.1 from its official checksum-verified archive and signed Arch OpenSSH
