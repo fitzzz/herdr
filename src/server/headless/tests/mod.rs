@@ -5,6 +5,7 @@ pub(super) mod api_wrapper;
 mod event_fairness;
 mod native_graphics;
 mod retained_terminal;
+mod shell_scroll_invalidation;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
 #[path = "pane_graphics.rs"]
@@ -3592,7 +3593,9 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
             )],
         });
 
-    assert_eq!(render_impact, RenderImpact::Full);
+    assert_eq!(render_impact, RenderImpact::None);
+    let damage = server.app.render_dirty.take();
+    assert_eq!(damage.pty_sources, HashSet::from([pane_id]));
     assert_eq!(
         input_rx.try_recv().expect("text must reach the PTY"),
         Bytes::from_static(b"x")

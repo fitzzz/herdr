@@ -2390,7 +2390,10 @@ impl HeadlessServer {
                 if let Err(err) = apply_client_pane_input_events(runtime, &events) {
                     warn!(client_id, pane_id, err = %err, "targeted client shell input failed");
                 }
-                foreground_changed | geometry_changed || runtime.scroll_metrics() != scroll_before
+                if runtime.scroll_metrics() != scroll_before {
+                    self.app.render_dirty.request_pty(runtime_pane_id);
+                }
+                foreground_changed | geometry_changed
             }
             ServerEvent::ClientShellPopupInput {
                 client_id,
