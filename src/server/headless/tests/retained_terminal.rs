@@ -73,6 +73,85 @@ fn assert_dense_parity(server: &HeadlessServer, target: &str, client_id: u64) {
     );
 }
 
+// Compare the delivered ANSI display, rather than raw baseline cells: ratatui's
+// fresh TestBackend skips a wide glyph's continuation, while Ghostty's dirty
+// row contains an empty spacer. Both are covered by the same ANSI wide glyph.
+fn replay_terminal_frame(
+    render: &std::sync::mpsc::Receiver<Vec<u8>>,
+    display: &crate::terminal::TerminalRuntime,
+) -> protocol::TerminalFrame {
+    let frame = terminal_frame(render);
+    assert_eq!(display.current_size(), (frame.height, frame.width));
+    display.test_process_pty_bytes(&frame.bytes);
+    frame
+}
+
+fn assert_ansi_display_parity(
+    server: &HeadlessServer,
+    target: &str,
+    client_id: u64,
+    display: &crate::terminal::TerminalRuntime,
+) {
+    let retained = server.clients[&client_id]
+        .render_state
+        .last_terminal_frame()
+        .unwrap();
+    let area = Rect::new(0, 0, retained.width, retained.height);
+    let runtime = server.runtime_for_terminal_id_string(target).unwrap();
+    let (buffer, cursor) = crate::server::render_stream::render_terminal_virtual(runtime, area);
+    let dense = FrameData::from_ratatui_buffer_with_hyperlinks(
+        &buffer,
+        cursor,
+        &runtime.visible_hyperlinks(area),
+    );
+    let encoded = crate::protocol::render_ansi::BlitEncoder::new().encode(&dense, true);
+    // Herdr's host setup disables autowrap. Keep both replay terminals under
+    // that same policy, including the smaller observer's right edge.
+    let expected = crate::terminal::TerminalRuntime::test_with_screen_bytes(
+        area.width,
+        area.height,
+        b"\x1b[?7l",
+    );
+    expected.test_process_pty_bytes(&encoded.bytes);
+    let cells = |runtime: &crate::terminal::TerminalRuntime| {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut cells = Vec::new();
+        terminal
+            .draw(|frame| {
+                runtime.render(frame, area, true);
+                // Capture before the backend diff skips covered spacer cells.
+                cells = frame
+                    .buffer_mut()
+                    .content
+                    .iter()
+                    .map(crate::protocol::CellData::from_ratatui_cell)
+                    .collect::<Vec<_>>();
+            })
+            .unwrap();
+        cells
+    };
+    let actual_cells = cells(display);
+    let expected_cells = cells(&expected);
+    assert_eq!(actual_cells.len(), expected_cells.len());
+    for (index, (actual, expected)) in actual_cells.iter().zip(&expected_cells).enumerate() {
+        assert_eq!(
+            actual,
+            expected,
+            "retained ANSI display differs at ({}, {})",
+            index % usize::from(area.width),
+            index / usize::from(area.width),
+        );
+    }
+    let actual_cursor = display.cursor_state(area, true).unwrap();
+    let expected_cursor = expected.cursor_state(area, true).unwrap();
+    assert_eq!(actual_cursor.visible, expected_cursor.visible);
+    // A hidden cursor's stored position and shape do not affect the display.
+    if expected_cursor.visible {
+        assert_eq!(actual_cursor, expected_cursor);
+    }
+}
+
 #[test]
 fn portal_direct_attachment_does_not_disable_retained_shell_updates() {
     with_terminal_session_test_server(|server, id, target, _| {
@@ -166,8 +245,12 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
         let controller = connect_direct(server, &target, 8, 360, 100);
         let observer = connect_terminal(server, &target, 9, 80, 24, false);
         server.render_and_stream();
-        let _ = terminal_frame(&controller);
-        let _ = terminal_frame(&observer);
+        let large_display =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(360, 100, b"\x1b[?7l");
+        let small_display =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"\x1b[?7l");
+        let _ = replay_terminal_frame(&controller, &large_display);
+        let _ = replay_terminal_frame(&observer, &small_display);
         server
             .app
             .terminal_runtimes
@@ -175,13 +258,30 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
             .unwrap()
             .test_process_pty_bytes(b"\x1b[2;3HMULTI\x1b[80;250HDEEP");
         assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-        let large = terminal_frame(&controller);
-        let small = terminal_frame(&observer);
+        let large = replay_terminal_frame(&controller, &large_display);
+        let small = replay_terminal_frame(&observer, &small_display);
         assert!(!large.full && !small.full);
         assert_eq!((large.width, large.height), (360, 100));
         assert_eq!((small.width, small.height), (80, 24));
         assert_dense_parity(server, &target, 8);
         assert_dense_parity(server, &target, 9);
+        for bytes in [
+            "\x1b[3;79H\x1b[31;44;1m界\x1b[0m".as_bytes(),
+            "\x1b[5;1HROW_START\x1b[4;80H\x1b[32;45m界\x1b[0m".as_bytes(),
+            b"\x1b[4;80Hx",
+        ] {
+            server
+                .app
+                .terminal_runtimes
+                .get(&id)
+                .unwrap()
+                .test_process_pty_bytes(bytes);
+            assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+            let _ = replay_terminal_frame(&controller, &large_display);
+            let _ = replay_terminal_frame(&observer, &small_display);
+            assert_ansi_display_parity(server, &target, 8, &large_display);
+            assert_ansi_display_parity(server, &target, 9, &small_display);
+        }
     });
 }
 
@@ -195,10 +295,14 @@ fn retained_direct_cursor_clear_wide_cells_and_scroll_match_dense_frames() {
         let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
         let direct = connect_direct(server, &target, 8, 80, 24);
         server.render_and_stream();
-        let _ = terminal_frame(&direct);
+        let display = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"\x1b[?7l");
+        let _ = replay_terminal_frame(&direct, &display);
         for bytes in [
             "\x1b[3;4H界Z".as_bytes(),
+            "\x1b[3;4H\x1b[31;44;1m界Z\x1b[0m".as_bytes(),
             b"\x1b[3;4Hx",
+            "\x1b[4;79H\x1b[32;45m界\x1b[0m".as_bytes(),
+            b"\x1b[4;79Hxy",
             b"\x1b[3;6H\x1b[5 q\x1b[?25l",
             b"\x1b[?25h\x1b[2J\x1b[HTEXT_AFTER_CLEAR",
         ] {
@@ -209,8 +313,8 @@ fn retained_direct_cursor_clear_wide_cells_and_scroll_match_dense_frames() {
                 .unwrap()
                 .test_process_pty_bytes(bytes);
             assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-            assert!(!terminal_frame(&direct).full);
-            assert_dense_parity(server, &target, 8);
+            assert!(!replay_terminal_frame(&direct, &display).full);
+            assert_ansi_display_parity(server, &target, 8, &display);
         }
         let history = (0..80)
             .map(|n| format!("line {n:03}\r\n"))
@@ -222,10 +326,10 @@ fn retained_direct_cursor_clear_wide_cells_and_scroll_match_dense_frames() {
             .unwrap()
             .test_process_pty_bytes(history.as_bytes());
         server.render_and_stream();
-        let _ = terminal_frame(&direct);
+        let _ = replay_terminal_frame(&direct, &display);
         server.app.terminal_runtimes.get(&id).unwrap().scroll_up(8);
         assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-        assert!(!terminal_frame(&direct).full);
+        assert!(!replay_terminal_frame(&direct, &display).full);
         assert!(server.clients[&8]
             .render_state
             .last_terminal_frame()
@@ -233,7 +337,7 @@ fn retained_direct_cursor_clear_wide_cells_and_scroll_match_dense_frames() {
             .cursor
             .as_ref()
             .is_none_or(|cursor| !cursor.visible));
-        assert_dense_parity(server, &target, 8);
+        assert_ansi_display_parity(server, &target, 8, &display);
         server
             .app
             .terminal_runtimes
@@ -241,8 +345,8 @@ fn retained_direct_cursor_clear_wide_cells_and_scroll_match_dense_frames() {
             .unwrap()
             .scroll_reset();
         assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
-        let _ = terminal_frame(&direct);
-        assert_dense_parity(server, &target, 8);
+        let _ = replay_terminal_frame(&direct, &display);
+        assert_ansi_display_parity(server, &target, 8, &display);
     });
 }
 
