@@ -129,7 +129,7 @@ mod tests {
     fn allocation_skips_imported_ids_even_with_ambiguous_suffix_and_reversing_clock() {
         let old = TerminalId::checked_import("term_1234".into()).unwrap();
         let mut reserved = HashSet::new();
-        reserve_ids(&mut reserved, &[old.clone()]).unwrap();
+        reserve_ids(&mut reserved, std::slice::from_ref(&old)).unwrap();
         let mut counters = [4, 5].into_iter();
         assert_eq!(
             allocate_unreserved(0x123, &reserved, || counters.next().unwrap()).as_str(),

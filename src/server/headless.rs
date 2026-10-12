@@ -862,14 +862,14 @@ impl HeadlessServer {
                 .render_state
                 .last_pane_surface()
                 .is_none_or(|surface| {
-                    !retained_surface::has_synchronized_pane(&self.app, surface)
-                        && !(self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+                    !(retained_surface::has_synchronized_pane(&self.app, surface)
+                        || (self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
                             && self.app.state.popup_pane.as_ref().is_some_and(|popup| {
                                 self.app
                                     .terminal_runtimes
                                     .get(&popup.terminal_id)
                                     .is_some_and(|runtime| runtime.synchronized_output_active())
-                            }))
+                            })))
                 }),
             ClientConnectionMode::TerminalPending => false,
         }
