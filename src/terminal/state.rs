@@ -2489,9 +2489,7 @@ mod tests {
             state: AgentState::Idle,
             message: None,
             reported_at: now,
-            session_ref: Some(crate::agent_resume::AgentSessionRef::id(
-                "continuing-session",
-            )),
+            session_ref: crate::agent_resume::AgentSessionRef::id("continuing-session"),
         });
         terminal.state = AgentState::Idle;
         terminal.finish_agent_process_acquisition();
