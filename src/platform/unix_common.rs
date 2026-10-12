@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) mod api_readiness_tests;
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted
@@ -28,6 +31,51 @@ pub(crate) fn poll_fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> std::
         Err(std::io::Error::last_os_error())
     } else {
         Ok(result > 0)
+    }
+}
+
+/// Waits for initial API input or peer shutdown without delaying already-ready input.
+pub(crate) fn wait_api_stream_readable(
+    stream: &crate::ipc::LocalStream,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Never turn a finite duration into poll's infinite (-1) or spinning (0) wait.
+    let timeout_ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let result = match poll_api_stream_readable(&mut descriptor, timeout_ms) {
+        Ok(result) => result,
+        // Return to the caller's nonblocking read and existing absolute-deadline check.
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if result > 0 && descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // POLLHUP/POLLERR also return to read, which owns EOF and read-error semantics.
+    Ok(())
+}
+
+fn poll_api_stream_readable(
+    descriptor: &mut libc::pollfd,
+    timeout_ms: i32,
+) -> std::io::Result<i32> {
+    #[cfg(test)]
+    if let Some(result) = api_readiness_tests::intercept_poll(descriptor, timeout_ms) {
+        return result;
+    }
+    // SAFETY: descriptor points to one initialized, live pollfd for this call.
+    let result = unsafe { libc::poll(descriptor, 1, timeout_ms) };
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
     }
 }
 

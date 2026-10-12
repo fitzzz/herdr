@@ -67,6 +67,16 @@ pub(crate) fn wait_client_stream_readable(
     Ok(())
 }
 
+pub(crate) fn wait_api_stream_readable(
+    _stream: &crate::ipc::LocalStream,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    // Preserve the API's existing peek-before-read wait: synchronous named-pipe
+    // reads have no bounded receive timeout in the current LocalStream abstraction.
+    std::thread::sleep(timeout);
+    Ok(())
+}
+
 pub(crate) fn forward_remote_bridge_stdio(
     stream: crate::ipc::LocalStream,
     _idle_timeout: bool,

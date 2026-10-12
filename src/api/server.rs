@@ -22,6 +22,8 @@ use crate::ipc::{
     socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
+#[cfg(all(test, unix))]
+mod initial_request_tests;
 #[cfg(test)]
 mod subscription_socket_tests;
 
@@ -696,13 +698,22 @@ fn read_initial_request_line_with_timeout(
     read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
 }
 
+#[inline]
+fn initial_request_now() -> Instant {
+    #[cfg(all(test, unix))]
+    if let Some(now) = initial_request_tests::clock_override() {
+        return now;
+    }
+    Instant::now()
+}
+
 fn read_initial_request_line_with_limits(
     stream: &mut LocalStream,
     timeout: Duration,
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
     set_local_stream_polling(stream, true)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = initial_request_now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
 
@@ -728,13 +739,18 @@ fn read_initial_request_line_with_limits(
                 }
             }
             LocalStreamRead::Pending => {
-                if Instant::now() >= deadline {
+                if initial_request_now() >= deadline {
                     break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                if let Err(err) =
+                    crate::platform::wait_api_stream_readable(stream, CONNECTION_POLL_INTERVAL)
+                {
+                    // Keep the blocking-mode restoration below on readiness errors too.
+                    break Err(err);
+                }
             }
         }
     };

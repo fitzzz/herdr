@@ -80,9 +80,12 @@ impl ChildExitReason {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use unix_common::api_readiness_tests;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+    wait_api_stream_readable,
 };
 
 #[cfg(not(any(unix, windows)))]
