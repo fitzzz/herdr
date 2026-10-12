@@ -1,9 +1,25 @@
-# Downstream fast API package and recovery rehearsal
+# Isolated downstream fast API candidate
 
 This Linux-only package supplements upstream v0.9.3 at
 `7b116c05bfda646af39d2524c54e70c751f57ee8`. It does not install over `herdr`,
 attach to the user's server, import existing sessions, or migrate conversations.
-A next-day live swap remains a separate action requiring Fitz's explicit approval.
+The alternate candidate is ready for isolated validation. It is **not safe for
+live in-place migration**. Replacing or restarting the live server remains
+unauthorized and needs a separate decision from Fitz.
+
+The compiled release selected for final staging is
+`12cc5dd1d6775cd202b0efaf9abe276022522521`, version
+`herdr 0.9.3-fast-api.12cc5dd1d677-readiness`, SHA256
+`b26a94a15b9a109a0a919848f4cef44088edfe81a2f7d25358b0eb743fe92640`.
+Stage this existing artifact; do not rebuild it or substitute a moving target
+directory. Package/launcher checks for this final artifact remain pending until
+the parent transfers the remote lane. Previous checks used product `512e8e29` and do not
+establish a result for this package.
+
+The package manifest's `source_commit` identifies the compiled product. Record
+the separately reviewed packaging source, source-archive hash, launcher hash
+and retained tool provenance beside the package. A documentation or launcher
+revision must not be represented as a rebuilt product.
 
 ## Namespace and update protection
 
@@ -51,7 +67,12 @@ The assigned child is `68a79a8b-13e1-4620-8e10-ab3cea96ade3`,
 is Ubuntu; the retained Arch root is `/home/boxd/w11y-env/portal`. Its helper
 `tools/portal-builder-environment.py` reports recipe digest
 `0c08c29cf5b47e3140bb5ef154df888faf26991cf1bf327adec72c529a55b11d`.
-All compile/check/rehearsal commands run through that helper's `exec-plan-step`,
+Use the private NSS helper recorded by the current lane handback, with its
+verified private passwd mapping; the original helper alone is unsuitable. The
+retained helper is
+`hf/diagnostics/causal-r4-input/private-nss-r4.py`, SHA256
+`41ff0646037a2146dc465b861d6744fb168c57db4edb36e63649466702a71ab5`.
+All compile/check/rehearsal commands run through its `exec-plan-step`,
 inside the pinned Arch container, with reports under `jobs/herdr-fast-api/`.
 The child has eight CPUs and 32 GiB RAM. Cargo's total build-job limit is eight;
 benchmark work waits until compilation finishes and uses the parent's separate
@@ -90,11 +111,14 @@ download checksums, package versions, linked libraries and file hashes in
 `hf/logs/dependencies/`; version probes are its only executable checks. It never
 runs tests or compilation. Node is a separate runtime, not a Bun alias.
 
-After setup, use the same helper prefix, with a unique report for each invocation:
+Setup/build commands below describe the existing lane. Final candidate staging
+reuses its verified tools and prebuilt release, with no reinstall or compilation.
+The parent must transfer exclusive ownership before any remote command. Use the
+same private helper prefix, with a unique report for each invocation:
 
 ```sh
 R=/home/boxd/w11y-env/portal
-python3 "$R/tools/portal-builder-environment.py" --project portal --variant arch-target \
+python3 "$R/hf/diagnostics/causal-r4-input/private-nss-r4.py" --project portal --variant arch-target \
   --root "$R" --expect-digest 0c08c29cf5b47e3140bb5ef154df888faf26991cf1bf327adec72c529a55b11d \
   exec-plan-step --cwd source/herdr-fast-api-candidate \
   --report "$R/jobs/herdr-fast-api/candidate-check.json" -- \
@@ -119,7 +143,7 @@ Focused remote packaging proof (after the parent hands over the exclusive lane):
 
 ```sh
 python3 -m unittest scripts.fast_api.test_packaging scripts.fast_api.test_rehearsal
-HERDR_FAST_API_TEST_BINARY="$R/hf/target-candidate/release/herdr" \
+HERDR_FAST_API_TEST_BINARY="$R/hf/artifacts/herdr-fast-api-readiness-12cc5dd1d677/herdr" \
   python3 -m unittest scripts.fast_api.test_launcher_integration
 ```
 
@@ -131,75 +155,27 @@ sentinel remained unchanged. No real provider is launched or configured. The
 receipt contract synchronizes an append after the waiter starts, flushes while
 the writer remains open, and checks the queued filesystem event without a delay.
 
-## 174-pane old-to-candidate rehearsal
+## Handoff limitations and retained rehearsal
 
-Run only remotely, after builds finish, using release binaries. The rehearsal
-uses `workspace.create`, one pane per tab, `pane.send_input`, `pane.list`, and
-`server.live_handoff` with `import_exe`, following `tests/live_handoff.rs`. Every
-run needs a new short root. It creates 174 actual PTYs and minimal Python input
-consumers with no native identities. Readiness uses filesystem events, not a
-sleep or a latency threshold. There is no automatic test timeout; cancellation
-belongs to the parent and its own helper container.
+The 174-pane synthetic handoff failed the strict terminal-ID assertion after
+handoff. A two-pane diagnostic confirmed that pane/tab/workspace addresses and
+child processes continued, while terminal IDs changed. The assertion and full
+identity/output diagnostics remain in `rehearse.py`; nothing is relaxed to make
+that result pass. The compiled `12cc5dd1` readiness change does not repair this seam.
 
-```sh
-# Inside the same Arch container; R is /home/boxd/w11y-env/portal.
-python3 scripts/fast_api/rehearse.py \
-  --old "$R/hf/artifacts/published-herdr" \
-  --candidate "$R/hf/target-candidate/release/herdr" \
-  --root "$R/hf/rh-ok"
-# Repeat with fresh rh-protocol, rh-spawn, rh-restored roots and respectively:
-# --failure protocol | --failure missing-executable | --failure after-restored
-```
+Portal can use a terminal ID to recognize a running child when it has no native
+session identity. A changed ID can make that child appear gone even though its
+process is still running. Handoff also resets the state/completion counters that
+Portal uses to decide whether a turn finished. Preserving an ID alone would not
+preserve those decisions. The old export does not include the needed counters,
+and a read taken before handoff cannot prove they stayed unchanged through the
+freeze. No migration source is being implemented to claim otherwise.
 
-Success verifies all 174 canonical pane/workspace/tab/terminal identities, child
-PIDs plus process start ticks, no HUP, six ordered input records per child and
-every unique `got:` output line through `pane.read` across
-the transition, candidate ownership of the public socket, and fresh API connections and generation-1 client handshakes at 483×128. Failure cases verify the source retains ownership and every
-child continues consuming ordered input. The existing importer failure injection
-`HERDR_TEST_HANDOFF_IMPORT_FAIL=after_restored` exercises rollback after PTY
-restoration but before commit. Result JSON, child markers and logs stay in the
-owned run root. No successful claim is made until the parent inspects them.
-
-Output verification waits for each phase's final `got:` line with the supported
-`pane.wait_for_output` API, then reads the same pane's recent unwrapped terminal
-output. Every expected line must occur exactly once and in order; input echo or
-another pane's output cannot satisfy the check. `terminal-output.json` retains
-the successful snapshots. No client delay or automatic deadline is added.
-
-Run the missing-output negative control on another fresh root:
-
-```sh
-python3 scripts/fast_api/rehearse.py \
-  --old "$R/hf/artifacts/published-herdr" \
-  --candidate "$R/hf/target-candidate/release/herdr" \
-  --root "$R/hf/rh-no-output" --suppress-output-pane 0
-```
-
-This command must exit nonzero with `missing or duplicated output
-'got:after-0-0'`, after the receipt ledger passes. The synthetic child still
-records all input and emits the final output line, so absence is detected after
-an output barrier. No timeout is needed to make this negative control finish.
-The Python contract also exercises this suppression with an actual synthetic
-child, confirms its receipt is intact, and rejects its incomplete output.
-
-The large Python rehearsal negotiates the generation-1 client endpoint before
-and after handoff. It does not drive a full TUI. Run existing `just test-one live_handoff` remotely as the
-complementary client bootstrap, keyboard protocol, modified keys, named routing,
-unmanaged identity, process death and rollback coverage. Those tests currently
-cover client input separately and a 70-pane descriptor-transfer case; they do not
-prove full TUI reconnect/input at 174 panes. The parent should report that boundary
-and have its harness owner extend end-to-end client input if required.
-
-A fifth fresh-root run with `--failure post-commit` first verifies successful
-migration and ordered input, then kills only the socket peer whose executable
-matches the assigned candidate and whose start ticks were checked. Its pidfd
-wait records candidate exit without a delay. `post-commit.json` reports child
-survival/HUP at observation time and whether the source exited. It deliberately
-does not invent a recovery guarantee or relaunch native consumers. The result's
-"passed" means the destructive scenario executed after migration checks; it does
-not mean recovery passed. Binary rollback cannot restore lost PTYs or native
-conversations. Supported handoff disconnects clients and may interrupt requests;
-post-commit recovery is not guaranteed by the upstream source.
+See [HANDOFF.md](HANDOFF.md) for retained evidence, unchanged diagnostic commands
+and the limits of rollback. Those commands are diagnostic contracts, not a live
+transition procedure. Final isolated package staging does not rerun handoff,
+the 100-pair startup measurement or the 56-run benchmark matrix. Native-chat
+continuity and the installed Portal's reconnection behavior remain unqualified.
 
 ## Updating this downstream series
 
@@ -211,9 +187,10 @@ endpoint fixtures, removes upstreamed equivalents, and repeats freshness,
 notification, identity, focus, input, recovery and performance checks. Preserve
 previous source commits and versioned artifacts with their hashes. Stage a new
 package directory and deliberately choose its launcher; never replace the old
-versioned directory in place. Native conversation preservation requires supported
-consistent provider transcript backups and verified identities under separate
-live-change approval; a saved layout is insufficient.
+versioned directory in place. Backups or saved layouts do not establish safe
+native-conversation migration. Any future live transition needs a separate
+user decision and an approved procedure addressing terminal identity, completion
+state, input delivery and consumer reconnection.
 
 Authored validation commands are not evidence of execution. This worker runs no
 local builds, tests or benchmarks. Remote receipts distinguish setup, compilation,
