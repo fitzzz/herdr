@@ -67,6 +67,19 @@ logs. The installed binary is copied as a file only; no local execution, socket
 access or update is involved. Installation runner versions are recorded; future
 runs should reuse that record rather than silently adopting newer just/nextest.
 
+The pinned Arch image lacks Node and OpenSSH. `remote_dependencies.sh` adds real
+Node 22.13.1 from its official checksum-verified archive and signed Arch OpenSSH
+in a disposable root container of the same image. Bind only `hf`, use image ID
+`sha256:34aa4196ec9557924a70bd3b0fbf72700f868d08609aa83d335066c070ab63ff`,
+and invoke the uploaded script with Bash. Installation changes only that
+container and private `hf` tools; it does not retag or modify the helper image.
+OpenSSH's actual executable, loader and linked libraries are copied together;
+its private wrapper selects those libraries without changing Herdr's loader
+environment. Candidate PATH includes both private tools. The setup preserves
+download checksums, package versions, linked libraries and file hashes in
+`hf/logs/dependencies/`; version probes are its only executable checks. It never
+runs tests or compilation. Node is a separate runtime, not a Bun alias.
+
 After setup, use the same helper prefix, with a unique report for each invocation:
 
 ```sh
