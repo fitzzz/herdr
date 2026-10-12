@@ -576,6 +576,15 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
     if out.is_empty() {
         return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
     }
+    // Received copies do not inherit their source descriptor's CLOEXEC bit.
+    // Seal the whole batch before restoration can start helper subprocesses,
+    // including copies not yet consumed by an individual PTY actor.
+    for fd in &out {
+        if let Err(error) = crate::pty::fd::set_cloexec(*fd) {
+            close_raw_fds(&out);
+            return Err(error);
+        }
+    }
     Ok(out)
 }
 
@@ -587,6 +596,20 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_handoff_descriptors_are_sealed_before_restore() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let source = std::fs::File::open("/dev/null").unwrap();
+        send_fds(&sender, &[source.as_raw_fd(), source.as_raw_fd()]).unwrap();
+        let received = recv_fds(&receiver, 2).unwrap();
+        assert_eq!(received.len(), 2);
+        for fd in &received {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        }
+        close_raw_fds(&received);
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

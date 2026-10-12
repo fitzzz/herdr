@@ -154,6 +154,9 @@ pub(crate) fn migration_attempt_files(fds: [RawFd; 3]) -> io::Result<[File; 3]> 
                 "migration descriptor type, owner or mode differs",
             ));
         }
+        // The shim cleared CLOEXEC only to carry proof across its exec. Seal
+        // every adopted descriptor before App starts any helper or pane child.
+        crate::pty::fd::set_cloexec(file.as_raw_fd())?;
     }
     Ok(files)
 }
@@ -198,6 +201,55 @@ pub(crate) fn migration_validate_master_fd(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn adopted_proof_descriptors_are_sealed_and_rejections_close_copies() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-migration-proof-fds-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let receipt = root.join("receipt.json");
+        let claim = root.join("claimed.json");
+        std::fs::write(&receipt, b"{}").unwrap();
+        std::fs::write(&claim, b"{}").unwrap();
+        std::fs::set_permissions(&claim, std::fs::Permissions::from_mode(0o400)).unwrap();
+        for receipt_mode in [0o400, 0o600] {
+            std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(receipt_mode))
+                .unwrap();
+            let fds = [
+                File::open(&receipt).unwrap().into_raw_fd(),
+                File::open(&claim).unwrap().into_raw_fd(),
+                File::open(&root).unwrap().into_raw_fd(),
+            ];
+            for fd in fds {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+            }
+            let result = migration_attempt_files(fds);
+            if receipt_mode == 0o400 {
+                let files = result.unwrap();
+                for file in &files {
+                    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+                    assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+                }
+                drop(files);
+            } else {
+                assert!(result.is_err());
+            }
+            for fd in fds {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn process_stat_handles_parentheses_and_rejects_zombies() {
         let tail = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
