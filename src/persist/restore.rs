@@ -93,6 +93,70 @@ pub fn restore(
 }
 
 #[cfg(unix)]
+pub(crate) fn validate_identity_imports(
+    snapshot: &SessionSnapshot,
+    imports: &HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
+) -> std::io::Result<()> {
+    let mut raw_ids = HashSet::new();
+    let mut terminal_ids = HashSet::new();
+    let mut epoch = None;
+    for workspace in &snapshot.workspaces {
+        for tab in &workspace.tabs {
+            let leaves = collect_snapshot_pane_ids(&tab.layout);
+            let saved: HashSet<_> = tab.panes.keys().copied().collect();
+            let layout: HashSet<_> = leaves.iter().copied().collect();
+            if layout.len() != leaves.len() || layout != saved {
+                return Err(std::io::Error::other(
+                    "identity handoff layout/pane coverage differs",
+                ));
+            }
+            for raw_id in leaves {
+                if !raw_ids.insert(raw_id) {
+                    return Err(std::io::Error::other(
+                        "identity handoff repeats a raw pane ID",
+                    ));
+                }
+                let import = imports.get(&raw_id).ok_or_else(|| {
+                    std::io::Error::other(
+                        "identity handoff is missing a pane runtime; no restore may spawn",
+                    )
+                })?;
+                let terminal_id = import.preserved_terminal_id.as_ref().ok_or_else(|| {
+                    std::io::Error::other("identity handoff is missing an admitted terminal ID")
+                })?;
+                let observed_epoch = import
+                    .observation_epoch
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        std::io::Error::other("identity handoff has no observation epoch")
+                    })?;
+                if epoch.is_some_and(|value| value != observed_epoch) {
+                    return Err(std::io::Error::other(
+                        "identity handoff observation epochs differ",
+                    ));
+                }
+                epoch = Some(observed_epoch);
+                if import.state.pane_id != raw_id
+                    || import.state.child_pid == 0
+                    || !terminal_ids.insert(terminal_id)
+                {
+                    return Err(std::io::Error::other(
+                        "identity handoff runtime/terminal association differs",
+                    ));
+                }
+            }
+        }
+    }
+    if raw_ids.len() != imports.len() {
+        return Err(std::io::Error::other(
+            "identity handoff has extra pane runtimes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn restore_handoff(
     snapshot: &SessionSnapshot,
     scrollback_limit_bytes: usize,
@@ -103,6 +167,12 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
+    if imports
+        .values()
+        .any(|import| import.preserved_terminal_id.is_some())
+    {
+        validate_identity_imports(snapshot, imports)?;
+    }
     restore_with_imports_strict(
         snapshot,
         None,
@@ -515,6 +585,12 @@ fn restore_tab(
 
         let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
+        #[cfg(unix)]
+        let preserves_identity = old_id
+            .and_then(|raw| imported_panes.get(raw))
+            .is_some_and(|import| import.preserved_terminal_id.is_some());
+        #[cfg(not(unix))]
+        let preserves_identity = false;
         if !has_import && !cwd.is_dir() {
             let terminal = unavailable_restored_terminal(
                 saved_pane,
@@ -537,7 +613,16 @@ fn restore_tab(
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
-        let startup = {
+        let startup = if preserves_identity {
+            // Continuing processes are not cold-start conversations. Do not
+            // deduplicate their native sessions or plan a resume/acquisition.
+            PaneRestoreStartup {
+                restore_plan: None,
+                initial_history_ansi: None,
+                duplicate_agent_session: false,
+                reserved_agent_session: None,
+            }
+        } else {
             let mut agent_restore = AgentRestoreState {
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
@@ -575,6 +660,14 @@ fn restore_tab(
             .unwrap_or_default();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
+        #[cfg(unix)]
+        let preserved_terminal_id = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.preserved_terminal_id.clone());
+        #[cfg(unix)]
+        let observation_epoch = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.observation_epoch.clone());
         #[cfg(unix)]
         let handoff_agent_state = imported_runtime
             .as_ref()
@@ -631,6 +724,8 @@ fn restore_tab(
             if let Some(imported) = imported_runtime {
                 TerminalRuntime::from_handoff_fd(
                     crate::handoff_runtime::ImportedHandoffRuntime {
+                        preserved_terminal_id: imported.preserved_terminal_id,
+                        observation_epoch: imported.observation_epoch,
                         master_fd: imported.master_fd,
                         state: imported.state.with_pane_id(*id),
                     },
@@ -681,6 +776,9 @@ fn restore_tab(
 
         match runtime_result {
             Ok(runtime) => {
+                #[cfg(unix)]
+                let terminal_id = preserved_terminal_id.unwrap_or_else(TerminalId::alloc);
+                #[cfg(not(unix))]
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 if was_imported {
@@ -720,6 +818,10 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
+                }
+                #[cfg(unix)]
+                if let Some(epoch) = observation_epoch {
+                    terminal.begin_handoff_observation_epoch(epoch);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -1917,7 +2019,11 @@ mod tests {
             let mut imports = HashMap::from([(
                 pane_id.raw(),
                 crate::handoff_runtime::ImportedHandoffRuntime {
-                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    preserved_terminal_id: None,
+                    observation_epoch: None,
+                    master_fd: unsafe {
+                        std::os::fd::FromRawFd::from_raw_fd(runtime.duplicate_handoff_fd().unwrap())
+                    },
                     state,
                 },
             )]);

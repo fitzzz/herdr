@@ -1,6 +1,9 @@
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Opaque identity for a server-owned terminal.
@@ -11,6 +14,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct TerminalId(String);
 
 static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
+static IMPORTED_TERMINAL_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn imported_ids() -> &'static Mutex<HashSet<String>> {
+    IMPORTED_TERMINAL_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_ids(reserved: &mut HashSet<String>, ids: &[TerminalId]) -> io::Result<()> {
+    let mut incoming = HashSet::new();
+    for id in ids {
+        if id.0.is_empty() || !incoming.insert(id.0.clone()) || reserved.contains(&id.0) {
+            return Err(io::Error::other(
+                "empty, duplicate or already reserved imported terminal ID",
+            ));
+        }
+    }
+    reserved.extend(incoming);
+    Ok(())
+}
 
 impl TerminalId {
     pub fn alloc() -> Self {
@@ -18,8 +39,40 @@ impl TerminalId {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_micros())
             .unwrap_or(0);
-        let counter = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
-        Self(format!("term_{micros:x}{counter:x}"))
+        let reserved = imported_ids()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let counter =
+                match NEXT_TERMINAL_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                }) {
+                    Ok(counter) => counter,
+                    // The infallible allocation API must never wrap into a reused
+                    // identity. Exhaustion is a process invariant failure.
+                    Err(_) => panic!("terminal identity counter exhausted"),
+                };
+            let id = format!("term_{micros:x}{counter:x}");
+            if !reserved.contains(&id) {
+                return Self(id);
+            }
+        }
+    }
+
+    pub(crate) fn checked_import(value: String) -> io::Result<Self> {
+        if value.is_empty() {
+            return Err(io::Error::other("imported terminal ID is empty"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Reserve the entire admitted set before App construction. Reservations
+    /// deliberately outlive terminals so stale clients cannot name a new one.
+    pub(crate) fn reserve_imported(ids: &[Self]) -> io::Result<()> {
+        let mut reserved = imported_ids()
+            .lock()
+            .map_err(|_| io::Error::other("terminal identity reservation lock poisoned"))?;
+        reserve_ids(&mut reserved, ids)
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -43,6 +96,26 @@ impl Borrow<str> for TerminalId {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn import_reservation_is_atomic_and_keeps_opaque_bytes() {
+        let ids = vec![
+            TerminalId::checked_import("opaque: old identity".into()).unwrap(),
+            TerminalId::checked_import("term_1234".into()).unwrap(),
+        ];
+        let mut reserved = HashSet::new();
+        reserve_ids(&mut reserved, &ids).unwrap();
+        assert!(reserved.contains("opaque: old identity"));
+        let before = reserved.clone();
+        let duplicate = vec![
+            TerminalId::checked_import("new".into()).unwrap(),
+            ids[0].clone(),
+        ];
+        assert!(reserve_ids(&mut reserved, &duplicate).is_err());
+        assert_eq!(reserved, before);
+        assert!(TerminalId::checked_import(String::new()).is_err());
+        assert!(reserve_ids(&mut reserved, &[ids[0].clone(), ids[0].clone()]).is_err());
+    }
 
     #[test]
     fn terminal_ids_support_borrowed_lookup_without_changing_identity() {

@@ -41,8 +41,14 @@ impl HandoffRuntimeState {
 
 #[derive(Debug)]
 pub(crate) struct ImportedHandoffRuntime {
+    /// Present only after explicit live identity admission. Never read from a
+    /// cold snapshot or inferred from a runtime/PID.
     #[cfg(unix)]
-    pub master_fd: std::os::fd::RawFd,
+    pub preserved_terminal_id: Option<crate::terminal::TerminalId>,
+    #[cfg(unix)]
+    pub observation_epoch: Option<String>,
+    #[cfg(unix)]
+    pub master_fd: std::os::fd::OwnedFd,
     #[cfg(unix)]
     pub state: HandoffRuntimeState,
 }

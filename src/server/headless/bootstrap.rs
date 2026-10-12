@@ -4,6 +4,33 @@ use super::*;
 pub fn run_server() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let handoff_import = args.get(2).map(String::as_str) == Some("--handoff-import");
+    // Explicit migration authenticates inherited FDs and context before normal
+    // logging/config loading can hide an admission failure in null stderr.
+    #[cfg(target_os = "linux")]
+    let identity_attempt = if handoff_import && args.len() > 5 {
+        if args.len() != 9 || args[5] != "--handoff-identity-fds" {
+            return Err(io::Error::other(
+                "invalid explicit handoff identity arguments",
+            ));
+        }
+        let mut fds = [0_i32; 3];
+        for (fd, text) in fds.iter_mut().zip(&args[6..9]) {
+            *fd = text.parse().map_err(io::Error::other)?;
+        }
+        Some(crate::server::handoff_identity::IdentityAttempt::from_fds(
+            fds,
+            Path::new(&args[3]),
+            &args[4],
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    if handoff_import && args.len() > 5 {
+        return Err(io::Error::other(
+            "explicit terminal identity migration requires Linux",
+        ));
+    }
     let process_context = crate::platform::prepare_server_process(handoff_import);
     init_logging();
     match process_context {
@@ -23,7 +50,12 @@ pub fn run_server() -> io::Result<()> {
         let token = args
             .get(4)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        return run_handoff_import_server(
+            &socket_path,
+            token,
+            #[cfg(target_os = "linux")]
+            identity_attempt,
+        );
     }
 
     let loaded_config = config::Config::load();
@@ -126,9 +158,26 @@ fn take_startup_cwd() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
-    let loaded_config = config::Config::load();
+fn run_handoff_import_server(
+    socket_path: &Path,
+    token: &str,
+    #[cfg(target_os = "linux")] identity_attempt: Option<
+        crate::server::handoff_identity::IdentityAttempt,
+    >,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let loaded_config = identity_attempt.is_none().then(config::Config::load);
+    #[cfg(not(target_os = "linux"))]
+    let loaded_config = Some(config::Config::load());
+    #[cfg(target_os = "linux")]
+    let mut received = if let Some(attempt) = &identity_attempt {
+        crate::server::handoff::receive_with_identity(socket_path, token, attempt)?
+    } else {
+        crate::server::handoff::receive(socket_path, token)?
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    let loaded_config = loaded_config.unwrap_or_else(config::Config::load);
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -138,13 +187,52 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let mut imports = HashMap::new();
     for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
         let pane_id = pane.pane_id;
-        imports.insert(
+        #[cfg(target_os = "linux")]
+        let preserved_terminal_id = if let Some(identities) = &mut received.identities {
+            Some(
+                identities
+                    .remove(&pane_id)
+                    .ok_or_else(|| io::Error::other("admitted terminal identity is missing"))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let preserved_terminal_id = None;
+        #[cfg(target_os = "linux")]
+        let observation_epoch = identity_attempt
+            .as_ref()
+            .map(|attempt| attempt.receipt.observation_epoch.clone());
+        #[cfg(not(target_os = "linux"))]
+        let observation_epoch = None;
+        let previous = imports.insert(
             pane_id,
             crate::handoff_runtime::ImportedHandoffRuntime {
+                preserved_terminal_id,
+                observation_epoch,
                 master_fd: fd,
                 state: pane,
             },
         );
+        if previous.is_some() {
+            return Err(io::Error::other("duplicate handoff raw pane ID"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if identity_attempt.is_some() {
+        if received
+            .identities
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Err(io::Error::other("unconsumed admitted terminal identities"));
+        }
+        crate::persist::validate_identity_imports(&received.manifest.snapshot, &imports)?;
+        let ids: Vec<_> = imports
+            .values()
+            .filter_map(|import| import.preserved_terminal_id.clone())
+            .collect();
+        crate::terminal::TerminalId::reserve_imported(&ids)?;
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()

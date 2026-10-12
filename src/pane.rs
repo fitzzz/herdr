@@ -2364,7 +2364,9 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
-        let crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state } = import;
+        let crate::handoff_runtime::ImportedHandoffRuntime {
+            master_fd, state, ..
+        } = import;
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
@@ -2380,10 +2382,6 @@ impl PaneRuntime {
             agent_state: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
-        use std::os::fd::FromRawFd;
-
-        let master_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(master_fd) };
-
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
