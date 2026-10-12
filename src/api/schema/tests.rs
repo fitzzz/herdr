@@ -63,6 +63,34 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn agent_observation_epoch_is_optional_and_round_trips_without_counter_changes() {
+    let legacy = serde_json::json!({
+        "terminal_id": "continuing-terminal",
+        "agent_status": "idle",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "state_change_seq": 42,
+        "completion_seq": 42,
+        "revision": 0
+    });
+    let mut agent: AgentInfo = serde_json::from_value(legacy).unwrap();
+    assert!(agent.state_change_epoch.is_none());
+    assert!(serde_json::to_value(&agent)
+        .unwrap()
+        .get("state_change_epoch")
+        .is_none());
+
+    agent.state_change_epoch = Some("migration-token".into());
+    let json = serde_json::to_value(&agent).unwrap();
+    assert_eq!(json["state_change_epoch"], "migration-token");
+    assert_eq!(json["state_change_seq"], 42);
+    assert_eq!(json["completion_seq"], 42);
+    assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), agent);
+}
+
+#[test]
 fn workspace_close_group_intent_defaults_false_and_round_trips() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "id": "close",

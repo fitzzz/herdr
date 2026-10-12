@@ -3096,6 +3096,135 @@ mod tests {
         assert_completion_guard_sequence(false, &[AgentState::Unknown, AgentState::Idle], false);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_starts_empty_until_a_real_completion() {
+        let mut app = app_with_workspaces(&["active", "background"]);
+        app.active = Some(0);
+        let pane_id = app.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.workspaces[1].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.last_agent_state_change_seq = Some(42);
+        terminal.last_agent_completion_seq = Some(42);
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+        assert_eq!(app.next_agent_state_change_seq, 0);
+        assert!(app.toast.is_none());
+
+        // An idle observation cannot recover the lost legacy completion.
+        app.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert!(app.terminals[&terminal_id]
+            .last_agent_completion_seq
+            .is_none());
+        assert_eq!(app.next_agent_state_change_seq, 0);
+
+        for state in [AgentState::Working, AgentState::Idle] {
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state,
+                visible_blocker: false,
+                visible_working: state == AgentState::Working,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        }
+        let terminal = &app.terminals[&terminal_id];
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert_eq!(terminal.last_agent_state_change_seq, Some(2));
+        assert_eq!(terminal.last_agent_completion_seq, Some(2));
+        app.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_does_not_complete_startup_acquisition() {
+        let mut app = app_with_workspaces(&["active", "background"]);
+        let pane_id = app.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.workspaces[1].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .begin_handoff_observation_epoch("migration-token".into());
+        app.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+        });
+        for state in [AgentState::Blocked, AgentState::Idle] {
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state,
+                visible_blocker: state == AgentState::Blocked,
+                visible_working: false,
+                process_exited: false,
+                observed_at: Instant::now(),
+            });
+        }
+        let terminal = &app.terminals[&terminal_id];
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert!(terminal.last_agent_state_change_seq.is_some());
+        assert!(terminal.last_agent_completion_seq.is_none());
+        app.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_preserves_current_work_until_its_real_completion() {
+        let mut app = app_with_workspaces(&["active", "background"]);
+        app.active = Some(0);
+        let pane_id = app.workspaces[1].tabs[0].root_pane;
+        let terminal_id = app.workspaces[1].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        terminal.last_agent_state_change_seq = Some(40);
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(terminal.last_agent_completion_seq.is_none());
+        assert_eq!(app.next_agent_state_change_seq, 0);
+        assert!(app.toast.is_none());
+
+        app.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+
+        let terminal = &app.terminals[&terminal_id];
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert_eq!(terminal.last_agent_state_change_seq, Some(1));
+        assert_eq!(terminal.last_agent_completion_seq, Some(1));
+        app.assert_invariants_for_test();
+    }
+
     #[test]
     fn completion_guard_first_work_finishes_without_prior_idle() {
         assert_completion_guard_sequence(true, &[AgentState::Working, AgentState::Idle], true);

@@ -6614,6 +6614,13 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "state_change_epoch": {
+              "description": "Sequence comparisons are valid only within the same observation epoch.\nAbsent on ordinary terminals; present after an admitted legacy handoff\nthat preserved terminal identity without old completion watermarks.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",
