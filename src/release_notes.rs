@@ -89,8 +89,8 @@ fn release_notes_from_stored(
     }
 
     let preview = match (
-        crate::update::Version::parse(&stored.version),
-        crate::update::Version::parse(current_version),
+        release_version(&stored.version),
+        release_version(current_version),
     ) {
         (Some(stored_version), Some(current_version)) => stored_version > current_version,
         _ => false,
@@ -101,6 +101,14 @@ fn release_notes_from_stored(
         version: stored.version,
         body,
     })
+}
+
+fn release_version(identity: &str) -> Option<crate::update::Version> {
+    // build_info::version() and preview manifests append a channel/build suffix.
+    // Compare their release numbers without changing the stored display identity
+    // or the exact identity match used when dismissing notes.
+    let base = identity.split_once('-').map_or(identity, |(base, _)| base);
+    crate::update::Version::parse(base)
 }
 
 pub fn mark_current_version_seen() -> std::io::Result<()> {
@@ -245,6 +253,64 @@ mod tests {
         assert_eq!(latest.version, "0.3.1");
         assert!(!latest.preview);
 
+        clear_pending_at(&path).unwrap();
+    }
+
+    #[test]
+    fn qualified_release_notes_compare_release_numbers_and_preserve_identity() {
+        for (current, stored, preview) in [
+            ("0.3.1-fast-api.abc123", "0.3.2", true),
+            ("0.3.1-preview.20261011-abc123", "0.3.2-preview.def456", true),
+            ("0.3.1", "0.3.2-fast-api.def456", true),
+            ("0.3.2-fast-api.abc123", "0.3.10-preview.def456", true),
+            ("0.3.1-fast-api.abc123", "0.3.1-fast-api.abc123", false),
+            ("0.3.1-fast-api.abc123", "0.3.1-preview.def456", false),
+            ("0.3.1-fast-api.abc123", "0.3.0-preview.def456", false),
+            ("0.3.1-preview.abc123", "0.3.0", false),
+            ("0.3.1-fast-api.abc123", "unknown", false),
+            ("unknown", "0.3.2-preview.def456", false),
+        ] {
+            let notes = release_notes_from_stored(
+                StoredReleaseNotes {
+                    version: stored.to_string(),
+                    body: "### Changed\n- One".to_string(),
+                    show_on_startup: true,
+                },
+                current,
+            )
+            .expect("latest notes");
+            assert_eq!(notes.preview, preview, "current={current}, stored={stored}");
+            assert_eq!(notes.version, stored);
+            assert_eq!(notes.body, "### Changed\n- One");
+        }
+    }
+
+    #[test]
+    fn qualified_release_notes_dismiss_only_the_exact_current_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-release-notes-{}-qualified-seen.json",
+            std::process::id()
+        ));
+        let _ = clear_pending_at(&path);
+        let current = "0.3.1-fast-api.abc123";
+        for stored in [
+            "0.3.0-preview.abc123",
+            "0.3.1",
+            "0.3.1-preview.abc123",
+            "0.3.1-fast-api.def456",
+            current,
+            "0.3.2-fast-api.abc123",
+        ] {
+            save_pending_to_path(&path, stored, "### Changed\n- One").unwrap();
+            mark_current_version_seen_at(&path, current).unwrap();
+            let saved = load_stored_from_path(&path).expect("stored notes");
+            assert_eq!(saved.version, stored);
+            assert_eq!(saved.body, "### Changed\n- One");
+            assert_eq!(saved.show_on_startup, stored != current, "stored={stored}");
+            let notes = load_latest_from_path(&path, current).expect("latest notes");
+            assert_eq!(notes.version, stored);
+            assert_eq!(notes.preview, stored == "0.3.2-fast-api.abc123");
+        }
         clear_pending_at(&path).unwrap();
     }
 
