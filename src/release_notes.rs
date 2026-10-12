@@ -260,7 +260,11 @@ mod tests {
     fn qualified_release_notes_compare_release_numbers_and_preserve_identity() {
         for (current, stored, preview) in [
             ("0.3.1-fast-api.abc123", "0.3.2", true),
-            ("0.3.1-preview.20261011-abc123", "0.3.2-preview.def456", true),
+            (
+                "0.3.1-preview.20261011-abc123",
+                "0.3.2-preview.def456",
+                true,
+            ),
             ("0.3.1", "0.3.2-fast-api.def456", true),
             ("0.3.2-fast-api.abc123", "0.3.10-preview.def456", true),
             ("0.3.1-fast-api.abc123", "0.3.1-fast-api.abc123", false),
