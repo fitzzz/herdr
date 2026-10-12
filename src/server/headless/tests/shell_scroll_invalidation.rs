@@ -159,3 +159,74 @@ async fn shell_scroll_that_claims_another_geometry_still_requires_complete_rende
     assert_eq!(server.foreground_client_id, Some(8));
     shutdown_test_runtimes(&mut server);
 }
+
+#[tokio::test]
+async fn writer_recovery_semantic_viewport_change_retries_oversized_surface_without_pty_damage() {
+    let (mut server, pane_id, _public_pane, frames, _input) = setup_scrolling_shell(80, 23);
+    let baseline = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+    let cap = HeadlessServer::frame_server_message_with_max(
+        &ServerMessage::PaneSurface(baseline.clone()),
+        MAX_GRAPHICS_FRAME_SIZE,
+    )
+    .unwrap()
+    .len()
+        + 512;
+    server.test_render_frame_limit = cap;
+    let geometry = (
+        server.clients[&7].terminal_size,
+        server.app.state.workspaces[0].tabs[0].layout.focused(),
+        server.app.state.workspaces[0].tabs[0].panes.len(),
+    );
+    let runtime = server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .unwrap();
+    let (rows, cols) = runtime.current_size();
+    let mut dense = String::from("\x1b[2J\x1b[H");
+    for row in 1..=rows {
+        dense.push_str(&format!("\x1b[{row};1H{}", "é".repeat(usize::from(cols))));
+    }
+    runtime.test_process_pty_bytes(dense.as_bytes());
+    server.clients.get_mut(&7).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    assert!(server.render_recoveries_waiting_for_change.contains_key(&7));
+    assert_eq!(
+        server.clients[&7].render_state.last_pane_surface(),
+        Some(&baseline)
+    );
+    let attempts = server.render_recovery_attempts;
+    server.app.render_dirty.take();
+    for _ in 0..15 {
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(server.render_recovery_attempts, attempts);
+
+    // Only the host viewport changes. There is no producer output or outer resize.
+    server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .unwrap()
+        .scroll_up(50);
+    assert_eq!(
+        (
+            server.clients[&7].terminal_size,
+            server.app.state.workspaces[0].tabs[0].layout.focused(),
+            server.app.state.workspaces[0].tabs[0].panes.len(),
+        ),
+        geometry
+    );
+    assert!(server.app.render_dirty.take().pty_sources.is_empty());
+    assert!(server.render_pending_work(true, false, &HashSet::new()));
+    let recovered = recv_pane_surface(&frames, "semantic viewport recovery");
+    assert!(frame_text(&recovered.frame).contains("history row"));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(server.render_recoveries_waiting_for_change.is_empty());
+    shutdown_test_runtimes(&mut server);
+}

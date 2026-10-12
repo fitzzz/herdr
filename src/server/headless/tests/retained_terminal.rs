@@ -433,11 +433,94 @@ fn backpressured_direct_recipient_keeps_baseline_and_recovers_all_changes() {
         assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
         let _ = recv_pane_surface_patch(&shell, "third shell patch");
         assert_eq!(terminal_frame(&direct).seq, initial.seq + 1);
-        assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
-        server.render_and_stream();
+        assert_eq!(
+            server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+                client_id: 8
+            }),
+            RenderImpact::None
+        );
+        assert!(server.render_pending_work(false, false, &HashSet::new()));
         assert_eq!(terminal_frame(&direct).seq, initial.seq + 2);
         assert_dense_parity(server, &target, 8);
     });
+}
+
+#[test]
+fn writer_recovery_for_direct_and_observer_skips_unrelated_runtime_after_output_stops() {
+    for control in [true, false] {
+        with_terminal_session_test_server(|server, id, target, _| {
+            let other_workspace = crate::workspace::Workspace::test_new("unrelated");
+            let other_pane = other_workspace.tabs[0].root_pane;
+            let other_id = other_workspace.terminal_id(other_pane).unwrap().clone();
+            server.app.state.workspaces.push(other_workspace);
+            server.app.state.ensure_test_terminals();
+            server.app.terminal_runtimes.insert(
+                other_id.clone(),
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"PEER"),
+            );
+            let responsive = connect_terminal(server, &other_id.to_string(), 7, 80, 24, false);
+            let slow = connect_terminal(server, &target, 8, 80, 24, control);
+            server.render_and_stream();
+            let _ = terminal_frame(&responsive);
+            let initial = terminal_frame(&slow);
+            server
+                .app
+                .terminal_runtimes
+                .get(&id)
+                .unwrap()
+                .test_process_pty_bytes(b"ONE");
+            server.render_and_stream();
+            let accepted = server.clients[&8]
+                .render_state
+                .last_terminal_frame()
+                .unwrap()
+                .clone();
+            server
+                .app
+                .terminal_runtimes
+                .get(&id)
+                .unwrap()
+                .test_process_pty_bytes(b"\rLATEST");
+            server.render_and_stream();
+            assert_eq!(server.clients[&8].deferred_render(), DeferredRender::Full);
+            assert_eq!(terminal_frame(&slow).seq, initial.seq + 1);
+            let peer_baseline = server.clients[&7]
+                .render_state
+                .last_terminal_frame()
+                .unwrap()
+                .clone();
+            // Missing runtime is a deterministic guard against unrelated per-client rendering.
+            let other_runtime = server.app.terminal_runtimes.remove(&other_id).unwrap();
+            let metadata_before = server.app.test_metadata_observation_counts();
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientWriterDrained { client_id: 8 })
+                .unwrap();
+            assert!(!server.drain_server_events());
+            assert_eq!(
+                server.clients[&8].render_state.last_terminal_frame(),
+                Some(&accepted)
+            );
+            assert!(server.has_pending_presentation_work(false, false));
+            assert!(server.render_pending_work(false, false, &HashSet::new()));
+            assert_eq!(terminal_frame(&slow).seq, initial.seq + 2);
+            assert_eq!(server.app.test_metadata_observation_counts(), metadata_before,
+                "direct-only recovery must not construct a shared shell snapshot");
+            assert_dense_parity(server, &target, 8);
+            assert_eq!(server.clients[&8].deferred_render(), DeferredRender::None);
+            assert!(server.pending_render_recoveries.is_empty());
+            assert!(
+                server.clients.contains_key(&7),
+                "unrelated runtime was read during recovery"
+            );
+            assert_eq!(
+                server.clients[&7].render_state.last_terminal_frame(),
+                Some(&peer_baseline)
+            );
+            assert!(responsive.try_recv().is_err());
+            server.app.terminal_runtimes.insert(other_id, other_runtime);
+        });
+    }
 }
 
 #[test]

@@ -147,6 +147,23 @@ enum RenderImpact {
     Full,
 }
 
+/// Shape of an unproducible replacement, retried only after relevant damage.
+struct RenderRecoveryShape {
+    size: (u16, u16),
+    cell_size: crate::kitty_graphics::HostCellSize,
+    mode: ClientConnectionMode,
+    location: Option<crate::server::clients::ClientShellLocation>,
+}
+
+impl RenderRecoveryShape {
+    fn matches(&self, client: &ClientConnection) -> bool {
+        self.size == client.terminal_size
+            && self.cell_size == client.cell_size
+            && self.mode == client.mode
+            && self.location == client.shell_location
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -195,6 +212,16 @@ pub struct HeadlessServer {
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
+    /// Recipients whose writer drained while a replacement was deferred.
+    /// Keep these separate from global damage and retain them until accepted.
+    pending_render_recoveries: HashSet<u64>,
+    /// A retry that found the render lane occupied waits for its next drain.
+    render_recoveries_waiting_for_drain: HashSet<u64>,
+    render_recoveries_waiting_for_change: HashMap<u64, RenderRecoveryShape>,
+    #[cfg(test)]
+    render_recovery_attempts: usize,
+    #[cfg(test)]
+    test_render_frame_limit: usize,
     native_graphics: native_graphics::NativeGraphics,
     #[cfg(unix)]
     next_client_id: u64,
@@ -341,6 +368,13 @@ impl HeadlessServer {
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
+            pending_render_recoveries: HashSet::new(),
+            render_recoveries_waiting_for_drain: HashSet::new(),
+            render_recoveries_waiting_for_change: HashMap::new(),
+            #[cfg(test)]
+            render_recovery_attempts: 0,
+            #[cfg(test)]
+            test_render_frame_limit: MAX_GRAPHICS_FRAME_SIZE,
             native_graphics: Default::default(),
             #[cfg(unix)]
             next_client_id: 1,
@@ -409,6 +443,7 @@ impl HeadlessServer {
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
             self.app.reap_finished_detached_processes();
+            self.retire_accepted_render_recoveries();
 
             // If shutdown has been initiated, complete it and exit.
             if self.shutting_down {
@@ -437,6 +472,7 @@ impl HeadlessServer {
                 needs_render = true;
                 crate::render_prof::event("render.request.signal");
             }
+            needs_render |= self.has_ready_render_recoveries();
             // 2. Drain a bounded internal-event batch. API handlers perform an
             // exhaustive forwarding-aware drain before reading pane/runtime state.
             if self.drain_internal_events_with_forwarding() {
@@ -513,6 +549,9 @@ impl HeadlessServer {
             self.sync_immediate_pty_sources();
             self.stream_host_mouse_capture_mode();
             self.stream_direct_terminal_keyboard_mode();
+            // A drained writer may have been queued in step 5 without global
+            // invalidation. Dispatch it now, including when pane output stopped.
+            needs_render |= self.has_ready_render_recoveries();
 
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
@@ -549,30 +588,24 @@ impl HeadlessServer {
                 if needs_full_render && !outer_title_synced {
                     self.sync_window_title();
                 }
-                if !needs_full_render && !needs_graphics_render && !pty_dirty {
+                if !needs_full_render
+                    && !needs_graphics_render
+                    && !pty_dirty
+                    && !self.has_ready_render_recoveries()
+                {
                     // A synchronized-output OSC title can be the only pending work.
                     // Its deferred PTY repaint has its own signal; do not manufacture
                     // a full UI render for this client-local side effect.
                     needs_render = false;
                     continue;
                 }
-                let hidden_only = pty_dirty
-                    && !needs_full_render
-                    && !needs_graphics_render
-                    && !self.pty_sources_visible_to_any_render_target(&render_request.pty_sources);
-                if hidden_only {
-                    crate::render_prof::event("render.skipped.hidden_sources");
-                } else if !needs_full_render
-                    && !needs_graphics_render
-                    && self.render_retained_pane_surface_and_stream(&render_request.pty_sources)
-                {
-                    crate::render_prof::event("retained_surface.invoke");
-                } else {
-                    crate::render_prof::event("full_render.invoke");
-                    self.render_and_stream();
-                }
-                self.app.record_render_attempt(now, !hidden_only);
-                needs_render = false;
+                let presentation = self.render_pending_work(
+                    needs_full_render,
+                    needs_graphics_render,
+                    &render_request.pty_sources,
+                );
+                self.app.record_render_attempt(now, presentation);
+                needs_render = self.has_ready_render_recoveries();
                 needs_full_render = false;
                 needs_graphics_render = false;
                 continue;
@@ -674,6 +707,172 @@ impl HeadlessServer {
 
         info!("headless server exiting");
         Ok(())
+    }
+
+    /// Dispatch coalesced presentation work without widening writer recovery
+    /// into global damage. Returns whether this pass attempted presentation.
+    fn render_pending_work(
+        &mut self,
+        needs_full_render: bool,
+        needs_graphics_render: bool,
+        pty_sources: &HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let changed = self
+            .render_recoveries_waiting_for_change
+            .keys()
+            .copied()
+            .filter(|client_id| self.render_recovery_source_changed(*client_id, pty_sources))
+            .collect::<Vec<_>>();
+        for client_id in changed {
+            self.render_recoveries_waiting_for_change.remove(&client_id);
+        }
+        if needs_full_render || needs_graphics_render {
+            // Explicit semantic/graphics damage can change splits, popup or
+            // viewport without changing outer geometry or producing PTY bytes.
+            // Retry unproducible output once for that damage; occupied lanes
+            // still wait for their transport drain.
+            self.render_recoveries_waiting_for_change.clear();
+            crate::render_prof::event("full_render.invoke");
+            self.render_and_stream();
+            return true;
+        }
+
+        let visible_pty =
+            !pty_sources.is_empty() && self.pty_sources_visible_to_any_render_target(pty_sources);
+        if !pty_sources.is_empty() && !visible_pty {
+            crate::render_prof::event("render.skipped.hidden_sources");
+        }
+        if visible_pty {
+            if !self.render_retained_pane_surface_and_stream(pty_sources) {
+                crate::render_prof::event("full_render.invoke");
+                self.render_and_stream();
+                return true;
+            }
+            crate::render_prof::event("retained_surface.invoke");
+        }
+        let recipients = self
+            .pending_render_recoveries
+            .iter()
+            .copied()
+            .filter(|client_id| {
+                let producer_changed = self.render_recovery_source_changed(*client_id, pty_sources);
+                self.render_recovery_ready(*client_id, producer_changed)
+            })
+            .collect::<HashSet<_>>();
+        let recovery = !recipients.is_empty();
+        if recovery {
+            crate::render_prof::event("render.recovery.invoke");
+            self.render_and_stream_for_recipients(&recipients);
+        }
+        visible_pty || recovery
+    }
+
+    fn render_recovery_source_changed(
+        &self,
+        client_id: u64,
+        sources: &HashSet<crate::layout::PaneId>,
+    ) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        sources.iter().any(|pane_id| match &client.mode {
+            ClientConnectionMode::ClientShell => self
+                .shell_target_for_client(client_id)
+                .is_some_and(|target| {
+                    self.shell_client_views_pane(client_id, target.workspace_index, *pane_id)
+                        || (self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+                            && self
+                                .app
+                                .state
+                                .popup_pane
+                                .as_ref()
+                                .is_some_and(|popup| popup.pane_id == *pane_id))
+                }),
+            ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } => self
+                .terminal_id_for_pane(*pane_id)
+                .is_some_and(|id| id.as_str() == terminal_id),
+            ClientConnectionMode::TerminalPending => false,
+        })
+    }
+
+    fn retire_accepted_render_recoveries(&mut self) {
+        self.pending_render_recoveries.retain(|client_id| {
+            self.clients
+                .get(client_id)
+                .is_some_and(|client| client.deferred_render() != DeferredRender::None)
+        });
+        self.render_recoveries_waiting_for_drain
+            .retain(|client_id| self.pending_render_recoveries.contains(client_id));
+        self.render_recoveries_waiting_for_change
+            .retain(|client_id, _| self.pending_render_recoveries.contains(client_id));
+    }
+
+    fn wait_for_render_recovery_change(&mut self, client_id: u64) {
+        if !self.pending_render_recoveries.contains(&client_id) {
+            return;
+        }
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        self.render_recoveries_waiting_for_change.insert(
+            client_id,
+            RenderRecoveryShape {
+                size: client.terminal_size,
+                cell_size: client.cell_size,
+                mode: client.mode.clone(),
+                location: client.shell_location.clone(),
+            },
+        );
+    }
+
+    fn has_ready_render_recoveries(&self) -> bool {
+        self.pending_render_recoveries
+            .iter()
+            .any(|client_id| self.render_recovery_ready(*client_id, false))
+    }
+
+    fn render_recovery_ready(&self, client_id: u64, producer_changed: bool) -> bool {
+        // Check transport readiness before even looking up a terminal runtime.
+        if self
+            .render_recoveries_waiting_for_drain
+            .contains(&client_id)
+            || (!producer_changed && self.native_graphics.is_pending(client_id))
+        {
+            return false;
+        }
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if !producer_changed
+            && self
+                .render_recoveries_waiting_for_change
+                .get(&client_id)
+                .is_some_and(|shape| shape.matches(client))
+        {
+            return false;
+        }
+        match &client.mode {
+            ClientConnectionMode::TerminalAttach { terminal_id }
+            | ClientConnectionMode::TerminalObserve { terminal_id } => self
+                .runtime_for_terminal_id_string(terminal_id)
+                .is_none_or(|runtime| !runtime.synchronized_output_active()),
+            ClientConnectionMode::ClientShell if !client.shell_surface_active => true,
+            ClientConnectionMode::ClientShell => client
+                .render_state
+                .last_pane_surface()
+                .is_none_or(|surface| {
+                    !retained_surface::has_synchronized_pane(&self.app, surface)
+                        && !(self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id)
+                            && self.app.state.popup_pane.as_ref().is_some_and(|popup| {
+                                self.app
+                                    .terminal_runtimes
+                                    .get(&popup.terminal_id)
+                                    .is_some_and(|runtime| runtime.synchronized_output_active())
+                            }))
+                }),
+            ClientConnectionMode::TerminalPending => false,
+        }
     }
 
     fn allocate_activity_stamp(&mut self) -> u64 {
@@ -892,6 +1091,9 @@ impl HeadlessServer {
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
+        self.pending_render_recoveries.remove(&client_id);
+        self.render_recoveries_waiting_for_drain.remove(&client_id);
+        self.render_recoveries_waiting_for_change.remove(&client_id);
         self.disconnect_native_graphics(client_id);
         let disconnected_focus = self
             .clients
@@ -2578,10 +2780,15 @@ impl HeadlessServer {
                 true
             }
             ServerEvent::ClientWriterDrained { client_id } => {
-                let Some(client) = self.clients.get_mut(&client_id) else {
+                self.render_recoveries_waiting_for_drain.remove(&client_id);
+                let Some(client) = self.clients.get(&client_id) else {
                     return false;
                 };
-                client.take_deferred_render() != DeferredRender::None
+                if client.deferred_render() != DeferredRender::None {
+                    self.pending_render_recoveries.insert(client_id);
+                    crate::render_prof::event("render.recovery.requested");
+                }
+                false
             }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.

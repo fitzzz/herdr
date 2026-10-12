@@ -242,7 +242,7 @@ struct RetainedRecipientUpdate {
     )>,
 }
 
-fn has_synchronized_pane(app: &app::App, surface: &protocol::PaneSurfaceFrame) -> bool {
+pub(super) fn has_synchronized_pane(app: &app::App, surface: &protocol::PaneSurfaceFrame) -> bool {
     surface.panes.iter().any(|pane| {
         app.parse_pane_id(&pane.pane_id)
             .and_then(|(workspace_index, pane_id)| {

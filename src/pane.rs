@@ -1386,6 +1386,11 @@ enum PaneRuntimeIo {
     },
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static FOREGROUND_ACTOR_REQUESTS: Cell<u64> = const { Cell::new(0) };
+}
+
 impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
@@ -1407,12 +1412,30 @@ impl PaneRuntimeIo {
     }
 
     #[cfg(unix)]
-    fn foreground_process_group_id(&self) -> Option<u32> {
-        match self {
-            PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id(),
+    fn foreground_process_group_id(&self, child_pid: u32, process_exited: bool) -> Option<u32> {
+        // Process observation is live OS I/O, but does not rendezvous with the PTY
+        // reader. Keep the sole-fd owner's query for unavailable observations (for
+        // example a reaped pane shell whose foreground job still owns the tty).
+        if let Some(pgid) = (!process_exited)
+            .then(|| crate::platform::foreground_process_group_id(child_pid))
+            .flatten()
+        {
+            crate::render_prof::event("metadata.foreground_process_observation");
+            return Some(pgid);
+        }
+        crate::render_prof::event("metadata.foreground_actor_request");
+        let started = crate::render_prof::timer();
+        let result = match self {
+            PaneRuntimeIo::Actor(actor) => {
+                #[cfg(test)]
+                FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(count.get() + 1));
+                actor.foreground_process_group_id()
+            }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => None,
-        }
+        };
+        crate::render_prof::duration_since("metadata.foreground_actor_request", started);
+        result
     }
 
     #[cfg(unix)]
@@ -3678,7 +3701,10 @@ impl PaneRuntime {
         {
             let leader_cwd = self
                 .io
-                .foreground_process_group_id()
+                .foreground_process_group_id(
+                    self.child_pid.load(Ordering::Acquire),
+                    self.cwd_process_exited.load(Ordering::Acquire),
+                )
                 .and_then(usable_process_cwd);
             leader_cwd.or_else(|| self.cwd())
         }
@@ -3694,19 +3720,19 @@ impl PaneRuntime {
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
-            let shell_cwd = absolute_process_cwd(pid);
             let foreground_pgid = self
                 .io
-                .foreground_process_group_id()
-                .or_else(|| crate::platform::foreground_process_group_id(pid));
+                .foreground_process_group_id(pid, self.cwd_process_exited.load(Ordering::Acquire));
             let leader_cwd = foreground_pgid.and_then(absolute_process_cwd);
 
             // The group leader's cwd is authoritative (issue #3270): a helper
             // process that chdirs elsewhere inside the same foreground group
             // must not override it. Scan other members only when the leader's
             // cwd cannot be read at all.
-            leader_cwd
-                .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
+            leader_cwd.or_else(|| {
+                let shell_cwd = absolute_process_cwd(pid);
+                foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref())
+            })
         }
 
         #[cfg(not(unix))]
@@ -4127,6 +4153,209 @@ mod tests {
             return;
         }
         assert_eq!(observed, Some(expected_cwd));
+    }
+
+    #[cfg(unix)]
+    async fn metadata_job_runtime() -> (
+        PaneRuntime,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        mpsc::Receiver<AppEvent>,
+    ) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("herdr-metadata-job-{}-{stamp}", std::process::id()));
+        let leader = root.join("leader");
+        let helper = root.join("helper");
+        std::fs::create_dir_all(&leader).unwrap();
+        std::fs::create_dir_all(&helper).unwrap();
+        let (events, mut event_rx) = mpsc::channel(32);
+        // Job control gives the foreground job a group distinct from the pane shell.
+        // A nonleader in that group chdirs elsewhere and signals readiness with BEL.
+        let argv = vec![
+            "/bin/sh".into(), "-c".into(),
+            r#"set -m; /bin/sh -c 'cd "$1"; (cd "$2"; printf "\a"; read line < /dev/tty) & wait' sh "$1" "$2"; printf "\a"; read line"#.into(),
+            "sh".into(), leader.display().to_string(), helper.display().to_string(),
+        ];
+        let runtime = PaneRuntime::spawn_argv_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            root.clone(),
+            &argv,
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        loop {
+            match event_rx.recv().await.expect("job readiness event") {
+                AppEvent::TerminalBell { .. } => break,
+                AppEvent::PaneDied { .. } => panic!("job exited before readiness"),
+                _ => {}
+            }
+        }
+        (runtime, root, leader.canonicalize().unwrap(), event_rx)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_foreground_job_keeps_leader_cwd_without_actor_rendezvous() {
+        let (runtime, root, leader, _events) = metadata_job_runtime().await;
+        let pid = runtime.child_pid().unwrap();
+        let observed_group = crate::platform::foreground_process_group_id(pid).unwrap();
+        let actor_group = match &runtime.io {
+            PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id().unwrap(),
+            _ => panic!("must use real PTY actor"),
+        };
+        assert_ne!(observed_group, pid, "fixture must enable real job control");
+        FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(0));
+        let foreground = runtime.foreground_cwd();
+        let follow = runtime.follow_cwd();
+        let requests = FOREGROUND_ACTOR_REQUESTS.with(Cell::get);
+        runtime.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(observed_group, actor_group);
+        assert_eq!(foreground, Some(leader.clone()));
+        assert_eq!(follow, Some(leader));
+        assert_eq!(
+            requests, 0,
+            "available process observation must avoid actor waits"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_foreground_job_survives_runtime_handoff_import() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let (runtime, root, leader, _events) = metadata_job_runtime().await;
+        let state = runtime.handoff_runtime_state(42);
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(1))
+            .unwrap();
+        let fd = runtime.duplicate_handoff_fd().unwrap();
+        let import = crate::handoff_runtime::ImportedHandoffRuntime {
+            preserved_terminal_id: None,
+            observation_epoch: None,
+            // duplicate_handoff_fd transfers this new descriptor to the importer.
+            master_fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            state,
+        };
+        let (events, _event_rx) = mpsc::channel(32);
+        let mut imported = PaneRuntime::from_handoff_fd(
+            import,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        // Until import succeeds, the paused original still owns cleanup on unwind.
+        runtime.preserve_for_handoff();
+        imported.assume_handoff_ownership();
+        imported.set_handoff_reader_paused(false);
+        FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(0));
+        let foreground = imported.foreground_cwd();
+        let follow = imported.follow_cwd();
+        let requests = FOREGROUND_ACTOR_REQUESTS.with(Cell::get);
+        imported.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(foreground, Some(leader.clone()));
+        assert_eq!(follow, Some(leader));
+        assert_eq!(requests, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_foreground_job_tracks_real_leader_exit_back_to_shell() {
+        let (runtime, root, _leader, mut events) = metadata_job_runtime().await;
+        let pid = runtime.child_pid().unwrap();
+        let leader_pid = crate::platform::foreground_process_group_id(pid).unwrap();
+        assert_ne!(leader_pid, pid);
+        // Kill only this fixture's foreground group leader. The pane shell waits
+        // for it and signals after reclaiming foreground control of the same tty.
+        crate::platform::signal_processes(&[leader_pid], crate::platform::Signal::Kill);
+        loop {
+            match events.recv().await.expect("shell foreground readiness") {
+                AppEvent::TerminalBell { .. } => break,
+                AppEvent::PaneDied { .. } => panic!("pane shell exited unexpectedly"),
+                _ => {}
+            }
+        }
+        let observed_group = crate::platform::foreground_process_group_id(pid);
+        FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(0));
+        let expected = root.canonicalize().unwrap();
+        let foreground = runtime.foreground_cwd();
+        let follow = runtime.follow_cwd();
+        let requests = FOREGROUND_ACTOR_REQUESTS.with(Cell::get);
+        runtime.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(observed_group, Some(pid));
+        assert_eq!(foreground, Some(expected.clone()));
+        assert_eq!(follow, Some(expected));
+        assert_eq!(requests, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_foreground_job_ignores_reused_pid_after_reported_exit() {
+        let (runtime, root, leader, _events) = metadata_job_runtime().await;
+        let (other, other_root, _other_leader, _other_events) = metadata_job_runtime().await;
+        let pid = runtime.child_pid().unwrap();
+        // Model PID reuse deterministically using another real, owned PTY child.
+        runtime
+            .child_pid
+            .store(other.child_pid().unwrap(), Ordering::Release);
+        runtime.cwd_process_exited.store(true, Ordering::Release);
+        FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(0));
+        let foreground = runtime.foreground_cwd();
+        let follow = runtime.follow_cwd();
+        let requests = FOREGROUND_ACTOR_REQUESTS.with(Cell::get);
+        runtime.child_pid.store(pid, Ordering::Release);
+        runtime.cwd_process_exited.store(false, Ordering::Release);
+        runtime.shutdown();
+        other.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+        assert_eq!(foreground, Some(leader.clone()));
+        assert_eq!(follow, Some(leader));
+        assert_eq!(
+            requests, 2,
+            "known-exited process identity must use the owning actor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_foreground_job_keeps_actor_fallback_when_process_unavailable() {
+        let (runtime, root, leader, _events) = metadata_job_runtime().await;
+        let pid = runtime.child_pid().unwrap();
+        // Model an unavailable/reaped process observation while its PTY foreground
+        // group is still alive. The actor still owns the sole authoritative fd.
+        runtime.child_pid.store(0, Ordering::Release);
+        FOREGROUND_ACTOR_REQUESTS.with(|count| count.set(0));
+        let foreground = runtime.foreground_cwd();
+        let follow = runtime.follow_cwd();
+        let requests = FOREGROUND_ACTOR_REQUESTS.with(Cell::get);
+        runtime.child_pid.store(pid, Ordering::Release);
+        runtime.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(foreground, Some(leader.clone()));
+        assert_eq!(follow, Some(leader));
+        assert_eq!(
+            requests, 2,
+            "unavailable process observation retains actor fallback"
+        );
     }
 
     #[cfg(unix)]
