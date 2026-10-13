@@ -99,7 +99,7 @@ pub fn checked_height(prev: GridRef<'_>, next: GridRef<'_>) -> Result<usize, Sha
     if prev.width != next.width
         || prev.cells.len() != next.cells.len()
         || (next.width == 0 && !next.cells.is_empty())
-        || (next.width != 0 && next.cells.len() % next.width != 0)
+        || (next.width != 0 && !next.cells.len().is_multiple_of(next.width))
     {
         return Err(ShapeError::Mismatch);
     }

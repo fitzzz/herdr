@@ -9,7 +9,7 @@
 //! next grid, and reads back eight bytes per candidate row.
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::residency::{GridKey, OverBudget, Residency};
 use super::{checked_height, CudaError, DeviceTimings, GridRef, PackedCell, RowDamage, ShapeError};
