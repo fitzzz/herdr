@@ -382,18 +382,13 @@ fn dirty_patch_fallback_keeps_previously_collected_rows_dirty() {
     let mut terminal = Harness::new(8, 6);
     terminal.write(b"\x1b[2;3H");
     terminal.pane.collect_dirty_patch(8, 6);
-    terminal.write(b"\x1b[2;3HX\x1b[5;4H\x1b]8;;https://example.test\x1b\\Y\x1b]8;;\x1b\\");
+    terminal.write(b"\x1b[2;3HX\x1b[?2026h\x1b[5;4HY");
     assert!(matches!(
         terminal.pane.collect_dirty_patch(8, 6),
         TerminalDirtyPatchOutcome::Fallback
     ));
-    // A fallback delivers nothing: both rows stay pending, and so does the
-    // hyperlink row until it no longer carries a link.
-    assert!(matches!(
-        terminal.pane.collect_dirty_patch(8, 6),
-        TerminalDirtyPatchOutcome::Fallback
-    ));
-    terminal.write(b"\x1b[5;4HZ");
+    // A fallback delivers nothing: both rows stay pending.
+    terminal.write(b"\x1b[?2026l");
     let TerminalDirtyPatchOutcome::Patch(patch) = terminal.pane.collect_dirty_patch(8, 6) else {
         panic!("expected both pending rows");
     };

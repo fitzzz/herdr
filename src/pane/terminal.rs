@@ -117,6 +117,8 @@ pub struct TerminalCursorState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalDirtyPatch {
     pub rows: Vec<(u16, Vec<CellData>)>,
+    /// OSC 8 URIs that the cells' `hyperlink` indices refer to.
+    pub hyperlinks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2931,7 +2933,8 @@ fn ghostty_collect_dirty_patch(
     }
 
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
-        rows: patch_rows
+        rows: patch_rows,
+        hyperlinks: Vec::new(),
     }));
 }
 

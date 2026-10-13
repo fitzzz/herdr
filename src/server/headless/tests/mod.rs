@@ -1675,16 +1675,19 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
     let _ = recv_pane_surface(&first_render, "first baseline");
     let _ = recv_pane_surface(&second_render, "second baseline");
 
-    // Foreground renders last. Its old hyperlink forces a fallback after the first plan.
+    // Foreground renders last. Only the background client has received the
+    // new link's URI, so the foreground plan falls back after the first plan.
     server.foreground_client_id = Some(8);
     let crate::server::render_stream::ClientRenderState::Semantic { last_surface, .. } =
-        &mut server.clients.get_mut(&8).unwrap().render_state
+        &mut server.clients.get_mut(&7).unwrap().render_state
     else {
         panic!("semantic client");
     };
     let linked = last_surface.as_mut().unwrap();
-    linked.frame.hyperlinks.push("https://example.com".into());
-    linked.frame.cells[0].hyperlink = Some(0);
+    linked
+        .frame
+        .hyperlinks
+        .push("https://example.test/late".into());
     let before = [7, 8].map(|id| {
         server.clients[&id]
             .render_state
@@ -1693,7 +1696,11 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
             .clone()
     });
 
-    write_shared_test_pane(&mut server, pane_id, b"\rNEXT\x1b[?1003h");
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\r\x1b]8;;https://example.test/late\x1b\\NEXT\x1b]8;;\x1b\\\x1b[?1003h",
+    );
     assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
     assert!(first_render.try_recv().is_err());
     assert!(second_render.try_recv().is_err());
@@ -1703,6 +1710,52 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
             Some(&expected)
         );
     }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn retained_patches_rebind_known_hyperlinks_and_fall_back_for_new_ones() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/known\x1b\\known\x1b]8;;\x1b\\\r\n",
+    );
+    server.render_and_stream();
+    let baseline = recv_pane_surface(&render, "baseline");
+    let known = baseline
+        .frame
+        .hyperlinks
+        .iter()
+        .position(|uri| uri == "https://example.test/known")
+        .expect("baseline link") as u32;
+
+    let sources = HashSet::from([pane_id]);
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/known\x1b\\again\x1b]8;;\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&sources));
+    let patch = recv_pane_surface_patch(&render, "linked patch");
+    let linked = patch
+        .rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .filter(|cell| cell.hyperlink.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(linked.len(), "again".len());
+    assert!(linked.iter().all(|cell| cell.hyperlink == Some(known)));
+
+    // A URI the client has never received needs a complete surface.
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/new\x1b\\new\x1b]8;;\x1b\\",
+    );
+    assert!(!server.render_retained_pane_surface_and_stream(&sources));
     shutdown_test_runtimes(&mut server);
 }
 

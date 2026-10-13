@@ -262,10 +262,7 @@ fn terminal_screen_render_and_dirty_patches_do_not_consume_each_others_changes()
 #[test]
 fn terminal_screen_patch_rows_match_full_render_cells() {
     let pane = PaneTerminal::new(pane(50, 12));
-    for bytes in RICH_CONTENT
-        .iter()
-        .filter(|bytes| !bytes.starts_with(b"\x1b]8"))
-    {
+    for bytes in RICH_CONTENT {
         write(&pane.ghostty, bytes);
     }
     let area = Rect::new(0, 0, 52, 12);
@@ -411,4 +408,38 @@ fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
         .unwrap()
         .frame_data_with_row_revisions(Rect::new(0, 0, 1, 6), None);
     assert!(clipped.is_none());
+}
+
+#[test]
+fn terminal_screen_patch_links_attach_like_full_frames() {
+    let pane = pane(50, 12);
+    for bytes in RICH_CONTENT {
+        write(&pane, bytes);
+    }
+    let TerminalDirtyPatchOutcome::Patch(patch) = pane.collect_dirty_patch(50, 12) else {
+        panic!("linked rows are patched, not a fallback");
+    };
+    let (frame, revisions) = pane
+        .screen_snapshot()
+        .unwrap()
+        .frame_data_with_row_revisions(Rect::new(0, 0, 50, 12), None);
+    // Every row starts with fresh diff state, as a patch row does.
+    assert!(revisions.is_some());
+    let uri = |table: &[String], cell: &CellData| {
+        cell.hyperlink.map(|index| table[index as usize].clone())
+    };
+    let mut linked = 0;
+    for (y, cells) in &patch.rows {
+        for (x, cell) in cells.iter().enumerate() {
+            let full = &frame.cells[usize::from(*y) * 50 + x];
+            assert_eq!(
+                uri(&patch.hyperlinks, cell),
+                uri(&frame.hyperlinks, full),
+                "({x}, {y})"
+            );
+            linked += usize::from(cell.hyperlink.is_some());
+        }
+    }
+    assert!(linked > 0);
+    assert_eq!(patch.hyperlinks.len(), 2);
 }

@@ -699,27 +699,17 @@ fn screen_dirty_patch_inner(
     if changed.is_empty() {
         return TerminalDirtyPatchOutcome::Clean;
     }
-    for (_, row) in &changed {
-        if row.selection.is_some() {
-            crate::render_prof::event("dirty_fallback.row_selection_present");
-            return TerminalDirtyPatchOutcome::Fallback;
-        }
-        if row
-            .cells
-            .iter()
-            .take(usize::from(area_width))
-            .any(|cell| cell.link != 0)
-        {
-            crate::render_prof::event("dirty_fallback.hyperlink_present");
-            return TerminalDirtyPatchOutcome::Fallback;
-        }
+    if changed.iter().any(|(_, row)| row.selection.is_some()) {
+        crate::render_prof::event("dirty_fallback.row_selection_present");
+        return TerminalDirtyPatchOutcome::Fallback;
     }
     let mut rows = Vec::with_capacity(changed.len());
+    let mut hyperlinks = Vec::new();
     for (y, row) in changed {
         // Bounded by `area_height`.
         let y16 = y as u16;
-        rows.push((y16, screen.patch_cells(y16, area_width)));
+        rows.push((y16, screen.patch_cells(y16, area_width, &mut hyperlinks)));
         baseline.revisions[y] = row.revision;
     }
-    TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch { rows })
+    TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch { rows, hyperlinks })
 }

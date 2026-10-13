@@ -266,24 +266,52 @@ impl TerminalScreen {
     }
 
     /// Patch cells for row `y`, padded to `width` with the default blank.
-    pub(crate) fn patch_cells(&self, y: u16, width: u16) -> Vec<CellData> {
+    /// OSC 8 cells index `hyperlinks`, which gains any URI it lacks. A link
+    /// attaches where a full render would attach it: where its symbol equals
+    /// what the row's own backend diff writes there. The diff starts fresh
+    /// at the row's first column, as it does after a pane's left border.
+    pub(crate) fn patch_cells(
+        &self,
+        y: u16,
+        width: u16,
+        hyperlinks: &mut Vec<String>,
+    ) -> Vec<CellData> {
         let mut scratch = [0u8; 4];
+        let mut link_scratch = [0u8; 4];
         let blank = self.blank();
         let row = self.row(y);
+        let mut diff = DiffState::default();
         (0..width)
             .map(|x| {
-                let (cell, symbol) =
-                    match row.and_then(|row| Some((row, row.cells.get(usize::from(x))?))) {
-                        Some((row, cell)) => (cell, row.symbol(cell, &mut scratch)),
-                        None => (&blank, " "),
+                let screen_cell = row.and_then(|row| Some((row, row.cells.get(usize::from(x))?)));
+                let (cell, symbol) = match screen_cell {
+                    Some((row, cell)) => (cell, row.symbol(cell, &mut scratch)),
+                    None => (&blank, " "),
+                };
+                let written =
+                    diff.write(cell.is_ratatui_empty(), symbol, symbol_width(cell, symbol));
+                let backend_symbol = if written { symbol } else { " " };
+                let hyperlink = screen_cell.and_then(|(row, cell)| {
+                    let uri: &str = row.link_uri(cell)?;
+                    if row.link_symbol(x, cell, &mut link_scratch) != backend_symbol {
+                        return None;
+                    }
+                    let index = match hyperlinks.iter().position(|known| known == uri) {
+                        Some(index) => index,
+                        None => {
+                            hyperlinks.push(uri.to_owned());
+                            hyperlinks.len() - 1
+                        }
                     };
+                    u32::try_from(index).ok()
+                });
                 CellData {
                     symbol: symbol.to_owned(),
                     fg: cell.fg,
                     bg: cell.bg,
                     modifier: cell.modifier,
                     skip: false,
-                    hyperlink: None,
+                    hyperlink,
                 }
             })
             .collect()
@@ -316,15 +344,12 @@ impl TerminalScreen {
         let mut scratch = [0u8; 4];
         let mut link_scratch = [0u8; 4];
 
-        // ratatui `Buffer::diff` state, carried across rows like the original.
-        let mut invalidated = 0usize;
-        let mut to_skip = 0usize;
-        let mut forced_end = 0usize;
-        let mut index = 0usize;
+        // Carried across rows like the original.
+        let mut diff = DiffState::default();
         let mut row_revisions = Some(Vec::with_capacity(usize::from(height)));
         for y in 0..height {
             let row = self.row(y);
-            if invalidated > 0 || to_skip > 0 || index < forced_end {
+            if diff.carries() {
                 row_revisions = None;
             }
             if let Some(revisions) = row_revisions.as_mut() {
@@ -336,16 +361,8 @@ impl TerminalScreen {
                     Some((row, cell)) => (cell, row.symbol(cell, &mut scratch)),
                     None => (&blank, " "),
                 };
-                let symbol_width = symbol_width(cell, symbol);
-                let empty = cell.is_ratatui_empty();
-                let diff_write = (!empty || invalidated > 0) && to_skip == 0;
-                let written = diff_write || (index < forced_end && !empty);
-                if diff_write && symbol_width > 1 && symbol.contains('\u{FE0F}') {
-                    forced_end = forced_end.max(index + symbol_width);
-                }
-                to_skip = symbol_width.saturating_sub(1);
-                invalidated = symbol_width.max(1).max(invalidated) - 1;
-
+                let written =
+                    diff.write(cell.is_ratatui_empty(), symbol, symbol_width(cell, symbol));
                 let backend_symbol = if written { symbol } else { " " };
                 let hyperlink = screen_cell.and_then(|(row, cell)| {
                     let uri: &str = row.link_uri(cell)?;
@@ -377,7 +394,6 @@ impl TerminalScreen {
                         hyperlink,
                     }
                 });
-                index += 1;
             }
         }
 
@@ -399,6 +415,37 @@ impl TerminalScreen {
             }
         });
         (frame, revisions)
+    }
+}
+
+/// ratatui-core's `Buffer::diff` against an empty previous buffer, one cell
+/// at a time in row-major order: which cells a fresh test backend receives.
+#[derive(Default)]
+struct DiffState {
+    invalidated: usize,
+    to_skip: usize,
+    forced_end: usize,
+    index: usize,
+}
+
+impl DiffState {
+    /// Whether the next cell still depends on cells before it.
+    fn carries(&self) -> bool {
+        self.invalidated > 0 || self.to_skip > 0 || self.index < self.forced_end
+    }
+
+    /// Advances over one cell; true when the backend receives it.
+    fn write(&mut self, empty: bool, symbol: &str, width: usize) -> bool {
+        let diff_write = (!empty || self.invalidated > 0) && self.to_skip == 0;
+        let written = diff_write || (self.index < self.forced_end && !empty);
+        // A VS16 wide symbol also forces the following non-empty cells it covers.
+        if diff_write && width > 1 && symbol.contains('\u{FE0F}') {
+            self.forced_end = self.forced_end.max(self.index + width);
+        }
+        self.to_skip = width.saturating_sub(1);
+        self.invalidated = width.max(1).max(self.invalidated) - 1;
+        self.index += 1;
+        written
     }
 }
 

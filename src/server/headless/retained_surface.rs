@@ -5,27 +5,37 @@ fn rect_fits_frame(rect: protocol::SurfaceRect, frame: &FrameData) -> bool {
         && rect.y.saturating_add(rect.height) <= frame.height
 }
 
-fn patch_intersects_hyperlinks(
-    frame: &FrameData,
-    area: protocol::SurfaceRect,
-    patch: &crate::pane::TerminalDirtyPatch,
-) -> bool {
-    if frame.hyperlinks.is_empty() || !rect_fits_frame(area, frame) {
-        return false;
+/// Rebinds the patch's OSC 8 cells to `committed`, the recipient's frame
+/// table, so patched cells and the recipient's retained cells share one
+/// table. None when the recipient has not received one of the URIs; only a
+/// complete frame (or surface delta) can add it.
+fn bind_patch_hyperlinks<'a>(
+    patch: &'a crate::pane::TerminalDirtyPatch,
+    committed: &[String],
+) -> Option<std::borrow::Cow<'a, crate::pane::TerminalDirtyPatch>> {
+    if patch.hyperlinks.is_empty() {
+        return Some(std::borrow::Cow::Borrowed(patch));
     }
-    let width = usize::from(frame.width);
-    patch
-        .rows
+    let bindings = patch
+        .hyperlinks
         .iter()
-        .filter(|(local_y, _)| *local_y < area.height)
-        .any(|(local_y, _)| {
-            let start = usize::from(area.y + *local_y) * width + usize::from(area.x);
-            let end = start + usize::from(area.width);
-            end > frame.cells.len()
-                || frame.cells[start..end]
-                    .iter()
-                    .any(|cell| cell.hyperlink.is_some())
+        .map(|uri| {
+            let index = committed.iter().position(|known| known == uri)?;
+            u32::try_from(index).ok()
         })
+        .collect::<Option<Vec<_>>>()?;
+    let mut bound = patch.clone();
+    for cell in bound
+        .rows
+        .iter_mut()
+        .flat_map(|(_, cells)| cells.iter_mut())
+    {
+        if let Some(index) = cell.hyperlink {
+            cell.hyperlink = Some(*bindings.get(usize::try_from(index).ok()?)?);
+        }
+    }
+    bound.hyperlinks = committed.to_vec();
+    Some(std::borrow::Cow::Owned(bound))
 }
 
 fn patch_row_changed(frame: &FrameData, row: &protocol::PaneSurfacePatchRow) -> Option<bool> {
@@ -422,7 +432,10 @@ impl HeadlessServer {
             let patch = match snapshot.patch {
                 crate::pane::TerminalDirtyPatchOutcome::Clean => {
                     crate::render_prof::event("retained_surface.pane_clean");
-                    crate::pane::TerminalDirtyPatch { rows: Vec::new() }
+                    crate::pane::TerminalDirtyPatch {
+                        rows: Vec::new(),
+                        hyperlinks: Vec::new(),
+                    }
                 }
                 crate::pane::TerminalDirtyPatchOutcome::Patch(patch) => patch,
                 crate::pane::TerminalDirtyPatchOutcome::Fallback => {
@@ -468,18 +481,14 @@ impl HeadlessServer {
                 if pane.alternate_screen_active != collected_pane.alternate_screen_active {
                     fallback!("alternate_screen_geometry");
                 }
-                if patch_intersects_hyperlinks(
-                    &surface.frame,
-                    pane.inner_rect,
-                    &collected_pane.patch,
-                ) {
-                    fallback!("hyperlink");
-                }
+                let Some(patch) =
+                    bind_patch_hyperlinks(&collected_pane.patch, &surface.frame.hyperlinks)
+                else {
+                    fallback!("hyperlink_unbound");
+                };
                 refresh_graphics |= collected_pane.graphics_may_have_placements;
                 let previous_pane = pane.clone();
-                let Some(rows) =
-                    changed_rows(&surface.frame, pane.inner_rect, &collected_pane.patch)
-                else {
+                let Some(rows) = changed_rows(&surface.frame, pane.inner_rect, &patch) else {
                     fallback!("invalid_patch");
                 };
                 patch_rows.extend(rows);
@@ -569,6 +578,10 @@ impl HeadlessServer {
             };
             if collected_pane.graphics_may_have_placements {
                 fallback!("terminal_graphics");
+            }
+            // The ANSI patch encoder writes no OSC 8 cells; a complete frame does.
+            if !collected_pane.patch.hyperlinks.is_empty() {
+                fallback!("terminal_hyperlink");
             }
             if terminal_has_clipped_wide_edge(recipient.frame, Some(&collected_pane.patch)) {
                 fallback!("terminal_clipped_wide_patch");
@@ -827,6 +840,7 @@ mod tests {
         assert!(!terminal_has_clipped_wide_edge(&frame, None));
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell(" "), voiced])],
+            hyperlinks: Vec::new(),
         };
         assert!(terminal_has_clipped_wide_edge(&frame, Some(&patch)));
     }
@@ -843,6 +857,7 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell(" "), cell("x"), cell("y"), cell(" ")])],
+            hyperlinks: Vec::new(),
         };
 
         let rows = changed_rows(
@@ -880,6 +895,7 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell("x"), cell("z"), cell("q")])],
+            hyperlinks: Vec::new(),
         };
 
         let rows = changed_rows(
@@ -916,6 +932,7 @@ mod tests {
         };
         let patch = crate::pane::TerminalDirtyPatch {
             rows: vec![(0, vec![cell(" "); 4]), (1, vec![cell(" "); 4])],
+            hyperlinks: Vec::new(),
         };
 
         let rows = changed_rows(
