@@ -332,32 +332,50 @@ fn terminal_screen_is_unavailable_during_synchronized_output() {
     assert_eq!(screen.rows_data[0].cells[0].content, u32::from('p'));
 }
 
+/// Helper frame cells with hyperlinks resolved to URIs, since table indices
+/// may differ between frames.
+fn rows_by_uri(frame: &crate::protocol::FrameData) -> Vec<Vec<(CellData, Option<String>)>> {
+    frame
+        .cells
+        .chunks(usize::from(frame.width))
+        .map(|row| {
+            row.iter()
+                .map(|cell| {
+                    let uri = cell
+                        .hyperlink
+                        .map(|index| frame.hyperlinks[index as usize].clone());
+                    (
+                        CellData {
+                            hyperlink: None,
+                            ..cell.clone()
+                        },
+                        uri,
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The rows the server ANSI encoder may skip when `next` follows `committed`:
+/// equal key and equal row revision. Asserts the skip contract for each one,
+/// same cells and same link targets.
+fn skippable_rows(
+    committed: &(crate::protocol::FrameData, super::screen::FrameRowRevisions),
+    next: &(crate::protocol::FrameData, super::screen::FrameRowRevisions),
+) -> Vec<usize> {
+    if committed.1.key != next.1.key {
+        return Vec::new();
+    }
+    let (old_rows, new_rows) = (rows_by_uri(&committed.0), rows_by_uri(&next.0));
+    (0..next.1.rows.len())
+        .filter(|&y| committed.1.rows[y] == next.1.rows[y])
+        .inspect(|&y| assert_eq!(new_rows[y], old_rows[y], "row {y}"))
+        .collect()
+}
+
 #[test]
 fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
-    // Cells with hyperlinks resolved to URIs, since table indices may differ.
-    fn rows_by_uri(frame: &crate::protocol::FrameData) -> Vec<Vec<(CellData, Option<String>)>> {
-        frame
-            .cells
-            .chunks(usize::from(frame.width))
-            .map(|row| {
-                row.iter()
-                    .map(|cell| {
-                        let uri = cell
-                            .hyperlink
-                            .map(|index| frame.hyperlinks[index as usize].clone());
-                        (
-                            CellData {
-                                hyperlink: None,
-                                ..cell.clone()
-                            },
-                            uri,
-                        )
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
     let pane = pane(20, 5);
     write(
         &pane,
@@ -408,6 +426,70 @@ fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
         .unwrap()
         .frame_data_with_row_revisions(Rect::new(0, 0, 1, 6), None);
     assert!(clipped.is_none());
+}
+
+#[test]
+fn terminal_screen_frame_row_revisions_match_only_the_same_screen_rows() {
+    // A 20x3 grid in a 20x4 area: row 3 is padding.
+    let area = Rect::new(0, 0, 20, 4);
+    let frame = |pane: &GhosttyPaneTerminal| {
+        let (frame, revisions) = pane
+            .screen_snapshot()
+            .unwrap()
+            .frame_data_with_row_revisions(area, None);
+        (frame, revisions.unwrap())
+    };
+    let content =
+        "same\r\n\x1b]8;;https://example.test/a\x1b\\text\x1b]8;;\x1b\\\r\n\x1b[38;5;1mred\x1b[0m";
+    let shown = pane(20, 3);
+    let other = pane(20, 3);
+    write(&shown, content.as_bytes());
+    write(&other, content.as_bytes());
+    let first = frame(&shown);
+
+    // Pane switch: same geometry, colors and cells give the same key, but no
+    // grid row of another screen shares a revision. Only padding matches.
+    let switched = frame(&other);
+    assert_eq!(switched.0, first.0);
+    assert_eq!(switched.1.key, first.1.key);
+    assert_eq!(skippable_rows(&first, &switched), vec![3]);
+    assert_eq!(skippable_rows(&switched, &first), vec![3]);
+
+    // The cursor is frame metadata, never drawn into helper cells.
+    write(&shown, b"\x1b[1;10H");
+    let moved = frame(&shown);
+    assert_eq!(skippable_rows(&first, &moved), vec![0, 1, 2, 3]);
+
+    // Same text, new OSC 8 target.
+    write(
+        &shown,
+        b"\x1b[2;1H\x1b]8;;https://example.test/b\x1b\\text\x1b]8;;\x1b\\",
+    );
+    let retargeted = frame(&shown);
+    assert_eq!(skippable_rows(&moved, &retargeted), vec![0, 2, 3]);
+
+    // A palette entry in use changes only the row that uses it.
+    write(&shown, b"\x1b]4;1;rgb:12/34/56\x07");
+    let repainted = frame(&shown);
+    assert_eq!(skippable_rows(&retargeted, &repainted), vec![0, 1, 3]);
+
+    // Eviction and recreation: identical cells under the same key, but every
+    // grid row is new, with revisions above any issued before.
+    let issued_before = repainted.1.rows.iter().copied().max().unwrap();
+    let used_at = shown.core.lock().unwrap().screen_used_at;
+    assert!(shown.release_idle_screen(used_at + IDLE_SCREEN_RETENTION, IDLE_SCREEN_RETENTION));
+    let recreated = frame(&shown);
+    assert_eq!(recreated.0, repainted.0);
+    assert_eq!(skippable_rows(&repainted, &recreated), vec![3]);
+    assert!(recreated.1.rows[..3]
+        .iter()
+        .all(|&revision| revision > issued_before));
+
+    // A new default background repaints padding, so the key changes.
+    write(&shown, b"\x1b]11;rgb:12/34/56\x07");
+    let new_background = frame(&shown);
+    assert_ne!(new_background.1.key, recreated.1.key);
+    assert!(skippable_rows(&recreated, &new_background).is_empty());
 }
 
 #[test]
