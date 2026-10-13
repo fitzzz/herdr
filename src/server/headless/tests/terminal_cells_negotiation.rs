@@ -43,19 +43,38 @@ fn observe(server: &mut HeadlessServer, client_id: u64, target: &str) {
     );
 }
 
-/// The welcome among the control messages written so far.
-fn welcome(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> CellsWelcome {
-    let welcomes = control_rx
-        .try_iter()
-        .filter_map(|bytes| match read_server_message(bytes) {
-            ServerMessage::EndpointControl { kind, data }
-                if kind == terminal_cells::WELCOME_KIND =>
-            {
-                Some(serde_json::from_str::<CellsWelcome>(&data).expect("welcome json"))
+/// The one welcome queued for the client so far.
+///
+/// The test writer forwards control messages from a background thread, so a
+/// non-blocking read can miss one that is queued but not yet forwarded. A
+/// sentinel queued behind it on the same FIFO control queue marks the end of
+/// what the server has written; reading up to it sees every earlier message.
+fn welcome(
+    server: &HeadlessServer,
+    client_id: u64,
+    control_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) -> CellsWelcome {
+    const SENTINEL: &[u8] = b"terminal cells test sentinel";
+    server
+        .clients
+        .get(&client_id)
+        .and_then(|client| client.writer.as_ref())
+        .expect("client writer")
+        .control
+        .send(SENTINEL.to_vec())
+        .expect("queue sentinel");
+    let mut welcomes = Vec::new();
+    loop {
+        let bytes = control_rx.recv().expect("control message");
+        if bytes == SENTINEL {
+            break;
+        }
+        if let ServerMessage::EndpointControl { kind, data } = read_server_message(bytes) {
+            if kind == terminal_cells::WELCOME_KIND {
+                welcomes.push(serde_json::from_str::<CellsWelcome>(&data).expect("welcome json"));
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+        }
+    }
     assert_eq!(welcomes.len(), 1, "exactly one welcome per hello");
     welcomes.into_iter().next().unwrap()
 }
@@ -69,7 +88,7 @@ fn hello_before_attach_is_welcomed_before_any_frame_and_streams_cells() {
         // frame can exist yet; the writer also drains control before render.
         assert!(render_rx.try_recv().is_err());
         assert_eq!(
-            welcome(&control_rx),
+            welcome(server, 7, &control_rx),
             CellsWelcome {
                 codec: Some(terminal_cells::CODEC.to_owned()),
                 error: None,
@@ -101,10 +120,9 @@ fn hello_after_attach_is_refused_and_the_stream_stays_ansi() {
             read_server_message(render_rx.recv().expect("ANSI baseline")),
             ServerMessage::Terminal(_)
         ));
-        let _ = control_rx.try_iter().count();
 
         hello(server, 7, &current_hello());
-        let refused = welcome(&control_rx);
+        let refused = welcome(server, 7, &control_rx);
         assert_eq!(refused.codec, None);
         assert_eq!(
             refused.error.as_deref(),
@@ -129,7 +147,7 @@ fn hello_without_a_known_codec_is_refused_and_frames_stay_ansi() {
         with_terminal_session_test_server(|server, _, target, _| {
             let (control_rx, render_rx) = connect(server, 7);
             hello(server, 7, data);
-            let refused = welcome(&control_rx);
+            let refused = welcome(server, 7, &control_rx);
             assert_eq!(refused.codec, None, "{data}");
             assert_eq!(
                 refused.error.as_deref(),
@@ -154,9 +172,9 @@ fn a_repeated_hello_before_attach_is_welcomed_again() {
     with_terminal_session_test_server(|server, _, _, _| {
         let (control_rx, _render_rx) = connect(server, 7);
         hello(server, 7, &current_hello());
-        assert!(welcome(&control_rx).codec.is_some());
+        assert!(welcome(server, 7, &control_rx).codec.is_some());
         hello(server, 7, &current_hello());
-        assert!(welcome(&control_rx).codec.is_some());
+        assert!(welcome(server, 7, &control_rx).codec.is_some());
     });
 }
 
