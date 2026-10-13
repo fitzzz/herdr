@@ -19,6 +19,8 @@ use crate::protocol::CellData;
 mod full_render_parity_tests;
 #[cfg(test)]
 mod migration_tests;
+#[cfg(test)]
+mod terminal_cells_eligibility_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
 

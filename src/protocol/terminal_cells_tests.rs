@@ -828,12 +828,32 @@ fn display_matches_the_ansi_encoder_through_a_real_terminal() {
                     frame = mutate(&mut rng, &frame, symbols);
                 }
                 normalize(&mut frame, true);
+                if host_setup == b"\x1b[?7l" {
+                    keep_marks_off_the_column_before_the_last(&mut frame);
+                }
                 let encoded = ansi.encode(&frame, false);
                 terminal.write(&encoded.bytes);
                 ansi.commit(frame.clone(), encoded);
                 send(&mut encoder, &mut grid, &frame, seq);
                 assert_display_parity(&terminal, &grid);
             }
+        }
+    }
+}
+
+/// Without autowrap, Ghostty cannot tell a cursor parked in the last column
+/// after printing into the column before it from one that printed the last
+/// column itself: a combining mark that follows attaches to the last column
+/// whenever that column already holds text (Terminal.zig `print`, grapheme
+/// branch). The ANSI bytes then display the mark one cell too far right, so
+/// that host cannot judge a cluster in that column. The autowrap pass keeps
+/// such clusters in every column.
+fn keep_marks_off_the_column_before_the_last(frame: &mut FrameData) {
+    let width = usize::from(frame.width);
+    for row in frame.cells.chunks_mut(width) {
+        let cell = &mut row[width - 2];
+        if cell.symbol.chars().count() > 1 && cell_width(cell) == 1 {
+            cell.symbol = "a".into();
         }
     }
 }
@@ -878,7 +898,10 @@ fn sample_record() -> Vec<u8> {
     let mut row = text_row("ab", 4);
     row[2] = linked("界", 0);
     row[3] = cell("");
-    let frame = frame_from_rows(&[row, text_row("e\u{301}", 4)], &["https://x"]);
+    // One grapheme cluster per cell: text_row would split the combining mark
+    // into a zero-width cell of its own, which the codec reports as unsupported.
+    let combining = vec![cell("e\u{301}"), cell(" "), cell(" "), cell(" ")];
+    let frame = frame_from_rows(&[row, combining], &["https://x"]);
     CellsEncoder::new()
         .encode(&frame, false, 3, 0)
         .unwrap()
