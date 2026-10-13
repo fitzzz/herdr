@@ -29,8 +29,10 @@
 use std::cmp;
 use std::io::Write;
 
+use cell_damage::RowDamage;
 use unicode_width::UnicodeWidthStr;
 
+use crate::cell_damage::{FrameDamage, PackedFrame};
 use crate::protocol::{
     underline_style_from_modifier, CellData, CursorState, FrameData, PaneSurfacePatchRow,
 };
@@ -52,6 +54,47 @@ pub(crate) struct EncodedBlit {
     pub(crate) full: bool,
     next_last_visible_cursor: Option<(u16, u16)>,
     next_last_cursor_shape: u8,
+    /// The packed frame, when row damage was computed for it.
+    packed: Option<PackedFrame>,
+    revisions: Option<Box<CommittedRevisions>>,
+    /// Rows the diff skipped because row damage reported them equal.
+    // Read by tests; render_prof records the same count while encoding.
+    #[cfg_attr(not(test), allow(dead_code))]
+    rows_skipped: usize,
+}
+
+/// Per-row content revisions of a frame built from a retained terminal
+/// screen. The encoder skips a row whose `key` and revision equal the
+/// committed frame's without reading it, so the producer guarantees: under
+/// one `key`, an equal revision means the same cells (symbol, colors,
+/// modifiers, skip flag) and the same sanitized hyperlink targets, whatever
+/// the hyperlink-table indexes. The screen producer meets this with
+/// process-unique revisions:
+///
+/// - A revision is never issued twice in a process, so rows from another
+///   pane, or from a screen that was evicted, recreated or reset, never
+///   match a committed row; the key may repeat across sources. Padding rows
+///   below the grid use revision 0 and are fully determined by the key.
+/// - A row keeps its revision only while its resolved content (cells, link
+///   targets, selection) is unchanged, so palette, theme and scroll changes
+///   need no new key. The key covers what lies outside the rows: frame
+///   size, grid size and default colors.
+/// - Anything that changes frame cells after the producer built them (a
+///   cursor or highlight drawn into cells) must pass no revisions or give
+///   the changed rows new ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+// Built by render_stream once the bulk track's screen frames reach it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RowRevisions {
+    pub(crate) key: u64,
+    pub(crate) rows: Vec<u64>,
+}
+
+/// Row revisions of the committed frame and which of its rows hold a symbol
+/// wider than two columns, which the diff can rewrite even when equal.
+struct CommittedRevisions {
+    revisions: RowRevisions,
+    overwide_rows: Vec<bool>,
 }
 
 /// Stateful encoder that diffs semantic frames into terminal ANSI bytes.
@@ -60,6 +103,24 @@ pub(crate) struct BlitEncoder {
     last_frame: Option<FrameData>,
     last_visible_cursor: Option<(u16, u16)>,
     last_cursor_shape: u8,
+    /// Optional packed row damage (`HERDR_RENDER_ACCEL`), which only lets
+    /// the diff skip rows equal to `last_frame`.
+    damage: FrameDamage,
+    /// Row revisions of `last_frame`, when it was encoded with them. Boxed
+    /// so encoders without revisions stay small.
+    last_revisions: Option<Box<CommittedRevisions>>,
+}
+
+impl EncodedBlit {
+    #[cfg(test)]
+    pub(crate) fn has_row_damage(&self) -> bool {
+        self.packed.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rows_skipped(&self) -> usize {
+        self.rows_skipped
+    }
 }
 
 impl BlitEncoder {
@@ -67,8 +128,101 @@ impl BlitEncoder {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_damage(damage: FrameDamage) -> Self {
+        Self {
+            damage,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn encode(&self, frame: &FrameData, repaint: bool) -> EncodedBlit {
-        self.encode_inner(frame, repaint, false)
+        self.encode_inner(frame, repaint, false, None, None)
+    }
+
+    /// Like [`Self::encode`] for a frame whose rows carry revisions. The
+    /// diff skips rows whose revision equals the committed frame's, unless
+    /// they hold a symbol wider than two columns. With a row-damage backend,
+    /// only rows whose revision differs are packed and compared, and rows
+    /// that compare equal are skipped as well.
+    // Called by render_stream once the bulk track's screen frames reach it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn encode_with_row_revisions(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        revisions: RowRevisions,
+    ) -> EncodedBlit {
+        let width = usize::from(frame.width);
+        if revisions.rows.len() != usize::from(frame.height)
+            || frame.cells.len() != width * usize::from(frame.height)
+        {
+            return self.encode(frame, repaint);
+        }
+        let same_shape = self
+            .last_frame
+            .as_ref()
+            .is_some_and(|last| last.width == frame.width && last.height == frame.height);
+        let last = self.last_revisions.as_ref().filter(|last| {
+            same_shape
+                && last.revisions.key == revisions.key
+                && last.revisions.rows.len() == revisions.rows.len()
+        });
+        let row_changed =
+            |row: usize| last.is_none_or(|last| last.revisions.rows[row] != revisions.rows[row]);
+        let overwide_rows: Vec<bool> = (0..revisions.rows.len())
+            .map(|row| match last {
+                Some(last) if !row_changed(row) => last.overwide_rows[row],
+                _ => frame.cells[row * width..(row + 1) * width]
+                    .iter()
+                    .any(is_overwide),
+            })
+            .collect();
+        let changed_rows: Option<Vec<u16>> = last.map(|_| {
+            (0..frame.height)
+                .filter(|&row| row_changed(usize::from(row)))
+                .collect()
+        });
+        let full_row = RowDamage {
+            start: 0,
+            end: u32::from(frame.width),
+        };
+        let revision_damage = last.map(|_| {
+            (0..revisions.rows.len())
+                .map(|row| {
+                    if row_changed(row) || overwide_rows[row] {
+                        full_row
+                    } else {
+                        RowDamage::UNCHANGED
+                    }
+                })
+                .collect()
+        });
+        let mut encoded = self.encode_inner(
+            frame,
+            repaint,
+            false,
+            changed_rows.as_deref(),
+            revision_damage,
+        );
+        encoded.revisions = Some(Box::new(CommittedRevisions {
+            revisions,
+            overwide_rows,
+        }));
+        encoded
+    }
+
+    /// Like [`Self::encode`], with the caller's guarantee that rows not in
+    /// `changed_rows` look the same as in the committed frame: same cells and
+    /// same link targets, whatever their hyperlink-table indexes.
+    #[cfg(test)]
+    pub(crate) fn encode_with_changed_rows(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        changed_rows: &[u16],
+    ) -> EncodedBlit {
+        self.encode_inner(frame, repaint, false, Some(changed_rows), None)
     }
 
     pub(crate) fn encode_with_suppressed_visible_cursor(
@@ -76,14 +230,17 @@ impl BlitEncoder {
         frame: &FrameData,
         repaint: bool,
     ) -> EncodedBlit {
-        self.encode_inner(frame, repaint, true)
+        self.encode_inner(frame, repaint, true, None, None)
     }
 
+    /// `revision_damage` is used when the backend computes no row damage.
     fn encode_inner(
         &self,
         frame: &FrameData,
         repaint: bool,
         suppress_visible_cursor: bool,
+        changed_rows: Option<&[u16]>,
+        revision_damage: Option<Vec<RowDamage>>,
     ) -> EncodedBlit {
         let previous_frame = self.last_frame.as_ref();
         let prev = if repaint { None } else { previous_frame };
@@ -94,6 +251,13 @@ impl BlitEncoder {
         let prof_stats =
             crate::render_prof::enabled().then(|| compute_prof_blit_stats(frame, prev, full));
         let prof_started = crate::render_prof::timer();
+        let (row_damage, packed) = match prev.filter(|_| !full) {
+            None => (None, None),
+            Some(prev) => match self.damage.damage(prev, frame, changed_rows) {
+                Some(damage) => (Some(damage.rows), Some(damage.packed)),
+                None => (revision_damage, None),
+            },
+        };
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
@@ -101,12 +265,19 @@ impl BlitEncoder {
             &mut bytes,
             frame,
             prev,
+            row_damage.as_deref(),
             &mut next_last_visible_cursor,
             &mut next_last_cursor_shape,
             repeat_ime_anchor_after_sync(),
             clear_before_full_redraw,
             suppress_visible_cursor,
         );
+        let rows_skipped = row_damage.as_deref().map_or(0, |rows| {
+            rows.iter().filter(|row| !row.is_changed()).count()
+        });
+        if prof_stats.is_some() && row_damage.is_some() {
+            crate::render_prof::counter("cell_damage.rows_skipped", rows_skipped as u64);
+        }
         if let Some(stats) = prof_stats {
             crate::render_prof::duration_since("ansi_encode.total", prof_started);
             crate::render_prof::counter("ansi_encode.bytes", bytes.len() as u64);
@@ -124,12 +295,19 @@ impl BlitEncoder {
             full,
             next_last_visible_cursor,
             next_last_cursor_shape,
+            packed,
+            revisions: None,
+            rows_skipped,
         }
     }
 
+    /// `encoded` must come from encoding `frame`; its packed form becomes the
+    /// row-damage baseline.
     pub(crate) fn commit(&mut self, frame: FrameData, encoded: EncodedBlit) {
         self.last_visible_cursor = encoded.next_last_visible_cursor;
         self.last_cursor_shape = encoded.next_last_cursor_shape;
+        self.damage.commit(encoded.packed);
+        self.last_revisions = encoded.revisions;
         self.last_frame = Some(frame);
     }
 
@@ -162,6 +340,9 @@ impl BlitEncoder {
                 full: false,
                 next_last_visible_cursor: self.last_visible_cursor,
                 next_last_cursor_shape: self.last_cursor_shape,
+                packed: None,
+                revisions: None,
+                rows_skipped: 0,
             });
         }
         let mut bytes = Vec::new();
@@ -182,6 +363,9 @@ impl BlitEncoder {
             full: false,
             next_last_visible_cursor,
             next_last_cursor_shape,
+            packed: None,
+            revisions: None,
+            rows_skipped: 0,
         })
     }
 
@@ -234,6 +418,8 @@ impl BlitEncoder {
         cursor: Option<CursorState>,
         encoded: EncodedBlit,
     ) -> bool {
+        // Patched rows have no revision; the next frame compares every row.
+        self.last_revisions = None;
         let Some(frame) = self.last_frame.as_mut() else {
             return false;
         };
@@ -241,10 +427,13 @@ impl BlitEncoder {
             let start = usize::from(row.y) * usize::from(frame.width) + usize::from(row.x);
             let end = start + row.cells.len();
             let Some(target) = frame.cells.get_mut(start..end) else {
+                // Earlier rows were written; the baseline no longer matches.
+                self.damage.commit(None);
                 return false;
             };
             target.clone_from_slice(&row.cells);
         }
+        self.damage.apply_patch(frame, rows);
         frame.cursor = cursor;
         self.last_visible_cursor = encoded.next_last_visible_cursor;
         self.last_cursor_shape = encoded.next_last_cursor_shape;
@@ -547,6 +736,7 @@ fn blit_frame_to_with_cursor_memory_and_policy(
         writer,
         frame,
         prev,
+        None,
         last_visible_cursor,
         last_cursor_shape,
         repeat_ime_anchor,
@@ -668,10 +858,13 @@ fn blit_patch_to(
     let _ = writer.flush();
 }
 
+/// `row_damage`, when given, has one entry per row of `frame`; rows it
+/// reports unchanged are equal to `prev` and the diff skips them.
 fn blit_frame_to_with_cursor_memory_and_clear_policy(
     mut writer: impl Write,
     frame: &FrameData,
     prev: Option<&FrameData>,
+    row_damage: Option<&[RowDamage]>,
     last_visible_cursor: &mut Option<(u16, u16)>,
     last_cursor_shape: &mut u8,
     repeat_ime_anchor: bool,
@@ -704,7 +897,7 @@ fn blit_frame_to_with_cursor_memory_and_clear_policy(
     } else {
         // Diff-based update: only write changed cells.
         let prev = prev.unwrap();
-        write_changed_cells(&mut writer, frame, prev);
+        write_changed_cells(&mut writer, frame, prev, row_damage);
     }
 
     // Position the cursor while it is still hidden, then restore visibility.
@@ -742,6 +935,12 @@ fn repeat_ime_anchor_after_sync() -> bool {
 #[cfg(not(windows))]
 fn repeat_ime_anchor_after_sync() -> bool {
     true
+}
+
+/// Whether the diff treats `cell` as wider than two columns. Single-byte
+/// symbols are at most one column, so most cells skip the width lookup.
+pub(crate) fn is_overwide(cell: &CellData) -> bool {
+    cell.symbol.len() > 1 && cell_width(cell) > 2
 }
 
 /// Writes all cells in the frame (full redraw).
@@ -913,7 +1112,7 @@ fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn sanitized_frame_hyperlinks(frame: &FrameData) -> Vec<Option<String>> {
+pub(crate) fn sanitized_frame_hyperlinks(frame: &FrameData) -> Vec<Option<String>> {
     frame
         .hyperlinks
         .iter()
@@ -1001,7 +1200,17 @@ fn cells_visually_equal(
     // Skip flag is only for ratatui internal use, not visual.
 }
 
-fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameData) {
+/// Rows that `row_damage` reports unchanged are skipped. That writes the same
+/// bytes as scanning them: the column scan state restarts at each row, the
+/// style and link state carried between rows only changes when a cell is
+/// written, and an equal row writes nothing unless it holds a symbol wider
+/// than two columns, which row damage always reports changed.
+fn write_changed_cells(
+    writer: &mut impl Write,
+    frame: &FrameData,
+    prev: &FrameData,
+    row_damage: Option<&[RowDamage]>,
+) {
     let mut last_sgr = String::new(); // Track last SGR to avoid redundant style changes.
     let mut last_style = None;
     let mut active_hyperlink = None;
@@ -1009,6 +1218,12 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
     let prev_sanitized_hyperlinks = sanitized_frame_hyperlinks(prev);
 
     for row in 0..frame.height {
+        if row_damage
+            .and_then(|damage| damage.get(usize::from(row)))
+            .is_some_and(|damage| !damage.is_changed())
+        {
+            continue;
+        }
         let mut invalidated = 0usize;
         let mut to_skip = 0usize;
         // Herdr clients disable host autowrap, so safe cells can advance inline
