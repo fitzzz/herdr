@@ -68,20 +68,20 @@ pub(crate) struct EncodedBlit {
 /// committed frame's without reading it, so the producer guarantees: under
 /// one `key`, an equal revision means the same cells (symbol, colors,
 /// modifiers, skip flag) and the same sanitized hyperlink targets, whatever
-/// the hyperlink-table indexes. In practice:
+/// the hyperlink-table indexes. The screen producer meets this with
+/// process-unique revisions:
 ///
-/// - A new `key` whenever the rows come from another source or the same
-///   source restarted its revisions: a pane, tab or zoom switch, and a
-///   screen that was evicted, recreated, reset or resized. Keys are never
-///   reused for another source or a restarted one.
-/// - A new `key` whenever frame row N maps to another screen row (scroll
-///   offset into scrollback, area or origin change), and whenever something
-///   outside the rows changes how cells render (palette or default colors,
-///   padding, theme).
-/// - A new revision for every row whose drawn content changes, including
-///   overlays drawn into the frame: the cursor cell at its old and new
-///   position, selection and search highlights, and an OSC 8 target that
-///   changes while the cells stay.
+/// - A revision is never issued twice in a process, so rows from another
+///   pane, or from a screen that was evicted, recreated or reset, never
+///   match a committed row; the key may repeat across sources. Padding rows
+///   below the grid use revision 0 and are fully determined by the key.
+/// - A row keeps its revision only while its resolved content (cells, link
+///   targets, selection) is unchanged, so palette, theme and scroll changes
+///   need no new key. The key covers what lies outside the rows: frame
+///   size, grid size and default colors.
+/// - Anything that changes frame cells after the producer built them (a
+///   cursor or highlight drawn into cells) must pass no revisions or give
+///   the changed rows new ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
 // Built by render_stream once the bulk track's screen frames reach it.
 #[cfg_attr(not(test), allow(dead_code))]
