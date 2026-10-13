@@ -323,11 +323,13 @@ mod tests {
         let three = grid(3, &["abc"]);
         let six = grid(3, &["abc", "def"]);
         let mut out = Vec::new();
-        let at = |cells: &[PackedCell], width| GridRef {
-            generation: 0,
-            width,
-            cells,
-        };
+        fn at(cells: &[PackedCell], width: usize) -> GridRef<'_> {
+            GridRef {
+                generation: 0,
+                width,
+                cells,
+            }
+        }
         assert_eq!(
             cpu_row_damage(at(&three, 3), at(&six, 3), None, &mut out),
             Err(ShapeError::Mismatch)
