@@ -1512,8 +1512,9 @@ mod tests {
         cell.expect("first cell")
     }
 
-    #[test]
-    fn split_sgr_styles_a_cell_like_one_sequence_per_group() {
+    // Terminal runtimes start their actor on the current Tokio runtime.
+    #[tokio::test]
+    async fn split_sgr_styles_a_cell_like_one_sequence_per_group() {
         let plain = replayed_cell(b"X");
         let colors = [0x02_FF_80_00, 0x01_00_00_FA, 0x0F];
         for underline in 0..=5u16 {
