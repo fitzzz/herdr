@@ -156,12 +156,9 @@ pub(super) fn next_screen_generation() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrameRowRevisions {
     /// Frame area, grid size and padding colors.
-    // Read by the server ANSI encoder's row damage (integration patch) and tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub key: u64,
     /// One value per frame row: the screen row's revision, or 0 for a row
     /// below the terminal grid, which holds only padding.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub rows: Vec<u64>,
 }
 
@@ -321,6 +318,7 @@ impl TerminalScreen {
     /// ratatui test backend (which only receives cells ratatui's diff emits
     /// against an empty buffer), then OSC 8 attachment where the hyperlink
     /// symbol equals the backend symbol.
+    #[cfg(test)]
     pub(crate) fn frame_data(&self, area: Rect, cursor: Option<CursorState>) -> FrameData {
         self.frame_data_with_row_revisions(area, cursor).0
     }

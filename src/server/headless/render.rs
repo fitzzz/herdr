@@ -728,6 +728,7 @@ impl HeadlessServer {
                 continue;
             }
             let mut surface_parts = None;
+            let mut row_revisions = None;
             let frame = match mode {
                 ClientConnectionMode::ClientShell => {
                     let crate::server::client_shell::RenderedPaneSurface {
@@ -802,7 +803,10 @@ impl HeadlessServer {
                         continue;
                     }
                     match (screen_frame, legacy) {
-                        (Some(frame), _) => frame,
+                        (Some((frame, revisions)), _) => {
+                            row_revisions = revisions;
+                            frame
+                        }
                         (None, Some((buffer, cursor, hyperlinks))) => {
                             let frame_started = crate::render_prof::timer();
                             let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
@@ -867,7 +871,9 @@ impl HeadlessServer {
                         native_upload.is_some(),
                     )
                 } else {
-                    client.render_state.prepare_frame(frame)
+                    client
+                        .render_state
+                        .prepare_frame_with_revisions(frame, row_revisions)
                 };
             let Some(mut prepared) = prepared else {
                 client.clear_deferred_render();

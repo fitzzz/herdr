@@ -4,6 +4,7 @@ use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::layout::{Position, Rect, Size};
 
 use crate::app::state::AppState;
+use crate::protocol::render_ansi::RowRevisions;
 use crate::protocol::{
     CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePatch, RenderEncoding, ServerMessage,
     SurfaceGraphicsAssetKey, SurfaceGraphicsScene, TerminalFrame,
@@ -125,6 +126,16 @@ impl ClientRenderState {
     }
 
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
+        self.prepare_frame_with_revisions(frame, None)
+    }
+
+    /// `revisions`, from the retained terminal screen, lets row damage skip
+    /// rows the committed frame already has.
+    pub(crate) fn prepare_frame_with_revisions(
+        &mut self,
+        frame: FrameData,
+        revisions: Option<RowRevisions>,
+    ) -> Option<PreparedRender> {
         match self {
             Self::Semantic { .. } => None,
             Self::TerminalAnsi {
@@ -136,7 +147,16 @@ impl ClientRenderState {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
-                let mut encoded = encoder.encode(&frame, *repaint_pending, *seq + 1, *seq);
+                let mut encoded = match revisions {
+                    Some(revisions) => encoder.encode_with_row_revisions(
+                        &frame,
+                        *repaint_pending,
+                        *seq + 1,
+                        *seq,
+                        revisions,
+                    ),
+                    None => encoder.encode(&frame, *repaint_pending, *seq + 1, *seq),
+                };
                 if encoded.full() {
                     crate::render_prof::event("prepare_frame.ansi.full");
                 } else {
@@ -713,10 +733,11 @@ pub(crate) fn render_terminal_virtual(
 /// `FrameData::from_ratatui_buffer_with_hyperlinks` produce, built straight
 /// from the pane's shared screen. None when no screen is available
 /// (synchronized output, snapshot path disabled); callers use the legacy path.
+/// The row revisions are present when every frame row maps to one screen row.
 pub(crate) fn render_terminal_frame(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,
-) -> Option<FrameData> {
+) -> Option<(FrameData, Option<RowRevisions>)> {
     let screen = runtime.screen_snapshot()?;
     let cursor = runtime.cursor_state(area, true).map(|cursor| CursorState {
         x: cursor.x,
@@ -724,7 +745,12 @@ pub(crate) fn render_terminal_frame(
         visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
         shape: cursor.shape,
     });
-    Some(screen.frame_data(area, cursor))
+    let (frame, revisions) = screen.frame_data_with_row_revisions(area, cursor);
+    let revisions = revisions.map(|revisions| RowRevisions {
+        key: revisions.key,
+        rows: revisions.rows,
+    });
+    Some((frame, revisions))
 }
 
 #[cfg(test)]

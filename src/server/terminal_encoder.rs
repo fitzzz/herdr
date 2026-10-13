@@ -1,6 +1,6 @@
 //! Per-connection terminal frame encoder: ANSI, or negotiated terminal cells.
 
-use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
+use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit, RowRevisions};
 use crate::protocol::terminal_cells::{CellsEncoder, EncodedCells};
 use crate::protocol::{CursorState, FrameData, PaneSurfacePatchRow};
 
@@ -71,8 +71,38 @@ impl TerminalEncoder {
         seq: u64,
         base_seq: u64,
     ) -> TerminalEncoded {
+        self.encode_with_optional_revisions(frame, repaint, seq, base_seq, None)
+    }
+
+    /// Like [`Self::encode`] for a frame whose rows carry screen revisions.
+    /// ANSI row damage then compares only rows whose revision changed. The
+    /// cell codec diffs every cell and does not use them, but an ANSI
+    /// fallback repaint keeps them so the ANSI diffs after it can.
+    pub(crate) fn encode_with_row_revisions(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        seq: u64,
+        base_seq: u64,
+        revisions: RowRevisions,
+    ) -> TerminalEncoded {
+        self.encode_with_optional_revisions(frame, repaint, seq, base_seq, Some(revisions))
+    }
+
+    fn encode_with_optional_revisions(
+        &self,
+        frame: &FrameData,
+        repaint: bool,
+        seq: u64,
+        base_seq: u64,
+        revisions: Option<RowRevisions>,
+    ) -> TerminalEncoded {
+        let encode_ansi = |encoder: &BlitEncoder, repaint, revisions| match revisions {
+            Some(revisions) => encoder.encode_with_row_revisions(frame, repaint, revisions),
+            None => encoder.encode(frame, repaint),
+        };
         match self {
-            Self::Ansi(encoder) => TerminalEncoded::Ansi(encoder.encode(frame, repaint)),
+            Self::Ansi(encoder) => TerminalEncoded::Ansi(encode_ansi(encoder, repaint, revisions)),
             Self::Cells(encoder) => match encoder.encode(frame, repaint, seq, base_seq) {
                 Ok(encoded) => TerminalEncoded::Cells(encoded),
                 Err(reason) => {
@@ -81,7 +111,7 @@ impl TerminalEncoder {
                         "terminal frame needs ANSI; switching connection from cells"
                     );
                     // A fresh encoder clears and repaints every cell.
-                    TerminalEncoded::Ansi(BlitEncoder::new().encode(frame, false))
+                    TerminalEncoded::Ansi(encode_ansi(&BlitEncoder::new(), false, revisions))
                 }
             },
         }
