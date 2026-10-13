@@ -858,6 +858,47 @@ fn keep_marks_off_the_column_before_the_last(frame: &mut FrameData) {
     }
 }
 
+/// Pins the case `keep_marks_off_the_column_before_the_last` excludes: on a
+/// 2x3 host with autowrap off and text already in the last column, the bytes
+/// CUP + "e" + U+0301 display the mark on the last column. With autowrap on the
+/// same bytes keep it on "e", and the cells record carries the cluster intact.
+#[test]
+fn ghostty_without_autowrap_moves_a_mark_from_the_column_before_the_last() {
+    let screen_text = |terminal: &crate::ghostty::Terminal, x: u16| -> String {
+        let (_, graphemes) = terminal.screen_cell(x, 0).unwrap();
+        graphemes
+            .iter()
+            .filter_map(|c| char::from_u32(*c))
+            .collect()
+    };
+    let bytes = "\x1b[1;2Hx\x1b[1;1He\u{301}".as_bytes();
+    for (host_setup, expected) in [
+        (&b"\x1b[?7l"[..], ["e", "x\u{301}"]),
+        (&b""[..], ["e\u{301}", "x"]),
+    ] {
+        let mut terminal = crate::ghostty::Terminal::new(2, 3, 0).unwrap();
+        terminal.write(host_setup);
+        terminal.write(bytes);
+        assert_eq!(
+            [screen_text(&terminal, 0), screen_text(&terminal, 1)],
+            expected,
+            "host setup {host_setup:?}"
+        );
+    }
+
+    let frame = frame_from_rows(
+        &[
+            vec![cell("e\u{301}"), cell("x")],
+            text_row("", 2),
+            text_row("", 2),
+        ],
+        &[],
+    );
+    let grid = full_grid(&frame);
+    assert_eq!(grid.cell(0, 0).text, "e\u{301}");
+    assert_eq!(grid.cell(1, 0).text, "x");
+}
+
 fn assert_display_parity(terminal: &crate::ghostty::Terminal, grid: &ReferenceGrid) {
     let blank = |text: &str| {
         if text.is_empty() {
