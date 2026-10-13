@@ -592,6 +592,10 @@ fn refresh_screen_inner(
     }
     render_state.set_dirty(crate::ghostty::Dirty::Clean)?;
     crate::render_prof::counter("screen.rows_extracted", extracted);
+    #[cfg(test)]
+    {
+        core.rows_extracted += extracted;
+    }
 
     let screen = match previous {
         Some(previous) if !changed && !context_changed && previous.cursor == cursor => previous,

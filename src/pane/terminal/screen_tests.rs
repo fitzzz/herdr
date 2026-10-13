@@ -443,3 +443,51 @@ fn terminal_screen_patch_links_attach_like_full_frames() {
     assert!(linked > 0);
     assert_eq!(patch.hyperlinks.len(), 2);
 }
+
+#[test]
+fn terminal_screen_extracts_each_change_once_for_every_consumer() {
+    let pane = PaneTerminal::new(pane(20, 6));
+    let area = Rect::new(0, 0, 20, 6);
+    let extracted = || pane.ghostty.core.lock().unwrap().rows_extracted;
+    let read_everything = || {
+        // Two TUI clients, a helper frame, a hyperlink scan and a retained patch.
+        let _ = draw(&pane.ghostty, area, false);
+        let _ = draw(&pane.ghostty, area, false);
+        let _ = pane
+            .ghostty
+            .screen_snapshot()
+            .unwrap()
+            .frame_data(area, None);
+        let _ = pane.ghostty.visible_hyperlinks(area);
+        let _ = pane.collect_dirty_patch(20, 6);
+    };
+
+    // Output to a pane nobody displays is parsed but never collected.
+    write(&pane.ghostty, b"one\r\ntwo\r\nthree");
+    assert_eq!(extracted(), 0);
+
+    // The first reader reads every row once; the other consumers share it.
+    read_everything();
+    assert_eq!(extracted(), 6);
+
+    // One changed row is read again, not the whole screen, and only once.
+    write(&pane.ghostty, b"\x1b[2;1HTWO");
+    let _ = draw(&pane.ghostty, area, false);
+    let after_change = extracted();
+    assert!((7..12).contains(&after_change), "{after_change}");
+    read_everything();
+    assert_eq!(extracted(), after_change);
+
+    // Hidden again: a burst of output reads nothing until a consumer asks.
+    for _ in 0..50 {
+        write(&pane.ghostty, b"hidden output\r\n");
+    }
+    assert_eq!(extracted(), after_change);
+    let used_at = pane.ghostty.core.lock().unwrap().screen_used_at;
+    assert!(pane
+        .ghostty
+        .release_idle_screen(used_at + IDLE_SCREEN_RETENTION, IDLE_SCREEN_RETENTION));
+    assert_eq!(extracted(), after_change);
+    read_everything();
+    assert_eq!(extracted(), after_change + 6);
+}

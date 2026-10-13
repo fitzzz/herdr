@@ -205,6 +205,9 @@ pub(crate) struct GhosttyPaneTerminal {
 pub(crate) struct GhosttyPaneCore {
     #[cfg(test)]
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
+    /// Screen rows read from Ghostty since creation, for operation-count tests.
+    #[cfg(test)]
+    rows_extracted: u64,
     pub terminal: crate::ghostty::Terminal,
     synchronized_output_epoch: u64,
     #[cfg(windows)]
@@ -1198,6 +1201,8 @@ impl GhosttyPaneTerminal {
             core: Mutex::new(GhosttyPaneCore {
                 #[cfg(test)]
                 dirty_collection_hook: None,
+                #[cfg(test)]
+                rows_extracted: 0,
                 terminal,
                 synchronized_output_epoch: 0,
                 #[cfg(windows)]
