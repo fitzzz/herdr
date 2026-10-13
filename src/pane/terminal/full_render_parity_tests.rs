@@ -57,7 +57,34 @@ fn observe(pane: &GhosttyPaneTerminal, area: Rect, reference: bool) -> Observati
             &hyperlinks,
         )
     } else {
-        pane.screen_snapshot().unwrap().frame_data(area, None)
+        let synchronized = pane
+            .core
+            .lock()
+            .unwrap()
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap();
+        match pane.screen_snapshot() {
+            Some(screen) => {
+                assert!(!synchronized, "screen snapshot during synchronized output");
+                screen.frame_data(area, None)
+            }
+            None => {
+                // The snapshot is withheld only while synchronized output is
+                // active; then the helper uses the legacy render, as
+                // `render_terminal_frame` callers do.
+                assert!(
+                    synchronized,
+                    "screen snapshot unavailable: {:?}",
+                    super::screen_extract::refresh_screen(&mut pane.core.lock().unwrap()).err()
+                );
+                crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
+                    terminal.backend().buffer(),
+                    None,
+                    &hyperlinks,
+                )
+            }
+        }
     };
     Observation {
         frame_cells,
