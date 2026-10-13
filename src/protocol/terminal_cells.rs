@@ -722,16 +722,23 @@ impl CellsEncoder {
 }
 
 // ---------------------------------------------------------------------------
-// Decoding (reference implementation for tests and display clients)
+// Decoding
 // ---------------------------------------------------------------------------
+//
+// The helper forwards frame records without parsing them (the display client
+// validates them), so production code only unwraps the frame control. The
+// record decoder below is the reference implementation the tests check the
+// encoder against; display clients implement their own.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DecodeError {
     TooLarge,
+    #[cfg(test)]
     Truncated,
     Malformed(&'static str),
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedCell {
     pub text: String,
@@ -743,6 +750,7 @@ pub(crate) struct DecodedCell {
     pub link: u32,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedSpan {
     pub y: u16,
@@ -750,6 +758,7 @@ pub(crate) struct DecodedSpan {
     pub cells: Vec<DecodedCell>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DecodedFrame {
     pub full: bool,
@@ -762,11 +771,13 @@ pub(crate) struct DecodedFrame {
     pub spans: Vec<DecodedSpan>,
 }
 
+#[cfg(test)]
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
+#[cfg(test)]
 impl<'a> Reader<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.at.checked_add(len).ok_or(DecodeError::Truncated)?;
@@ -800,6 +811,7 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(test)]
 fn valid_color(color: u32) -> bool {
     match color >> 24 {
         0x00 => color <= 0x10,
@@ -811,6 +823,7 @@ fn valid_color(color: u32) -> bool {
 
 /// Decodes and validates a complete record. Nothing is returned unless every
 /// bound holds, so a client can apply the result atomically.
+#[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedFrame, DecodeError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::TooLarge);
