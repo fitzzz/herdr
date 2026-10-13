@@ -1,0 +1,15 @@
+[package]
+name = "cell-damage"
+version = "0.0.0"
+edition = "2021"
+description = "Packed terminal cell row damage with a CPU reference and an optional CUDA backend"
+license = "Apache-2.0"
+repository = "https://github.com/herdrdev/herdr"
+publish = false
+
+[features]
+# Loads libcuda and libnvrtc at run time; nothing CUDA-related is needed to build.
+cuda = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
