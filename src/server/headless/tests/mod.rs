@@ -129,6 +129,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_config_diagnostic_without_keybindings: None,
         terminal_attach_owners: HashMap::new(),
         pending_alt_screen_reads: Vec::new(),
+        next_idle_screen_sweep: Instant::now() + IDLE_SCREEN_SWEEP_INTERVAL,
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,
         headless_size,
