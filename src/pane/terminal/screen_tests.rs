@@ -443,6 +443,12 @@ fn terminal_screen_frame_row_revisions_match_only_the_same_screen_rows() {
         "same\r\n\x1b]8;;https://example.test/a\x1b\\text\x1b]8;;\x1b\\\r\n\x1b[38;5;1mred\x1b[0m";
     let shown = pane(20, 3);
     let other = pane(20, 3);
+    // Herdr gives every pane the host's default colors. Ghostty's render
+    // state only takes a new default background (OSC 11) once a default
+    // foreground exists too (render.zig `update`, block `bg_fg`).
+    for pane in [&shown, &other] {
+        pane.apply_host_terminal_theme(known_host_theme());
+    }
     write(&shown, content.as_bytes());
     write(&other, content.as_bytes());
     let first = frame(&shown);
@@ -488,6 +494,9 @@ fn terminal_screen_frame_row_revisions_match_only_the_same_screen_rows() {
     // A new default background repaints padding, so the key changes.
     write(&shown, b"\x1b]11;rgb:12/34/56\x07");
     let new_background = frame(&shown);
+    let padding_bg = crate::protocol::color_to_u32(Color::Rgb(0x12, 0x34, 0x56));
+    assert_ne!(recreated.0.cells[3 * 20].bg, padding_bg);
+    assert_eq!(new_background.0.cells[3 * 20].bg, padding_bg);
     assert_ne!(new_background.1.key, recreated.1.key);
     assert!(skippable_rows(&recreated, &new_background).is_empty());
 }
