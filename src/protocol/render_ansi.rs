@@ -87,8 +87,6 @@ pub(crate) struct EncodedBlit {
 ///   cursor or highlight drawn into cells) must pass no revisions or give
 ///   the changed rows new ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Built by render_stream once the bulk track's screen frames reach it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RowRevisions {
     pub(crate) key: u64,
     pub(crate) rows: Vec<u64>,
@@ -149,8 +147,6 @@ impl BlitEncoder {
     /// they hold a symbol wider than two columns. With a row-damage backend,
     /// only rows whose revision differs are packed and compared, and rows
     /// that compare equal are skipped as well.
-    // Called by render_stream once the bulk track's screen frames reach it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn encode_with_row_revisions(
         &self,
         frame: &FrameData,
