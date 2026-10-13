@@ -56,7 +56,7 @@ pub(crate) struct EncodedBlit {
     next_last_cursor_shape: u8,
     /// The packed frame, when row damage was computed for it.
     packed: Option<PackedFrame>,
-    revisions: Option<CommittedRevisions>,
+    revisions: Option<Box<CommittedRevisions>>,
     /// Rows the diff skipped because row damage reported them equal.
     rows_skipped: usize,
 }
@@ -89,8 +89,9 @@ pub(crate) struct BlitEncoder {
     /// Optional packed row damage (`HERDR_RENDER_ACCEL`), which only lets
     /// the diff skip rows equal to `last_frame`.
     damage: FrameDamage,
-    /// Row revisions of `last_frame`, when it was encoded with them.
-    last_revisions: Option<CommittedRevisions>,
+    /// Row revisions of `last_frame`, when it was encoded with them. Boxed
+    /// so encoders without revisions stay small.
+    last_revisions: Option<Box<CommittedRevisions>>,
 }
 
 impl EncodedBlit {
@@ -182,10 +183,10 @@ impl BlitEncoder {
             changed_rows.as_deref(),
             revision_damage,
         );
-        encoded.revisions = Some(CommittedRevisions {
+        encoded.revisions = Some(Box::new(CommittedRevisions {
             revisions,
             overwide_rows,
-        });
+        }));
         encoded
     }
 

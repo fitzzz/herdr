@@ -272,10 +272,15 @@ pub(crate) struct Damage {
     pub(crate) packed: PackedFrame,
 }
 
-/// Per-encoder damage state: the backend, the interner and the packed form
-/// of the committed frame.
+/// Per-encoder damage state, boxed and absent while row damage is off so
+/// every encoder stays small.
 pub(crate) struct FrameDamage {
-    backend: Option<Backend>,
+    state: Option<Box<DamageState>>,
+}
+
+/// The backend, the interner and the packed form of the committed frame.
+struct DamageState {
+    backend: Backend,
     packer: Mutex<CellPacker>,
     baseline: Option<PackedFrame>,
 }
@@ -293,21 +298,28 @@ impl Default for FrameDamage {
 impl FrameDamage {
     pub(crate) fn with_backend(backend: Option<Backend>) -> Self {
         Self {
-            backend,
-            packer: Mutex::default(),
-            baseline: None,
+            state: backend.map(|backend| {
+                Box::new(DamageState {
+                    backend,
+                    packer: Mutex::default(),
+                    baseline: None,
+                })
+            }),
         }
     }
 
     /// A tiny interner bound, so tests cross epochs within a few frames.
     #[cfg(test)]
-    fn with_interner_bound(backend: Option<Backend>, max_interned: usize) -> Self {
+    fn with_interner_bound(backend: Backend, max_interned: usize) -> Self {
         Self {
-            packer: Mutex::new(CellPacker {
-                max_interned,
-                ..CellPacker::default()
-            }),
-            ..Self::with_backend(backend)
+            state: Some(Box::new(DamageState {
+                backend,
+                packer: Mutex::new(CellPacker {
+                    max_interned,
+                    ..CellPacker::default()
+                }),
+                baseline: None,
+            })),
         }
     }
 
@@ -320,7 +332,8 @@ impl FrameDamage {
         next: &FrameData,
         changed_rows: Option<&[u16]>,
     ) -> Option<Damage> {
-        let backend = self.backend?;
+        let state = self.state.as_deref()?;
+        let backend = state.backend;
         let cells = usize::from(next.width) * usize::from(next.height);
         if prev.width != next.width
             || prev.height != next.height
@@ -335,11 +348,11 @@ impl FrameDamage {
             return None;
         }
         let started = crate::render_prof::timer();
-        let mut packer = self.packer.lock().ok()?;
+        let mut packer = state.packer.lock().ok()?;
         packer.begin_frame();
         let epoch = packer.epoch;
         let packed_prev;
-        let prev_packed = match self.baseline.as_ref().filter(|b| b.describes(prev, epoch)) {
+        let prev_packed = match state.baseline.as_ref().filter(|b| b.describes(prev, epoch)) {
             Some(baseline) => baseline,
             None => {
                 crate::render_prof::event("cell_damage.pack_baseline");
@@ -377,21 +390,24 @@ impl FrameDamage {
     /// Records the packed form of the frame the encoder just committed, or
     /// forgets the baseline when the frame was encoded without damage.
     pub(crate) fn commit(&mut self, packed: Option<PackedFrame>) {
-        self.baseline = packed;
+        if let Some(state) = self.state.as_deref_mut() {
+            state.baseline = packed;
+        }
     }
 
     /// Keeps the baseline equal to the committed frame after `rows` were
     /// written into it.
     pub(crate) fn apply_patch(&mut self, frame: &FrameData, rows: &[PaneSurfacePatchRow]) {
-        let Some(baseline) = self.baseline.as_mut() else {
+        let Some(state) = self.state.as_deref_mut() else {
             return;
         };
-        let Ok(mut packer) = self.packer.lock() else {
-            self.baseline = None;
+        let Some(mut baseline) = state.baseline.take() else {
+            return;
+        };
+        let Ok(mut packer) = state.packer.lock() else {
             return;
         };
         if !baseline.describes(frame, packer.epoch) {
-            self.baseline = None;
             return;
         }
         let link_keys = packer.link_keys(frame);
@@ -399,7 +415,6 @@ impl FrameDamage {
         for row in rows {
             let start = usize::from(row.y) * width + usize::from(row.x);
             if row.y >= frame.height || usize::from(row.x) + row.cells.len() > width {
-                self.baseline = None;
                 return;
             }
             baseline.repack(
@@ -411,6 +426,8 @@ impl FrameDamage {
             );
         }
         baseline.generation = next_generation();
+        drop(packer);
+        state.baseline = Some(baseline);
     }
 }
 
@@ -876,7 +893,7 @@ mod tests {
                     let y = rng.below(usize::from(height)) as u16;
                     let cells = vec![random_cell(&mut rng, 0, false)];
                     let row = PaneSurfacePatchRow { x: 0, y, cells };
-                    if pair.patch(&[row.clone()], frame.cursor.clone()) {
+                    if pair.patch(std::slice::from_ref(&row), frame.cursor.clone()) {
                         frame.cells[usize::from(y) * usize::from(width)] = row.cells[0].clone();
                         revisions.rows[usize::from(y)] = next_revision;
                         next_revision += 1;
@@ -929,7 +946,7 @@ mod tests {
     #[test]
     fn interner_epochs_keep_the_same_bytes() {
         let damaged = run_random_parity(
-            FrameDamage::with_interner_bound(Some(Backend::Cpu), 3),
+            FrameDamage::with_interner_bound(Backend::Cpu, 3),
             0x1234_5678,
             400,
         );
