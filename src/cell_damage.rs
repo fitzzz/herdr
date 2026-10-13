@@ -26,6 +26,29 @@ const FLAG_OVERWIDE: u16 = 2;
 static SERVER_BACKEND: OnceLock<Option<Backend>> = OnceLock::new();
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BACKEND: std::cell::Cell<Option<Option<Backend>>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_DAMAGED_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `test` with `backend` as the server backend for encoders created on
+/// this thread, as `HERDR_RENDER_ACCEL` would select it for a server.
+#[cfg(test)]
+pub(crate) fn with_test_backend<R>(backend: Option<Backend>, test: impl FnOnce() -> R) -> R {
+    let previous = TEST_BACKEND.with(|cell| cell.replace(Some(backend)));
+    let result = test();
+    TEST_BACKEND.with(|cell| cell.set(previous));
+    result
+}
+
+/// Frames this thread encoded with row damage so far.
+#[cfg(test)]
+pub(crate) fn test_damaged_frames() -> usize {
+    TEST_DAMAGED_FRAMES.with(std::cell::Cell::get)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Backend {
     Cpu,
@@ -259,6 +282,10 @@ pub(crate) struct FrameDamage {
 
 impl Default for FrameDamage {
     fn default() -> Self {
+        #[cfg(test)]
+        if let Some(backend) = TEST_BACKEND.with(std::cell::Cell::get) {
+            return Self::with_backend(backend);
+        }
         Self::with_backend(server_backend())
     }
 }
@@ -339,6 +366,8 @@ impl FrameDamage {
             }
         }
         crate::render_prof::duration_since("cell_damage.total", started);
+        #[cfg(test)]
+        TEST_DAMAGED_FRAMES.with(|count| count.set(count.get() + 1));
         Some(Damage {
             rows: damage,
             packed,
