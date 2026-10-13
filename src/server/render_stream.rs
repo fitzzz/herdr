@@ -676,6 +676,24 @@ pub(crate) fn render_terminal_virtual(
     (buffer, cursor)
 }
 
+/// The helper frame `render_terminal_virtual` plus `visible_hyperlinks` and
+/// `FrameData::from_ratatui_buffer_with_hyperlinks` produce, built straight
+/// from the pane's shared screen. None when no screen is available
+/// (synchronized output, snapshot path disabled); callers use the legacy path.
+pub(crate) fn render_terminal_frame(
+    runtime: &crate::terminal::TerminalRuntime,
+    area: Rect,
+) -> Option<FrameData> {
+    let screen = runtime.screen_snapshot()?;
+    let cursor = runtime.cursor_state(area, true).map(|cursor| CursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+        shape: cursor.shape,
+    });
+    Some(screen.frame_data(area, cursor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

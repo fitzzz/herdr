@@ -27,6 +27,8 @@ struct Observation {
     backend_cursor: ratatui::layout::Position,
     cursor: Option<TerminalCursorState>,
     hyperlinks: VisibleHyperlinks,
+    /// The terminal attach/observe helper frame.
+    helper_frame: crate::protocol::FrameData,
 }
 
 fn observe(pane: &GhosttyPaneTerminal, area: Rect, reference: bool) -> Observation {
@@ -43,12 +45,27 @@ fn observe(pane: &GhosttyPaneTerminal, area: Rect, reference: bool) -> Observati
             frame_cells = frame.buffer_mut().content.to_vec();
         })
         .unwrap();
+    let hyperlinks = if reference {
+        ghostty_visible_hyperlinks(&mut pane.core.lock().unwrap(), area).unwrap()
+    } else {
+        pane.visible_hyperlinks(area)
+    };
+    let helper_frame = if reference {
+        crate::protocol::FrameData::from_ratatui_buffer_with_hyperlinks(
+            terminal.backend().buffer(),
+            None,
+            &hyperlinks,
+        )
+    } else {
+        pane.screen_snapshot().unwrap().frame_data(area, None)
+    };
     Observation {
         frame_cells,
         backend_cells: terminal.backend().buffer().content.to_vec(),
         backend_cursor: terminal.backend_mut().get_cursor_position().unwrap(),
         cursor: pane.cursor_state(),
-        hyperlinks: pane.visible_hyperlinks(area),
+        hyperlinks,
+        helper_frame,
     }
 }
 
@@ -119,6 +136,28 @@ fn replay(fixture_json: &str) {
             );
             assert_eq!(new.cursor, old.cursor, "{context} terminal cursor");
             assert_eq!(new.hyperlinks, old.hyperlinks, "{context} hyperlinks");
+            assert_eq!(
+                new.helper_frame.hyperlinks, old.helper_frame.hyperlinks,
+                "{context} helper hyperlink table"
+            );
+            for (index, (actual, expected)) in new
+                .helper_frame
+                .cells
+                .iter()
+                .zip(&old.helper_frame.cells)
+                .enumerate()
+            {
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{context} helper cell ({},{})",
+                    index % usize::from(fixture.width),
+                    index / usize::from(fixture.width)
+                );
+            }
+            assert_eq!(new.helper_frame, old.helper_frame, "{context} helper frame");
+            assert!(crate::ghostty::raw_cell_layout_verified());
+            super::screen_tests::assert_extract_paths_agree(&candidate, &context);
             assert_eq!(
                 new.frame_cells.len(),
                 usize::from(fixture.width) * usize::from(fixture.height)

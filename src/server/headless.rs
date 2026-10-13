@@ -180,6 +180,10 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise idle. Keep this much slower than the old resize-poll cadence to
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often retained screens that nobody read are released. The loop wakes at
+/// least every `CLIENT_ACCEPT_POLL_INTERVAL`, so an unread screen is dropped
+/// within retention + this interval + one poll, even when the pane is quiet.
+const IDLE_SCREEN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Headless server
@@ -251,6 +255,8 @@ pub struct HeadlessServer {
     terminal_attach_owners: HashMap<String, u64>,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
+    /// Next release of retained terminal screens that nobody has read.
+    next_idle_screen_sweep: Instant,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
     /// Monotonic activity counter used to pick the most recently active client.
@@ -396,6 +402,7 @@ impl HeadlessServer {
             server_config_diagnostic_without_keybindings,
             terminal_attach_owners: HashMap::new(),
             pending_alt_screen_reads: Vec::new(),
+            next_idle_screen_sweep: Instant::now() + IDLE_SCREEN_SWEEP_INTERVAL,
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
@@ -523,6 +530,13 @@ impl HeadlessServer {
                 needs_full_render = true;
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.scheduled_tasks");
+            }
+
+            if now >= self.next_idle_screen_sweep {
+                self.next_idle_screen_sweep = now + IDLE_SCREEN_SWEEP_INTERVAL;
+                for runtime in self.app.terminal_runtimes.values() {
+                    runtime.release_idle_screen(now, crate::pane::IDLE_SCREEN_RETENTION);
+                }
             }
 
             self.poll_pending_alt_screen_reads(now);

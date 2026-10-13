@@ -435,6 +435,19 @@ impl TerminalRuntime {
         self.0.visible_hyperlinks(area)
     }
 
+    /// Shared immutable copy of the visible screen; see `crate::pane::TerminalScreen`.
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<crate::pane::TerminalScreen>> {
+        self.0.screen_snapshot()
+    }
+
+    pub(crate) fn release_idle_screen(
+        &self,
+        now: std::time::Instant,
+        retention: std::time::Duration,
+    ) -> bool {
+        self.0.release_idle_screen(now, retention)
+    }
+
     pub(crate) fn link_regions_at(
         &self,
         col: u16,

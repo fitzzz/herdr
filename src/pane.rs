@@ -45,7 +45,8 @@ pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    TerminalScreen, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion, IDLE_SCREEN_RETENTION,
 };
 pub use self::{
     state::PaneState,
@@ -3487,6 +3488,18 @@ impl PaneRuntime {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.terminal.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<TerminalScreen>> {
+        self.terminal.screen_snapshot()
+    }
+
+    pub(crate) fn release_idle_screen(
+        &self,
+        now: std::time::Instant,
+        retention: std::time::Duration,
+    ) -> bool {
+        self.terminal.release_idle_screen(now, retention)
     }
 
     pub(crate) fn link_regions_at(

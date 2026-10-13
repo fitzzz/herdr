@@ -772,18 +772,25 @@ impl HeadlessServer {
                         continue;
                     }
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_terminal_virtual(runtime, area);
-                    crate::render_prof::duration_since(
-                        "full_render.render_terminal_virtual",
-                        render_started,
-                    );
-                    let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks = runtime.visible_hyperlinks(area);
-                    crate::render_prof::duration_since(
-                        "full_render.visible_hyperlinks",
-                        hyperlinks_started,
-                    );
+                    let screen_frame =
+                        crate::server::render_stream::render_terminal_frame(runtime, area);
+                    crate::render_prof::duration_since("full_render.screen_frame", render_started);
+                    let legacy = screen_frame.is_none().then(|| {
+                        let render_started = crate::render_prof::timer();
+                        let (buffer, cursor) =
+                            crate::server::render_stream::render_terminal_virtual(runtime, area);
+                        crate::render_prof::duration_since(
+                            "full_render.render_terminal_virtual",
+                            render_started,
+                        );
+                        let hyperlinks_started = crate::render_prof::timer();
+                        let hyperlinks = runtime.visible_hyperlinks(area);
+                        crate::render_prof::duration_since(
+                            "full_render.visible_hyperlinks",
+                            hyperlinks_started,
+                        );
+                        (buffer, cursor, hyperlinks)
+                    });
                     let (synchronized, after_epoch) = runtime.synchronized_output_state();
                     if synchronized || after_epoch != epoch {
                         if let Some(client) = self.clients.get_mut(&client_id) {
@@ -794,14 +801,23 @@ impl HeadlessServer {
                         }
                         continue;
                     }
-                    let frame_started = crate::render_prof::timer();
-                    let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
-                        cursor,
-                        &hyperlinks,
-                    );
-                    crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    match (screen_frame, legacy) {
+                        (Some(frame), _) => frame,
+                        (None, Some((buffer, cursor, hyperlinks))) => {
+                            let frame_started = crate::render_prof::timer();
+                            let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+                                &buffer,
+                                cursor,
+                                &hyperlinks,
+                            );
+                            crate::render_prof::duration_since(
+                                "full_render.frame_build",
+                                frame_started,
+                            );
+                            frame
+                        }
+                        (None, None) => continue,
+                    }
                 }
             };
 

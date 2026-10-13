@@ -19,8 +19,15 @@ use crate::protocol::CellData;
 mod full_render_parity_tests;
 #[cfg(test)]
 mod migration_tests;
+mod screen;
+mod screen_extract;
+#[cfg(test)]
+mod screen_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
+
+pub(crate) use screen::TerminalScreen;
+pub(crate) use screen_extract::IDLE_SCREEN_RETENTION;
 
 #[cfg(test)]
 use super::cursor::CURSOR_POSITION_SETTLE;
@@ -216,6 +223,10 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Retained display snapshot; the only consumer of render dirty flags.
+    screen: Option<Arc<TerminalScreen>>,
+    screen_used_at: Instant,
+    patch_baseline: Option<screen_extract::PatchBaseline>,
 }
 
 pub(crate) struct PaneTerminal {
@@ -551,6 +562,14 @@ impl PaneTerminal {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.ghostty.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<TerminalScreen>> {
+        self.ghostty.screen_snapshot()
+    }
+
+    pub(crate) fn release_idle_screen(&self, now: Instant, retention: Duration) -> bool {
+        self.ghostty.release_idle_screen(now, retention)
     }
 
     pub(crate) fn link_regions_at(
@@ -1197,6 +1216,9 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                screen: None,
+                screen_used_at: Instant::now(),
+                patch_baseline: None,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -2322,11 +2344,45 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
-        self.core
-            .lock()
-            .ok()
-            .and_then(|mut core| ghostty_visible_hyperlinks(&mut core, area).ok())
-            .unwrap_or_default()
+        let Ok(mut core) = self.core.lock() else {
+            return Vec::new();
+        };
+        if screen_extract::screen_snapshot_enabled() {
+            if let Ok(screen) = screen_extract::refresh_screen(&mut core) {
+                drop(core);
+                return screen.visible_hyperlinks(area);
+            }
+        }
+        ghostty_visible_hyperlinks(&mut core, area).unwrap_or_default()
+    }
+
+    /// The pane's current screen, refreshed from dirty rows. None while
+    /// synchronized output is active or when the snapshot path is disabled.
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<TerminalScreen>> {
+        if !screen_extract::screen_snapshot_enabled() {
+            return None;
+        }
+        let mut core = self.core.lock().ok()?;
+        if core
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        screen_extract::refresh_screen(&mut core).ok()
+    }
+
+    /// Drops the retained screen if nobody read it within `retention`.
+    /// Skips a busy core; the next sweep retries.
+    pub(crate) fn release_idle_screen(&self, now: Instant, retention: Duration) -> bool {
+        self.try_lock_core()
+            .is_some_and(|mut core| screen_extract::release_idle_screen(&mut core, now, retention))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn screen_is_retained(&self) -> bool {
+        self.core.lock().is_ok_and(|core| core.screen.is_some())
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
@@ -2364,6 +2420,43 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        if !screen_extract::screen_snapshot_enabled() {
+            return self.render_legacy(frame, area, show_cursor);
+        }
+        let lock_started = crate::render_prof::timer();
+        let (screen, cursor) = {
+            let Ok(mut core) = self.core.lock() else {
+                return;
+            };
+            crate::render_prof::duration_since("full_viewport.core_lock_wait", lock_started);
+            if core
+                .terminal
+                .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let Ok(screen) = screen_extract::refresh_screen(&mut core) else {
+                drop(core);
+                return self.render_legacy(frame, area, show_cursor);
+            };
+            let cursor = show_cursor
+                .then(|| effective_cursor_state(&mut core, screen.cursor))
+                .flatten();
+            (screen, cursor)
+        };
+        // The core lock is released; writing cells only reads the snapshot.
+        let write_started = crate::render_prof::timer();
+        screen.write_to_buffer(frame.buffer_mut(), area);
+        crate::render_prof::duration_since("full_viewport.conversion", write_started);
+        if let Some(cursor) = cursor.filter(|cursor| cursor.visible) {
+            if cursor.x < area.width && cursor.y < area.height {
+                frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+            }
+        }
+    }
+
+    fn render_legacy(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         let mut profile = crate::render_prof::timer().map(FullViewportProfile::new);
         let Ok(mut core) = self.core.lock() else {
             return;
@@ -2526,7 +2619,11 @@ impl GhosttyPaneTerminal {
                 if let Some(hook) = core.dirty_collection_hook.take() {
                     hook();
                 }
-                ghostty_collect_dirty_patch(&mut core, area_width, area_height)
+                if screen_extract::screen_snapshot_enabled() {
+                    screen_extract::screen_dirty_patch(&mut core, area_width, area_height)
+                } else {
+                    ghostty_collect_dirty_patch(&mut core, area_width, area_height)
+                }
             })
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
     }
@@ -3618,6 +3715,7 @@ fn terminal_theme_color(color: crate::ghostty::RgbColor) -> crate::terminal_them
 // host makes it resolve against the host's own palette, discarding the redefinition.
 // Only overridden entries become RGB; the rest stay indexed and keep following the
 // host theme. None when nothing was redefined, which is the common case.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PaletteOverrides([Option<crate::ghostty::RgbColor>; 256]);
 
 impl PaletteOverrides {

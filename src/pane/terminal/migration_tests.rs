@@ -361,18 +361,19 @@ fn sparse_dirty_patches_preserve_coordinates_and_clipped_rows() {
         );
         assert!(patch.rows.iter().all(|(_, cells)| cells.len() == 8));
 
-        let core = terminal.pane.ghostty.core.lock().unwrap();
-        let mut iterator = crate::ghostty::RowIterator::new().unwrap();
-        let mut rows = core
-            .render_state
-            .populate_row_iterator(&mut iterator)
-            .unwrap();
-        let mut y = 0;
-        while rows.next() {
-            assert_eq!(rows.dirty().unwrap(), height == 3 && y == 4);
-            y += 1;
+        // Rows outside the clipped area stay pending for the next patch.
+        let next = terminal.pane.collect_dirty_patch(8, 6);
+        if height == 3 {
+            let TerminalDirtyPatchOutcome::Patch(patch) = next else {
+                panic!("expected the clipped row, got {next:?}");
+            };
+            assert_eq!(
+                patch.rows.iter().map(|(y, _)| *y).collect::<Vec<_>>(),
+                vec![4]
+            );
+        } else {
+            assert!(matches!(next, TerminalDirtyPatchOutcome::Clean));
         }
-        assert_eq!(y, 6);
     }
 }
 
@@ -386,21 +387,20 @@ fn dirty_patch_fallback_keeps_previously_collected_rows_dirty() {
         terminal.pane.collect_dirty_patch(8, 6),
         TerminalDirtyPatchOutcome::Fallback
     ));
-    let core = terminal.pane.ghostty.core.lock().unwrap();
-    let mut iterator = crate::ghostty::RowIterator::new().unwrap();
-    let mut rows = core
-        .render_state
-        .populate_row_iterator(&mut iterator)
-        .unwrap();
-    let mut dirty = Vec::new();
-    let mut y = 0;
-    while rows.next() {
-        if rows.dirty().unwrap() {
-            dirty.push(y);
-        }
-        y += 1;
-    }
-    assert_eq!(dirty, vec![1, 4]);
+    // A fallback delivers nothing: both rows stay pending, and so does the
+    // hyperlink row until it no longer carries a link.
+    assert!(matches!(
+        terminal.pane.collect_dirty_patch(8, 6),
+        TerminalDirtyPatchOutcome::Fallback
+    ));
+    terminal.write(b"\x1b[5;4HZ");
+    let TerminalDirtyPatchOutcome::Patch(patch) = terminal.pane.collect_dirty_patch(8, 6) else {
+        panic!("expected both pending rows");
+    };
+    assert_eq!(
+        patch.rows.iter().map(|(y, _)| *y).collect::<Vec<_>>(),
+        vec![1, 4]
+    );
 }
 
 #[test]
