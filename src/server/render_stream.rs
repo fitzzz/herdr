@@ -125,6 +125,7 @@ impl ClientRenderState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         self.prepare_frame_with_revisions(frame, None)
     }
