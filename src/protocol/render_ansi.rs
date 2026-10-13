@@ -58,6 +58,8 @@ pub(crate) struct EncodedBlit {
     packed: Option<PackedFrame>,
     revisions: Option<Box<CommittedRevisions>>,
     /// Rows the diff skipped because row damage reported them equal.
+    // Read by tests; render_prof records the same count while encoding.
+    #[cfg_attr(not(test), allow(dead_code))]
     rows_skipped: usize,
 }
 
@@ -113,6 +115,11 @@ impl EncodedBlit {
     #[cfg(test)]
     pub(crate) fn has_row_damage(&self) -> bool {
         self.packed.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rows_skipped(&self) -> usize {
+        self.rows_skipped
     }
 }
 

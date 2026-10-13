@@ -762,7 +762,7 @@ mod tests {
             );
             assert_eq!(actual.full, expected.full);
             self.damaged += usize::from(actual.has_row_damage());
-            self.skipped_rows += actual.rows_skipped;
+            self.skipped_rows += actual.rows_skipped();
             self.off.commit(frame.clone(), expected);
             self.on.commit(frame.clone(), actual);
         }
@@ -1194,7 +1194,7 @@ mod tests {
                         let encoded = encode(&encoder, index);
                         times.push(started.elapsed());
                         bytes.extend_from_slice(&encoded.bytes);
-                        skipped_rows += encoded.rows_skipped;
+                        skipped_rows += encoded.rows_skipped();
                         encoder.commit(frame.clone(), encoded);
                     }
                     let expected = expected_bytes.get_or_insert_with(|| bytes.clone());
