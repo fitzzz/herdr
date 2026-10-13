@@ -766,14 +766,14 @@ fn is_halfwidth_katakana_voiced_grapheme(symbol: &str) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct HostCursorState {
-    position: (u16, u16),
-    visible: bool,
+pub(crate) struct HostCursorState {
+    pub(crate) position: (u16, u16),
+    pub(crate) visible: bool,
     /// DECSCUSR parameter (0–6). 0 means terminal default.
-    shape: u8,
+    pub(crate) shape: u8,
 }
 
-fn resolve_host_cursor_state(
+pub(crate) fn resolve_host_cursor_state(
     frame: &FrameData,
     last_visible_cursor: &mut Option<(u16, u16)>,
 ) -> HostCursorState {
@@ -905,7 +905,7 @@ fn cell_hyperlink_uri<'a>(frame: &'a FrameData, cell: &CellData) -> Option<&'a s
     frame.hyperlinks.get(index).map(String::as_str)
 }
 
-fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
+pub(crate) fn sanitized_hyperlink_uri(uri: &str) -> Option<String> {
     let sanitized: String = uri
         .chars()
         .filter(|ch| *ch != '\x1b' && *ch != '\x07' && !ch.is_control())
