@@ -23,6 +23,8 @@ mod screen;
 mod screen_extract;
 #[cfg(test)]
 mod screen_tests;
+#[cfg(test)]
+mod terminal_cells_eligibility_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
 

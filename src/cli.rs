@@ -42,9 +42,9 @@ mod workspace;
 mod worktree;
 
 const TERMINAL_SESSION_OBSERVE_USAGE: &str =
-    "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
+    "usage: herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
-    "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
+    "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells]";
 pub(crate) const AGENT_HELP_FOOTER: &str = concat!(
     "Are you an AI? Use these resources ONLY IF your task specifically asks you to:\n",
     "  Help a human understand or set up Herdr for the first time:\n",
@@ -577,6 +577,7 @@ fn terminal_session_control(args: &[String]) -> std::io::Result<i32> {
         options.takeover,
         options.cols,
         options.rows,
+        options.output,
     )?;
     Ok(0)
 }
@@ -592,7 +593,12 @@ fn terminal_session_observe(args: &[String]) -> std::io::Result<i32> {
         Err(code) => return Ok(code),
     };
 
-    crate::client::run_terminal_session_observe(options.target, options.cols, options.rows)?;
+    crate::client::run_terminal_session_observe(
+        options.target,
+        options.cols,
+        options.rows,
+        options.output,
+    )?;
     Ok(0)
 }
 
@@ -601,6 +607,7 @@ struct TerminalSessionOptions {
     cols: u16,
     rows: u16,
     takeover: bool,
+    output: crate::client::TerminalSessionOutput,
 }
 
 fn parse_terminal_session_options(
@@ -624,6 +631,7 @@ fn parse_terminal_session_options(
     let mut cols = 120;
     let mut rows = 40;
     let mut takeover = false;
+    let mut output = crate::client::TerminalSessionOutput::Ansi;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -647,6 +655,17 @@ fn parse_terminal_session_options(
                 rows = parse_terminal_dimension(value, "--rows")?;
                 i += 2;
             }
+            "--output" => {
+                output = match args.get(i + 1).map(String::as_str) {
+                    Some("ansi") => crate::client::TerminalSessionOutput::Ansi,
+                    Some("cells") => crate::client::TerminalSessionOutput::Cells,
+                    _ => {
+                        eprintln!("{usage}");
+                        return Ok(Err(2));
+                    }
+                };
+                i += 2;
+            }
             "help" | "--help" | "-h" => {
                 eprintln!("{usage}");
                 return Ok(Err(0));
@@ -664,6 +683,7 @@ fn parse_terminal_session_options(
         cols,
         rows,
         takeover,
+        output,
     }))
 }
 
@@ -1031,8 +1051,12 @@ fn print_config_help() {
 fn print_terminal_help() {
     eprintln!("herdr terminal commands:");
     eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
-    eprintln!("  herdr terminal session control <target> [--takeover] [--cols N] [--rows N]");
-    eprintln!("  herdr terminal session observe <target> [--cols N] [--rows N]");
+    eprintln!(
+        "  herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells]"
+    );
+    eprintln!(
+        "  herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells]"
+    );
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");

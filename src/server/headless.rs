@@ -2003,6 +2003,42 @@ impl HeadlessServer {
         true
     }
 
+    /// Answers a terminal cells hello on the control lane. Only a direct terminal
+    /// connection that has not attached yet can switch, so its welcome is queued
+    /// before any render frame and no ANSI frame precedes the cells stream.
+    fn handle_terminal_cells_hello(&mut self, client_id: u64, data: &str) {
+        use crate::protocol::terminal_cells::{CellsHello, CellsWelcome, CODEC};
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        let error = if !matches!(client.mode, ClientConnectionMode::TerminalPending) {
+            Some("terminal cells must be requested before attaching")
+        } else if !serde_json::from_str::<CellsHello>(data)
+            .is_ok_and(|hello| hello.accepts_current())
+        {
+            Some("no supported terminal cells codec")
+        } else if !client.render_state.enable_terminal_cells() {
+            Some("terminal cells are unavailable for this connection")
+        } else {
+            None
+        };
+        let welcome = CellsWelcome {
+            codec: error.is_none().then(|| CODEC.to_owned()),
+            error: error.map(str::to_owned),
+        };
+        info!(
+            client_id,
+            accepted = error.is_none(),
+            "terminal cells hello"
+        );
+        match crate::protocol::terminal_cells::welcome_message(&welcome) {
+            Ok(message) => {
+                self.send_to_client(client_id, message);
+            }
+            Err(err) => warn!(client_id, err = %err, "failed to encode terminal cells welcome"),
+        }
+    }
+
     fn client_is_pending_terminal_mode(&self, client_id: u64) -> bool {
         self.clients
             .get(&client_id)
@@ -2498,6 +2534,10 @@ impl HeadlessServer {
                 client.shell_mouse_capture = enabled;
                 client.host_mouse_capture_active = None;
                 true
+            }
+            ServerEvent::TerminalCellsHello { client_id, data } => {
+                self.handle_terminal_cells_hello(client_id, &data);
+                false
             }
             ServerEvent::ClientShellPresentationSync { client_id, token } => {
                 let Some(client) = self.clients.get_mut(&client_id) else {

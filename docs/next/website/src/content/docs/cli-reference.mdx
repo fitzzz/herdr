@@ -370,8 +370,8 @@ Use `pane send-text`, `pane send-keys`, `pane run`, and `terminal attach` for or
 
 ```bash
 herdr terminal attach <terminal_id> [--takeover]
-herdr terminal session control <target> [--takeover] [--cols N] [--rows N]
-herdr terminal session observe <target> [--cols N] [--rows N]
+herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells]
+herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells]
 herdr terminal title set <title>
 herdr terminal title clear
 ```
@@ -400,6 +400,16 @@ without taking input, resize, scroll, or takeover authority.
 On Linux and macOS, an observer is disconnected if a socket write makes no progress
 for 30 seconds. A stalled stream can end without a final `terminal.closed` record;
 the pane and other clients keep running. Quiet panes do not trigger this timeout.
+`--output cells` asks the server for terminal cells instead of ANSI bytes, for
+display clients that draw their own cell grid. Output then starts with one
+`terminal.stream` JSON line. When it says `"encoding":"ansi"` (the server does
+not offer cells or refused them, with a `reason`), the usual JSON records
+follow. When it says `"encoding":"cells"`, binary records follow, each a
+little-endian `u32` body length, a `u8` type and the body: type 1 is one
+`herdr.terminal.cells.v1` record, type 2 is the closed record (`u8` has-reason
+flag, then the UTF-8 reason), and type 3 is an ANSI frame (`u64` seq, `u16`
+width, `u16` height, `u8` full, then the ANSI bytes) that replaces the cell
+stream for the rest of the session. `--output ansi` is the default.
 `terminal title clear` hands the outer terminal window title back to `ui.window_title`.
 
 ## Output waits
