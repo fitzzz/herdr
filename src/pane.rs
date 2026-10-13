@@ -3976,7 +3976,7 @@ mod tests {
         assert!(snapshot.sgr_pixel_mouse);
         assert!(!snapshot.alternate_screen_active);
 
-        runtime.test_process_pty_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        runtime.test_process_pty_bytes(b"\x1b[?2026hpartial");
         assert!(runtime.collect_dirty_patch_snapshot(20, 4).is_none());
         assert!(runtime.content_write_lock.try_lock().is_ok());
     }
