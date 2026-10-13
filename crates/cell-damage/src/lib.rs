@@ -304,7 +304,7 @@ mod tests {
                 width: 2,
                 cells: &next,
             },
-            Some(&[2, 1]),
+            Some(&[2, 1][..]),
             &mut out,
         )
         .unwrap();
@@ -337,7 +337,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            cpu_row_damage(at(&three, 3), at(&three, 3), Some(&[1]), &mut out),
+            cpu_row_damage(at(&three, 3), at(&three, 3), Some(&[1][..]), &mut out),
             Err(ShapeError::RowOutOfRange)
         );
         assert_eq!(
