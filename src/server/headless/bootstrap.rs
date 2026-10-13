@@ -33,6 +33,7 @@ pub fn run_server() -> io::Result<()> {
     }
     let process_context = crate::platform::prepare_server_process(handoff_import);
     init_logging();
+    crate::cell_damage::configure_server_from_env();
     match process_context {
         Ok(true) => info!("server using persistent user service context"),
         Ok(false) => {}
