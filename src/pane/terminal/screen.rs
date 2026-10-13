@@ -7,6 +7,7 @@
 //! revisions instead of cells.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -148,6 +149,22 @@ pub(super) fn next_screen_generation() -> u64 {
     NEXT_SCREEN_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Identity of each row of a helper frame built by
+/// `TerminalScreen::frame_data_with_row_revisions`. Two frames with equal
+/// `key` whose rows hold equal values have identical cells in those rows,
+/// with hyperlinks compared by URI (table indices can differ).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrameRowRevisions {
+    /// Frame area, grid size and padding colors.
+    // Read by the server ANSI encoder's row damage (integration patch) and tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub key: u64,
+    /// One value per frame row: the screen row's revision, or 0 for a row
+    /// below the terminal grid, which holds only padding.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub rows: Vec<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalScreen {
     pub cols: u16,
@@ -277,6 +294,18 @@ impl TerminalScreen {
     /// against an empty buffer), then OSC 8 attachment where the hyperlink
     /// symbol equals the backend symbol.
     pub(crate) fn frame_data(&self, area: Rect, cursor: Option<CursorState>) -> FrameData {
+        self.frame_data_with_row_revisions(area, cursor).0
+    }
+
+    /// `frame_data` plus the identity of each frame row. The revisions are
+    /// `None` when ratatui's diff state carries from one row into the next
+    /// (a wide cell at the right edge), because such a row also depends on
+    /// the row above it.
+    pub(crate) fn frame_data_with_row_revisions(
+        &self,
+        area: Rect,
+        cursor: Option<CursorState>,
+    ) -> (FrameData, Option<FrameRowRevisions>) {
         let width = area.width;
         let height = area.height;
         let total = usize::from(width) * usize::from(height);
@@ -292,8 +321,15 @@ impl TerminalScreen {
         let mut to_skip = 0usize;
         let mut forced_end = 0usize;
         let mut index = 0usize;
+        let mut row_revisions = Some(Vec::with_capacity(usize::from(height)));
         for y in 0..height {
             let row = self.row(y);
+            if invalidated > 0 || to_skip > 0 || index < forced_end {
+                row_revisions = None;
+            }
+            if let Some(revisions) = row_revisions.as_mut() {
+                revisions.push(row.map_or(0, |row| row.revision));
+            }
             for x in 0..width {
                 let screen_cell = row.and_then(|row| Some((row, row.cells.get(usize::from(x))?)));
                 let (cell, symbol) = match screen_cell {
@@ -345,14 +381,24 @@ impl TerminalScreen {
             }
         }
 
-        FrameData {
+        let frame = FrameData {
             cells,
             width,
             height,
             cursor,
             hyperlinks,
             graphics: Vec::new(),
-        }
+        };
+        let revisions = row_revisions.map(|rows| {
+            let mut key = std::hash::DefaultHasher::new();
+            (area.width, area.height, self.cols, self.rows).hash(&mut key);
+            (self.default_fg, self.default_bg).hash(&mut key);
+            FrameRowRevisions {
+                key: key.finish(),
+                rows,
+            }
+        });
+        (frame, revisions)
     }
 }
 

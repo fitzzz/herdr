@@ -334,3 +334,81 @@ fn terminal_screen_is_unavailable_during_synchronized_output() {
     let screen = pane.screen_snapshot().unwrap();
     assert_eq!(screen.rows_data[0].cells[0].content, u32::from('p'));
 }
+
+#[test]
+fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
+    // Cells with hyperlinks resolved to URIs, since table indices may differ.
+    fn rows_by_uri(frame: &crate::protocol::FrameData) -> Vec<Vec<(CellData, Option<String>)>> {
+        frame
+            .cells
+            .chunks(usize::from(frame.width))
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        let uri = cell
+                            .hyperlink
+                            .map(|index| frame.hyperlinks[index as usize].clone());
+                        (
+                            CellData {
+                                hyperlink: None,
+                                ..cell.clone()
+                            },
+                            uri,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    let pane = pane(20, 5);
+    write(
+        &pane,
+        "top\r\n\u{6f22}\u{5b57} wide\r\nchange me\r\n\x1b]8;;https://example.test/a\x1b\\link\x1b]8;;\x1b\\"
+            .as_bytes(),
+    );
+    let area = Rect::new(0, 0, 20, 6);
+    let (first_frame, first) = pane
+        .screen_snapshot()
+        .unwrap()
+        .frame_data_with_row_revisions(area, None);
+    let first = first.unwrap();
+    assert_eq!(first.rows.len(), 6);
+    assert_eq!(first.rows[5], 0, "padding row below the grid");
+
+    // Row 2 changes; a new link on row 0 renumbers row 3's hyperlink index.
+    write(
+        &pane,
+        b"\x1b[3;1Hchanged\x1b[1;5H\x1b]8;;https://example.test/b\x1b\\b\x1b]8;;\x1b\\",
+    );
+    let (second_frame, second) = pane
+        .screen_snapshot()
+        .unwrap()
+        .frame_data_with_row_revisions(area, None);
+    let second = second.unwrap();
+    assert_eq!(second.key, first.key);
+    assert_ne!(second_frame.hyperlinks, first_frame.hyperlinks);
+    let (old_rows, new_rows) = (rows_by_uri(&first_frame), rows_by_uri(&second_frame));
+    let mut equal_rows = Vec::new();
+    for y in 0..6 {
+        if first.rows[y] == second.rows[y] {
+            assert_eq!(new_rows[y], old_rows[y], "row {y}");
+            equal_rows.push(y);
+        }
+    }
+    assert_eq!(equal_rows, vec![1, 3, 4, 5]);
+
+    // Another area is another key.
+    let (_, narrower) = pane
+        .screen_snapshot()
+        .unwrap()
+        .frame_data_with_row_revisions(Rect::new(0, 0, 19, 6), None);
+    assert_ne!(narrower.unwrap().key, second.key);
+
+    // A wide cell clipped at the right edge carries into the next row.
+    let (_, clipped) = pane
+        .screen_snapshot()
+        .unwrap()
+        .frame_data_with_row_revisions(Rect::new(0, 0, 1, 6), None);
+    assert!(clipped.is_none());
+}
