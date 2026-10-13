@@ -38,6 +38,10 @@ use crate::protocol::{
 };
 
 const REVERSED_MODIFIER: u16 = 1 << 6;
+/// Parameter slots per SGR sequence; each `;` or `:` starts a slot.
+/// libvterm 0.3.3 (Portal) has no bounds check and overwrites its parser
+/// callbacks with a 17th slot.
+const MAX_SGR_SLOTS: usize = 16;
 const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
 
 pub(crate) fn final_sync_output_end(bytes: &[u8]) -> Option<usize> {
@@ -656,17 +660,36 @@ fn modifier_to_sgr_parts(val: u16) -> Vec<&'static str> {
     parts
 }
 
-/// Builds a complete SGR escape sequence for a cell's style.
+/// Builds the SGR escape sequences for a cell's style: a reset, the
+/// attributes, then the colors. A style needing more than
+/// [`MAX_SGR_SLOTS`] parameter slots continues in further sequences, split
+/// between attributes or colors, never inside one; only the first resets.
 fn build_sgr(fg: u32, bg: u32, modifier: u16) -> String {
-    let mut parts = vec!["0".to_owned()];
-    parts.extend(
+    let mut groups = vec!["0".to_owned()];
+    groups.extend(
         modifier_to_sgr_parts(modifier)
             .into_iter()
             .map(str::to_owned),
     );
-    parts.push(color_to_sgr_fg(fg));
-    parts.push(color_to_sgr_bg(bg));
-    format!("\x1b[{}m", parts.join(";"))
+    groups.push(color_to_sgr_fg(fg));
+    groups.push(color_to_sgr_bg(bg));
+    let mut sgr = String::from("\x1b[");
+    let mut slots = 0;
+    for group in groups {
+        let group_slots = 1 + group.chars().filter(|&c| c == ';' || c == ':').count();
+        if slots > 0 {
+            if slots + group_slots > MAX_SGR_SLOTS {
+                sgr.push_str("m\x1b[");
+                slots = 0;
+            } else {
+                sgr.push(';');
+            }
+        }
+        sgr.push_str(&group);
+        slots += group_slots;
+    }
+    sgr.push('m');
+    sgr
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,6 +1424,119 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "\x1b[1;1H\x1b[0;39;49ma\x1b]8;;https://example.com\x1b\\b\x1b]8;;\x1b\\c\x1b[0;31;49md\x1b[0;39;49me\x1b[0m"
         );
+    }
+
+    /// The SGR groups of one style, each as its own reference parameter
+    /// list: the reset, every attribute, the foreground and the background.
+    fn sgr_groups(fg: u32, bg: u32, modifier: u16) -> Vec<String> {
+        let mut groups = vec!["0".to_owned()];
+        groups.extend(
+            modifier_to_sgr_parts(modifier)
+                .into_iter()
+                .map(str::to_owned),
+        );
+        groups.push(color_to_sgr_fg(fg));
+        groups.push(color_to_sgr_bg(bg));
+        groups
+    }
+
+    fn sgr_slots(params: &str) -> usize {
+        1 + params.chars().filter(|&c| c == ';' || c == ':').count()
+    }
+
+    /// Every attribute bit, each underline style, and default, named,
+    /// indexed and RGB colors.
+    fn sgr_styles() -> Vec<(u32, u32, u16)> {
+        const COLORS: [u32; 5] = [0, 0x0F, 0x01_00_00_FA, 0x02_FF_80_00, 0x02_00_00_01];
+        let mut styles = Vec::new();
+        for low in 0..(1u16 << 9) {
+            for underline in 0..=5u16 {
+                let modifier = low | (underline << 12);
+                for fg in COLORS {
+                    for bg in COLORS {
+                        styles.push((fg, bg, modifier));
+                    }
+                }
+            }
+        }
+        styles
+    }
+
+    #[test]
+    fn build_sgr_keeps_every_sequence_within_the_parameter_limit() {
+        let mut split = 0;
+        for (fg, bg, modifier) in sgr_styles() {
+            let sgr = build_sgr(fg, bg, modifier);
+            let reference = sgr_groups(fg, bg, modifier).join(";");
+            let sequences: Vec<&str> = sgr
+                .strip_prefix("\x1b[")
+                .and_then(|sgr| sgr.strip_suffix('m'))
+                .expect("SGR sequences")
+                .split("m\x1b[")
+                .collect();
+            for params in &sequences {
+                assert!(sgr_slots(params) <= MAX_SGR_SLOTS, "{sgr:?}");
+            }
+            // The same parameters in the same order, so one reset first.
+            assert_eq!(sequences.join(";"), reference, "{sgr:?}");
+            if sgr_slots(&reference) <= MAX_SGR_SLOTS {
+                assert_eq!(sgr, format!("\x1b[{reference}m"));
+            } else {
+                split += 1;
+            }
+        }
+        assert!(split > 0);
+    }
+
+    #[test]
+    fn build_sgr_splits_the_largest_style_between_colors() {
+        let modifier = 0x1FF | (3 << 12);
+        assert_eq!(
+            build_sgr(0x02_01_02_03, 0x02_04_05_06, modifier),
+            "\x1b[0;1;2;3;4:3;5;6;7;8;9;38;2;1;2;3m\x1b[48;2;4;5;6m"
+        );
+    }
+
+    fn replayed_cell(bytes: &[u8]) -> CellData {
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(4, 1, bytes);
+        let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(4, 1))
+            .expect("test terminal");
+        let mut cell = None;
+        terminal
+            .draw(|frame| {
+                runtime.render(frame, area, false);
+                cell = Some(CellData::from_ratatui_cell(&frame.buffer_mut().content[0]));
+            })
+            .expect("draw");
+        cell.expect("first cell")
+    }
+
+    #[test]
+    fn split_sgr_styles_a_cell_like_one_sequence_per_group() {
+        let plain = replayed_cell(b"X");
+        let colors = [0x02_FF_80_00, 0x01_00_00_FA, 0x0F];
+        for underline in 0..=5u16 {
+            for (fg, bg) in [
+                (colors[0], colors[0]),
+                (colors[0], colors[1]),
+                (colors[2], colors[0]),
+            ] {
+                let modifier = 0x1FF | (underline << 12);
+                let split = build_sgr(fg, bg, modifier);
+                let per_group: String = sgr_groups(fg, bg, modifier)
+                    .iter()
+                    .map(|group| format!("\x1b[{group}m"))
+                    .collect();
+                let cell = replayed_cell(format!("{split}X").as_bytes());
+                assert_eq!(
+                    cell,
+                    replayed_cell(format!("{per_group}X").as_bytes()),
+                    "{split:?}"
+                );
+                assert_ne!(cell, plain);
+            }
+        }
     }
 
     #[test]
