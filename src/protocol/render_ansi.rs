@@ -56,7 +56,9 @@ pub(crate) struct EncodedBlit {
     next_last_cursor_shape: u8,
     /// The packed frame, when row damage was computed for it.
     packed: Option<PackedFrame>,
-    revisions: Option<RowRevisions>,
+    revisions: Option<CommittedRevisions>,
+    /// Rows the diff skipped because row damage reported them equal.
+    rows_skipped: usize,
 }
 
 /// Per-row content revisions of a frame built from a retained terminal
@@ -71,6 +73,13 @@ pub(crate) struct RowRevisions {
     pub(crate) rows: Vec<u64>,
 }
 
+/// Row revisions of the committed frame and which of its rows hold a symbol
+/// wider than two columns, which the diff can rewrite even when equal.
+struct CommittedRevisions {
+    revisions: RowRevisions,
+    overwide_rows: Vec<bool>,
+}
+
 /// Stateful encoder that diffs semantic frames into terminal ANSI bytes.
 #[derive(Default)]
 pub(crate) struct BlitEncoder {
@@ -81,7 +90,7 @@ pub(crate) struct BlitEncoder {
     /// the diff skip rows equal to `last_frame`.
     damage: FrameDamage,
     /// Row revisions of `last_frame`, when it was encoded with them.
-    last_revisions: Option<RowRevisions>,
+    last_revisions: Option<CommittedRevisions>,
 }
 
 impl EncodedBlit {
@@ -105,12 +114,14 @@ impl BlitEncoder {
     }
 
     pub(crate) fn encode(&self, frame: &FrameData, repaint: bool) -> EncodedBlit {
-        self.encode_inner(frame, repaint, false, None)
+        self.encode_inner(frame, repaint, false, None, None)
     }
 
-    /// Like [`Self::encode`] for a frame whose rows carry revisions. Row
-    /// damage then packs and compares only rows whose revision differs from
-    /// the committed frame's; without a backend this is [`Self::encode`].
+    /// Like [`Self::encode`] for a frame whose rows carry revisions. The
+    /// diff skips rows whose revision equals the committed frame's, unless
+    /// they hold a symbol wider than two columns. With a row-damage backend,
+    /// only rows whose revision differs are packed and compared, and rows
+    /// that compare equal are skipped as well.
     // Called by render_stream once the bulk track's screen frames reach it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn encode_with_row_revisions(
@@ -119,21 +130,62 @@ impl BlitEncoder {
         repaint: bool,
         revisions: RowRevisions,
     ) -> EncodedBlit {
-        let changed_rows: Option<Vec<u16>> = self
-            .last_revisions
+        let width = usize::from(frame.width);
+        if revisions.rows.len() != usize::from(frame.height)
+            || frame.cells.len() != width * usize::from(frame.height)
+        {
+            return self.encode(frame, repaint);
+        }
+        let same_shape = self
+            .last_frame
             .as_ref()
-            .filter(|last| {
-                last.key == revisions.key
-                    && last.rows.len() == revisions.rows.len()
-                    && revisions.rows.len() == usize::from(frame.height)
+            .is_some_and(|last| last.width == frame.width && last.height == frame.height);
+        let last = self.last_revisions.as_ref().filter(|last| {
+            same_shape
+                && last.revisions.key == revisions.key
+                && last.revisions.rows.len() == revisions.rows.len()
+        });
+        let row_changed =
+            |row: usize| last.is_none_or(|last| last.revisions.rows[row] != revisions.rows[row]);
+        let overwide_rows: Vec<bool> = (0..revisions.rows.len())
+            .map(|row| match last {
+                Some(last) if !row_changed(row) => last.overwide_rows[row],
+                _ => frame.cells[row * width..(row + 1) * width]
+                    .iter()
+                    .any(is_overwide),
             })
-            .map(|last| {
-                (0..frame.height)
-                    .filter(|&row| last.rows[usize::from(row)] != revisions.rows[usize::from(row)])
-                    .collect()
-            });
-        let mut encoded = self.encode_inner(frame, repaint, false, changed_rows.as_deref());
-        encoded.revisions = Some(revisions);
+            .collect();
+        let changed_rows: Option<Vec<u16>> = last.map(|_| {
+            (0..frame.height)
+                .filter(|&row| row_changed(usize::from(row)))
+                .collect()
+        });
+        let full_row = RowDamage {
+            start: 0,
+            end: u32::from(frame.width),
+        };
+        let revision_damage = last.map(|_| {
+            (0..revisions.rows.len())
+                .map(|row| {
+                    if row_changed(row) || overwide_rows[row] {
+                        full_row
+                    } else {
+                        RowDamage::UNCHANGED
+                    }
+                })
+                .collect()
+        });
+        let mut encoded = self.encode_inner(
+            frame,
+            repaint,
+            false,
+            changed_rows.as_deref(),
+            revision_damage,
+        );
+        encoded.revisions = Some(CommittedRevisions {
+            revisions,
+            overwide_rows,
+        });
         encoded
     }
 
@@ -147,7 +199,7 @@ impl BlitEncoder {
         repaint: bool,
         changed_rows: &[u16],
     ) -> EncodedBlit {
-        self.encode_inner(frame, repaint, false, Some(changed_rows))
+        self.encode_inner(frame, repaint, false, Some(changed_rows), None)
     }
 
     pub(crate) fn encode_with_suppressed_visible_cursor(
@@ -155,15 +207,17 @@ impl BlitEncoder {
         frame: &FrameData,
         repaint: bool,
     ) -> EncodedBlit {
-        self.encode_inner(frame, repaint, true, None)
+        self.encode_inner(frame, repaint, true, None, None)
     }
 
+    /// `revision_damage` is used when the backend computes no row damage.
     fn encode_inner(
         &self,
         frame: &FrameData,
         repaint: bool,
         suppress_visible_cursor: bool,
         changed_rows: Option<&[u16]>,
+        revision_damage: Option<Vec<RowDamage>>,
     ) -> EncodedBlit {
         let previous_frame = self.last_frame.as_ref();
         let prev = if repaint { None } else { previous_frame };
@@ -174,12 +228,13 @@ impl BlitEncoder {
         let prof_stats =
             crate::render_prof::enabled().then(|| compute_prof_blit_stats(frame, prev, full));
         let prof_started = crate::render_prof::timer();
-        let (row_damage, packed) = prev
-            .filter(|_| !full)
-            .and_then(|prev| self.damage.damage(prev, frame, changed_rows))
-            .map_or((None, None), |damage| {
-                (Some(damage.rows), Some(damage.packed))
-            });
+        let (row_damage, packed) = match prev.filter(|_| !full) {
+            None => (None, None),
+            Some(prev) => match self.damage.damage(prev, frame, changed_rows) {
+                Some(damage) => (Some(damage.rows), Some(damage.packed)),
+                None => (revision_damage, None),
+            },
+        };
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
@@ -194,9 +249,11 @@ impl BlitEncoder {
             clear_before_full_redraw,
             suppress_visible_cursor,
         );
-        if let Some(rows) = row_damage.as_deref().filter(|_| prof_stats.is_some()) {
-            let skipped = rows.iter().filter(|row| !row.is_changed()).count();
-            crate::render_prof::counter("cell_damage.rows_skipped", skipped as u64);
+        let rows_skipped = row_damage.as_deref().map_or(0, |rows| {
+            rows.iter().filter(|row| !row.is_changed()).count()
+        });
+        if prof_stats.is_some() && row_damage.is_some() {
+            crate::render_prof::counter("cell_damage.rows_skipped", rows_skipped as u64);
         }
         if let Some(stats) = prof_stats {
             crate::render_prof::duration_since("ansi_encode.total", prof_started);
@@ -217,6 +274,7 @@ impl BlitEncoder {
             next_last_cursor_shape,
             packed,
             revisions: None,
+            rows_skipped,
         }
     }
 
@@ -261,6 +319,7 @@ impl BlitEncoder {
                 next_last_cursor_shape: self.last_cursor_shape,
                 packed: None,
                 revisions: None,
+                rows_skipped: 0,
             });
         }
         let mut bytes = Vec::new();
@@ -283,6 +342,7 @@ impl BlitEncoder {
             next_last_cursor_shape,
             packed: None,
             revisions: None,
+            rows_skipped: 0,
         })
     }
 
@@ -852,6 +912,12 @@ fn repeat_ime_anchor_after_sync() -> bool {
 #[cfg(not(windows))]
 fn repeat_ime_anchor_after_sync() -> bool {
     true
+}
+
+/// Whether the diff treats `cell` as wider than two columns. Single-byte
+/// symbols are at most one column, so most cells skip the width lookup.
+pub(crate) fn is_overwide(cell: &CellData) -> bool {
+    cell.symbol.len() > 1 && cell_width(cell) > 2
 }
 
 /// Writes all cells in the frame (full redraw).

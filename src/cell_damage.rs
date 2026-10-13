@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 use cell_damage::{inline_symbol, interned_symbol, GridRef, PackedCell, RowDamage};
 
-use crate::protocol::render_ansi::{cell_width, sanitized_frame_hyperlinks};
+use crate::protocol::render_ansi::{is_overwide, sanitized_frame_hyperlinks};
 use crate::protocol::{CellData, FrameData, PaneSurfacePatchRow};
 
 const ENV_VAR: &str = "HERDR_RENDER_ACCEL";
@@ -415,10 +415,9 @@ impl FrameDamage {
 }
 
 /// [`FLAG_OVERWIDE`] when the encoder treats `cell` as wider than two
-/// columns. Single-byte symbols are at most one column, so most cells skip
-/// the width lookup.
+/// columns.
 fn overwide_flag(cell: &CellData) -> u16 {
-    if cell.symbol.len() > 1 && cell_width(cell) > 2 {
+    if is_overwide(cell) {
         FLAG_OVERWIDE
     } else {
         0
@@ -704,6 +703,7 @@ mod tests {
         off: BlitEncoder,
         on: BlitEncoder,
         damaged: usize,
+        skipped_rows: usize,
     }
 
     impl Pair {
@@ -712,6 +712,7 @@ mod tests {
                 off: BlitEncoder::with_damage(FrameDamage::with_backend(None)),
                 on: BlitEncoder::with_damage(damage),
                 damaged: 0,
+                skipped_rows: 0,
             }
         }
 
@@ -742,6 +743,7 @@ mod tests {
             );
             assert_eq!(actual.full, expected.full);
             self.damaged += usize::from(actual.has_row_damage());
+            self.skipped_rows += actual.rows_skipped;
             self.off.commit(frame.clone(), expected);
             self.on.commit(frame.clone(), actual);
         }
@@ -837,11 +839,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn row_revisions_keep_the_same_bytes() {
-        let mut rng = Rng(31);
-        let mut pair = Pair::new(FrameDamage::with_backend(Some(Backend::Cpu)));
-        let (width, height) = (10u16, 5u16);
+    /// Row edits, patches, changes outside the rows (a new key) and resizes,
+    /// with the producer's row revisions. Returns the pair's counters.
+    fn run_revision_parity(damage: FrameDamage, seed: u64, steps: usize) -> Pair {
+        let mut rng = Rng(seed);
+        let mut pair = Pair::new(damage);
+        let (mut width, mut height) = (10u16, 5u16);
         let mut frame = random_frame(&mut rng, width, height);
         let mut revisions = RowRevisions {
             key: 1,
@@ -849,7 +852,7 @@ mod tests {
         };
         let mut next_revision = 2;
         pair.frame_with_revisions(&frame, revisions.clone());
-        for step in 0..300 {
+        for step in 0..steps {
             match step % 50 {
                 49 => {
                     // A change outside the rows: the producer changes the key.
@@ -857,12 +860,23 @@ mod tests {
                     frame.hyperlinks.swap_remove(0);
                     revisions.key += 1;
                 }
+                37 => {
+                    width = 1 + rng.below(16) as u16;
+                    height = 1 + rng.below(8) as u16;
+                    frame = random_frame(&mut rng, width, height);
+                    revisions = RowRevisions {
+                        key: revisions.key + 1,
+                        rows: vec![next_revision; usize::from(height)],
+                    };
+                    next_revision += 1;
+                }
                 24 => {
+                    let y = rng.below(usize::from(height)) as u16;
                     let cells = vec![random_cell(&mut rng, 0, false)];
-                    let row = PaneSurfacePatchRow { x: 0, y: 2, cells };
+                    let row = PaneSurfacePatchRow { x: 0, y, cells };
                     if pair.patch(&[row.clone()], frame.cursor.clone()) {
-                        frame.cells[2 * usize::from(width)] = row.cells[0].clone();
-                        revisions.rows[2] = next_revision;
+                        frame.cells[usize::from(y) * usize::from(width)] = row.cells[0].clone();
+                        revisions.rows[usize::from(y)] = next_revision;
                         next_revision += 1;
                     }
                 }
@@ -877,7 +891,37 @@ mod tests {
             }
             pair.frame_with_revisions(&frame, revisions.clone());
         }
-        assert!(pair.damaged > 250, "only {} damaged frames", pair.damaged);
+        pair
+    }
+
+    #[test]
+    fn row_revisions_keep_the_same_bytes() {
+        for seed in 1..=4 {
+            let pair = run_revision_parity(
+                FrameDamage::with_backend(Some(Backend::Cpu)),
+                seed * 0x5851_f42d,
+                300,
+            );
+            assert!(
+                pair.damaged > 250,
+                "seed {seed}: only {} damaged frames",
+                pair.damaged
+            );
+        }
+    }
+
+    #[test]
+    fn row_revisions_without_a_backend_skip_rows_and_keep_the_same_bytes() {
+        let mut skipped_rows = 0;
+        for seed in 1..=8 {
+            let pair =
+                run_revision_parity(FrameDamage::with_backend(None), seed * 0x5851_f42d, 300);
+            assert_eq!(pair.damaged, 0);
+            skipped_rows += pair.skipped_rows;
+        }
+        // Random rows often hold a symbol wider than two columns, which is
+        // never skipped; the exact count is asserted by the overwide test.
+        assert!(skipped_rows > 100, "only {skipped_rows} rows skipped");
     }
 
     #[test]
@@ -933,6 +977,18 @@ mod tests {
         assert!(String::from_utf8_lossy(&expected.bytes).contains('y'));
         pair.frame(&next, false, Some(&[1][..]));
         assert_eq!(pair.damaged, 1);
+
+        // Row revisions alone must not skip it either.
+        let mut pair = Pair::new(FrameDamage::with_backend(None));
+        let revisions = |rows: Vec<u64>| RowRevisions { key: 1, rows };
+        pair.frame_with_revisions(&frame, revisions(vec![1, 1]));
+        pair.frame_with_revisions(&next, revisions(vec![1, 2]));
+        assert_eq!(pair.skipped_rows, 0);
+        let mut plain = next.clone();
+        plain.cells[0] = cell("a");
+        pair.frame_with_revisions(&plain, revisions(vec![3, 2]));
+        pair.frame_with_revisions(&next, revisions(vec![4, 2]));
+        assert_eq!(pair.skipped_rows, 2);
     }
 
     #[test]
@@ -965,6 +1021,16 @@ mod tests {
                 400,
             );
             assert!(damaged > 200, "seed {seed}: only {damaged} damaged frames");
+            let pair = run_revision_parity(
+                FrameDamage::with_backend(Some(Backend::Cuda)),
+                seed * 0x5851_f42d,
+                300,
+            );
+            assert!(
+                pair.damaged > 250,
+                "seed {seed}: only {} damaged frames",
+                pair.damaged
+            );
         }
     }
 
@@ -1033,15 +1099,16 @@ mod tests {
         #[allow(unused_mut)] // Only CUDA builds add paths.
         let mut paths = vec![
             ("full diff (existing)", None, false),
+            ("revisions, no packing", None, true),
             ("cpu packed", Some(Backend::Cpu), false),
-            ("cpu packed + rows", Some(Backend::Cpu), true),
+            ("cpu packed + revisions", Some(Backend::Cpu), true),
         ];
         #[cfg(feature = "cuda")]
         if std::env::var("HERDR_TEST_CUDA").as_deref() == Ok("1") {
             let device = open_cuda_for_tests().expect("HERDR_TEST_CUDA=1 needs a CUDA device");
             println!("CUDA device: {device}");
             paths.push(("cuda", Some(Backend::Cuda), false));
-            paths.push(("cuda + rows", Some(Backend::Cuda), true));
+            paths.push(("cuda + revisions", Some(Backend::Cuda), true));
         }
         paths
     }
@@ -1059,8 +1126,9 @@ mod tests {
 
     /// Host wall time of complete server ANSI encodes per path: packing,
     /// comparison (for CUDA: upload, launch, sync and readback), and the
-    /// byte diff. "+ rows" passes the changed rows, as row revisions would.
-    /// Every path must produce the same bytes. Raw evidence, not a claim.
+    /// byte diff. "+ revisions" paths get row revisions bumped exactly for
+    /// the changed rows, as a retained screen would report them. Every path
+    /// must produce the same bytes. Raw evidence, not a claim.
     #[test]
     #[ignore = "profile; run with --ignored --nocapture, HERDR_TEST_CUDA=1 adds CUDA"]
     fn cell_damage_profile() {
@@ -1069,29 +1137,53 @@ mod tests {
         for (width, height) in [(94u16, 39u16), (457, 127)] {
             for scenario in ["typing", "scroll", "rewrite"] {
                 let frames = profile_frames(scenario, width, height, samples);
+                let mut revisions = RowRevisions {
+                    key: 1,
+                    rows: vec![0; usize::from(height)],
+                };
+                let frame_revisions: Vec<RowRevisions> = (1..)
+                    .zip(&frames)
+                    .map(|(revision, (_, rows))| {
+                        for &row in rows {
+                            revisions.rows[usize::from(row)] = revision;
+                        }
+                        revisions.clone()
+                    })
+                    .collect();
                 let mut expected_bytes = None;
-                for &(name, backend, with_rows) in &paths {
+                for &(name, backend, with_revisions) in &paths {
                     let mut encoder = BlitEncoder::with_damage(FrameDamage::with_backend(backend));
-                    let first = encoder.encode(&frames[0].0, false);
+                    let encode = |encoder: &BlitEncoder, index: usize| {
+                        let frame = &frames[index].0;
+                        if with_revisions {
+                            encoder.encode_with_row_revisions(
+                                frame,
+                                false,
+                                frame_revisions[index].clone(),
+                            )
+                        } else {
+                            encoder.encode(frame, false)
+                        }
+                    };
+                    let first = encode(&encoder, 0);
                     encoder.commit(frames[0].0.clone(), first);
                     let mut times = Vec::with_capacity(samples);
                     let mut bytes = Vec::new();
-                    for (frame, rows) in &frames[1..] {
+                    let mut skipped_rows = 0;
+                    for (index, (frame, _)) in frames.iter().enumerate().skip(1) {
                         let started = std::time::Instant::now();
-                        let encoded = if with_rows {
-                            encoder.encode_with_changed_rows(frame, false, rows)
-                        } else {
-                            encoder.encode(frame, false)
-                        };
+                        let encoded = encode(&encoder, index);
                         times.push(started.elapsed());
                         bytes.extend_from_slice(&encoded.bytes);
+                        skipped_rows += encoded.rows_skipped;
                         encoder.commit(frame.clone(), encoded);
                     }
                     let expected = expected_bytes.get_or_insert_with(|| bytes.clone());
                     assert!(*expected == bytes, "{name} wrote different bytes");
                     println!(
-                        "{width}x{height} {scenario:<7} {name:<22} {}",
-                        percentiles(&mut times)
+                        "{width}x{height} {scenario:<7} {name:<24} {} rows skipped/frame {:.1}",
+                        percentiles(&mut times),
+                        skipped_rows as f64 / samples as f64
                     );
                 }
             }
