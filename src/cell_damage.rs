@@ -539,6 +539,8 @@ mod cuda {
         match cuda.row_damage(prev, next, rows, out) {
             Ok(timings) => {
                 crate::render_prof::duration("cell_damage.cuda.upload", timings.upload);
+                crate::render_prof::duration("cell_damage.cuda.alloc_free", timings.alloc_free);
+                crate::render_prof::duration("cell_damage.cuda.device_copy", timings.device_copy);
                 crate::render_prof::duration("cell_damage.cuda.launch_sync", timings.launch_sync);
                 crate::render_prof::duration("cell_damage.cuda.readback", timings.readback);
                 crate::render_prof::counter(

@@ -336,6 +336,8 @@ fn cuda_row_damage_profile() {
             let mut prev = random_grid(&mut rng, width * height);
             let (mut cpu_times, mut gpu_times) = (Vec::new(), Vec::new());
             let (mut upload, mut launch, mut readback) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut alloc_free, mut device_copy) = (Vec::new(), Vec::new());
+            let (mut allocations, mut frees) = (0u64, 0u64);
             let mut out = Vec::new();
             for generation in (first_generation..).take(samples) {
                 let rows: Vec<u32> = if rows_per_frame == 1 {
@@ -364,6 +366,10 @@ fn cuda_row_damage_profile() {
                 let timings = device.row_damage(a, b, hint, &mut out).unwrap();
                 gpu_times.push(started.elapsed());
                 upload.push(timings.upload);
+                alloc_free.push(timings.alloc_free);
+                device_copy.push(timings.device_copy);
+                allocations += u64::from(timings.allocations);
+                frees += u64::from(timings.frees);
                 launch.push(timings.launch_sync);
                 readback.push(timings.readback);
                 prev = next;
@@ -380,6 +386,14 @@ fn cuda_row_damage_profile() {
             println!(
                 "{width}x{height} {scenario:<7} cuda upload        {}",
                 percentiles(&mut upload)
+            );
+            println!(
+                "{width}x{height} {scenario:<7} cuda alloc+free    {} ({allocations} allocations, {frees} frees)",
+                percentiles(&mut alloc_free)
+            );
+            println!(
+                "{width}x{height} {scenario:<7} cuda device copy   {}",
+                percentiles(&mut device_copy)
             );
             println!(
                 "{width}x{height} {scenario:<7} cuda launch+sync   {}",

@@ -437,26 +437,30 @@ impl CudaDamage {
         let (prev_key, next_key) = (key(prev), key(next));
 
         let upload_started = Instant::now();
-        let prev_ptr = match self.resident_ptr(prev_key) {
+        let prev_ptr = match self.resident_ptr(prev_key, &mut timings) {
             Some(ptr) => ptr,
             None => {
-                let ptr = self.insert_resident(prev_key, grid_bytes, None)?;
+                let ptr = self.insert_resident(prev_key, grid_bytes, None, &mut timings)?;
                 self.upload(ptr, prev.cells, &mut timings)?;
                 ptr
             }
         };
-        let (staged_ptr, next_out_ptr, compact) = match self.resident_ptr(next_key) {
+        let (staged_ptr, next_out_ptr, compact) = match self.resident_ptr(next_key, &mut timings) {
             Some(next_ptr) => (next_ptr, 0, 0u32),
             None if row_count == height => {
-                let next_ptr = self.insert_resident(next_key, grid_bytes, Some(prev_key))?;
+                let next_ptr =
+                    self.insert_resident(next_key, grid_bytes, Some(prev_key), &mut timings)?;
                 self.upload(next_ptr, next.cells, &mut timings)?;
                 (next_ptr, 0, 0)
             }
             None => {
-                let next_ptr = self.insert_resident(next_key, grid_bytes, Some(prev_key))?;
+                let next_ptr =
+                    self.insert_resident(next_key, grid_bytes, Some(prev_key), &mut timings)?;
+                let copy_started = Instant::now();
                 // SAFETY: both device buffers hold `grid_bytes`.
                 let result = unsafe { (self.driver.memcpy_dtod)(next_ptr, prev_ptr, grid_bytes) };
                 self.driver.check("cuMemcpyDtoD", result)?;
+                timings.device_copy = copy_started.elapsed();
                 self.host_staged.clear();
                 for &row in &self.host_rows {
                     let start = row as usize * width;
@@ -467,6 +471,7 @@ impl CudaDamage {
                     &self.driver,
                     &mut self.staging,
                     row_count * width * CELL_BYTES,
+                    &mut timings,
                 )?;
                 let staged = std::mem::take(&mut self.host_staged);
                 let uploaded = self.upload(staging, &staged, &mut timings);
@@ -475,7 +480,12 @@ impl CudaDamage {
                 (staging, next_ptr, 1)
             }
         };
-        let row_list = Self::ensure_buffer(&self.driver, &mut self.row_list, row_count * 4)?;
+        let row_list = Self::ensure_buffer(
+            &self.driver,
+            &mut self.row_list,
+            row_count * 4,
+            &mut timings,
+        )?;
         let rows_host = std::mem::take(&mut self.host_rows);
         let uploaded = self.upload(row_list, &rows_host, &mut timings);
         self.host_rows = rows_host;
@@ -484,6 +494,7 @@ impl CudaDamage {
             &self.driver,
             &mut self.damage,
             row_count * std::mem::size_of::<RowDamage>(),
+            &mut timings,
         )?;
         timings.upload = upload_started.elapsed();
 
@@ -571,12 +582,15 @@ impl CudaDamage {
         Ok(())
     }
 
-    fn resident_ptr(&mut self, key: GridKey) -> Option<CuDevicePtr> {
+    fn resident_ptr(&mut self, key: GridKey, timings: &mut DeviceTimings) -> Option<CuDevicePtr> {
         let mut stale = Vec::new();
         let ptr = self.residency.get(key, &mut stale);
+        let started = Instant::now();
         for ptr in stale {
             self.free(ptr);
+            timings.frees += 1;
         }
+        timings.alloc_free += started.elapsed();
         ptr
     }
 
@@ -588,17 +602,24 @@ impl CudaDamage {
         key: GridKey,
         bytes: usize,
         keep: Option<GridKey>,
+        timings: &mut DeviceTimings,
     ) -> Result<CuDevicePtr, CudaError> {
         let mut evicted = Vec::new();
         let reserved = self.residency.reserve(bytes, keep, &mut evicted);
+        let started = Instant::now();
         for ptr in evicted {
             self.free(ptr);
+            timings.frees += 1;
         }
+        timings.alloc_free += started.elapsed();
         reserved.map_err(|OverBudget| CudaError {
             step: "device residency",
             detail: format!("a {bytes}-byte grid exceeds the {MAX_RESIDENT_BYTES}-byte bound"),
         })?;
+        let started = Instant::now();
         let ptr = self.alloc(bytes)?;
+        timings.alloc_free += started.elapsed();
+        timings.allocations += 1;
         self.residency.insert(key, ptr, bytes);
         Ok(ptr)
     }
@@ -607,18 +628,23 @@ impl CudaDamage {
         driver: &Driver,
         slot: &mut Option<DeviceBuffer>,
         bytes: usize,
+        timings: &mut DeviceTimings,
     ) -> Result<CuDevicePtr, CudaError> {
         if let Some(buffer) = slot.as_ref().filter(|buffer| buffer.bytes >= bytes) {
             return Ok(buffer.ptr);
         }
+        let started = Instant::now();
         if let Some(buffer) = slot.take() {
             // SAFETY: allocated by cuMemAlloc and no longer referenced.
             unsafe { (driver.mem_free)(buffer.ptr) };
+            timings.frees += 1;
         }
         let bytes = bytes.max(1).next_power_of_two();
         let mut ptr = 0;
         // SAFETY: valid out-pointer.
         driver.check("cuMemAlloc", unsafe { (driver.mem_alloc)(&mut ptr, bytes) })?;
+        timings.alloc_free += started.elapsed();
+        timings.allocations += 1;
         *slot = Some(DeviceBuffer { ptr, bytes });
         Ok(ptr)
     }

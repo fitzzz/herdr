@@ -178,8 +178,15 @@ impl From<ShapeError> for CudaError {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeviceTimings {
     /// Baseline and candidate-row uploads, the row list, and the device copy
-    /// that seeds the next resident grid.
+    /// that seeds the next resident grid. Includes `alloc_free` and
+    /// `device_copy`.
     pub upload: Duration,
+    /// Device allocations and frees for resident grids and scratch buffers.
+    pub alloc_free: Duration,
+    pub allocations: u32,
+    pub frees: u32,
+    /// The device copy of the baseline that seeds a partially uploaded grid.
+    pub device_copy: Duration,
     /// Kernel launch until the device is idle.
     pub launch_sync: Duration,
     /// Copying the per-row damage back to the host.
