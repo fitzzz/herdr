@@ -470,11 +470,14 @@ fn terminal_screen_extracts_each_change_once_for_every_consumer() {
     read_everything();
     assert_eq!(extracted(), 6);
 
-    // One changed row is read again, not the whole screen, and only once.
+    // Only Ghostty's dirty rows are read again, and only once. Moving the
+    // cursor from row 2 to row 1 marks both rows dirty (Screen.cursorChangePin
+    // marks the row it leaves and the row it enters), and printing marks row 1;
+    // nothing sets a terminal- or screen-wide flag, so no full rebuild.
     write(&pane.ghostty, b"\x1b[2;1HTWO");
     let _ = draw(&pane.ghostty, area, false);
     let after_change = extracted();
-    assert!((7..12).contains(&after_change), "{after_change}");
+    assert_eq!(after_change, 6 + 2);
     read_everything();
     assert_eq!(extracted(), after_change);
 
