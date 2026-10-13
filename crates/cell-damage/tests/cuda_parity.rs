@@ -166,8 +166,7 @@ fn chained_candidate_rows_reuse_the_resident_grid_exactly() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let (width, height) = (94, 39);
     let mut prev = random_grid(&mut rng, width * height);
-    let mut generation = 1;
-    for step in 0..200 {
+    for (generation, step) in (1..).zip(0..200) {
         let rows = candidate_rows(&mut rng, height);
         let next = edited(&mut rng, &prev, width, &rows);
         let timings = assert_parity(
@@ -184,7 +183,6 @@ fn chained_candidate_rows_reuse_the_resident_grid_exactly() {
             assert_eq!(timings.uploaded_bytes, expected as u64, "step {step}");
         }
         prev = next;
-        generation += 1;
     }
     assert!(device.resident_grids() <= 16);
 }
@@ -329,15 +327,17 @@ fn percentiles(samples: &mut [Duration]) -> String {
 fn cuda_row_damage_profile() {
     let Some(mut device) = device() else { return };
     let samples = 500;
+    // Generations stay unique across scenarios: one device keeps grids by
+    // generation, and a reused one would be read as the earlier grid.
+    let mut first_generation = 1u64;
     for (width, height) in [(94, 39), (457, 127)] {
         for (scenario, rows_per_frame) in [("typing", 1), ("scroll", height), ("rewrite", height)] {
             let mut rng = Rng(19);
             let mut prev = random_grid(&mut rng, width * height);
-            let mut generation = 1u64;
             let (mut cpu_times, mut gpu_times) = (Vec::new(), Vec::new());
             let (mut upload, mut launch, mut readback) = (Vec::new(), Vec::new(), Vec::new());
             let mut out = Vec::new();
-            for _ in 0..samples {
+            for generation in (first_generation..).take(samples) {
                 let rows: Vec<u32> = if rows_per_frame == 1 {
                     vec![rng.below(height) as u32]
                 } else {
@@ -367,8 +367,8 @@ fn cuda_row_damage_profile() {
                 launch.push(timings.launch_sync);
                 readback.push(timings.readback);
                 prev = next;
-                generation += 1;
             }
+            first_generation += samples as u64 + 1;
             println!(
                 "{width}x{height} {scenario:<7} cpu reference      {}",
                 percentiles(&mut cpu_times)
