@@ -130,6 +130,10 @@ pub struct PaneAgentSessionSnapshot {
     /// repeat them. Absent in files from older Herdr versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_options: Option<Vec<String>>,
+    /// The agent was resumed by a restore that fell back to the bare resume
+    /// command, so its launch options are not known. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed_without_launch_options: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -363,6 +367,8 @@ fn capture_tab(
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
                         launch_options: terminal.launch_options_for_session(&authority.agent_label),
+                        resumed_without_launch_options: terminal
+                            .resumed_without_launch_options_for_session(&authority.agent_label),
                     });
                 }
             }
@@ -375,6 +381,8 @@ fn capture_tab(
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
                     launch_options: terminal.launch_options_for_session(&session.agent),
+                    resumed_without_launch_options: terminal
+                        .resumed_without_launch_options_for_session(&session.agent),
                 })
         });
         let agent_resume = terminal
@@ -1474,6 +1482,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "session-1".into(),
             launch_options: Some(vec!["-c".into(), "placeholder_key=placeholder".into()]),
+            resumed_without_launch_options: false,
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(
@@ -1493,6 +1502,71 @@ mod tests {
         let old: PaneAgentSessionSnapshot = serde_json::from_str(old_json).unwrap();
         assert_eq!(old.launch_options, None);
         assert_eq!(old.value, "session-1");
+    }
+
+    #[test]
+    fn capture_saves_resumed_without_launch_options_for_the_session_agent() {
+        let captured = |seed_agent: crate::detect::Agent, flagged: bool, hook_authority: bool| {
+            let (mut state, root) = launch_options_capture_state("claude", None, hook_authority);
+            let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+                .attached_terminal_id
+                .clone();
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .seed_agent_launch(
+                    seed_agent,
+                    crate::agent_resume::AgentLaunchOptions::Unavailable(
+                        crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                    ),
+                    flagged,
+                );
+            capture_from_state(&state).workspaces[0].tabs[0].panes[&root.raw()]
+                .agent_session
+                .as_ref()
+                .expect("agent session should be captured")
+                .resumed_without_launch_options
+        };
+        for hook_authority in [false, true] {
+            assert!(captured(crate::detect::Agent::Claude, true, hook_authority));
+            assert!(!captured(
+                crate::detect::Agent::Claude,
+                false,
+                hook_authority
+            ));
+            assert!(!captured(crate::detect::Agent::Codex, true, hook_authority));
+        }
+    }
+
+    #[test]
+    fn agent_session_resumed_without_launch_options_round_trips_and_defaults() {
+        let session = PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "session-1".into(),
+            launch_options: None,
+            resumed_without_launch_options: true,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"resumed_without_launch_options\":true"));
+        assert_eq!(
+            serde_json::from_str::<PaneAgentSessionSnapshot>(&json).unwrap(),
+            session
+        );
+
+        let unflagged = PaneAgentSessionSnapshot {
+            resumed_without_launch_options: false,
+            ..session
+        };
+        let json = serde_json::to_string(&unflagged).unwrap();
+        assert!(!json.contains("resumed_without_launch_options"));
+
+        let old_json =
+            r#"{"source":"herdr:claude","agent":"claude","kind":"id","value":"session-1"}"#;
+        let old: PaneAgentSessionSnapshot = serde_json::from_str(old_json).unwrap();
+        assert!(!old.resumed_without_launch_options);
     }
 
     #[test]

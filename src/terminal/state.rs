@@ -124,8 +124,9 @@ pub struct ObservedAgentLaunch {
     /// `herdr agent start` to the process that runs the agent.
     pub process_group_id: Option<u32>,
     pub options: crate::agent_resume::AgentLaunchOptions,
-    /// Seeded by a restore that fell back to the bare resume command.
-    pub bare_resume: bool,
+    /// The agent was resumed by a restore that fell back to the bare resume
+    /// command; stays set while the record is bound to that process.
+    pub resumed_without_options: bool,
 }
 
 impl ObservedAgentLaunch {
@@ -136,6 +137,10 @@ impl ObservedAgentLaunch {
             }
             crate::agent_resume::AgentLaunchOptions::Unavailable(_) => None,
         }
+    }
+
+    fn resumed_without_options_agent(&self) -> Option<Agent> {
+        self.resumed_without_options.then_some(self.agent)
     }
 }
 
@@ -248,11 +253,13 @@ impl TerminalState {
     }
 
     fn set_agent_launch(&mut self, launch: Option<ObservedAgentLaunch>) {
-        let saved_changed = self
-            .agent_launch
-            .as_ref()
-            .and_then(ObservedAgentLaunch::saved_options)
-            != launch.as_ref().and_then(ObservedAgentLaunch::saved_options);
+        let current = self.agent_launch.as_ref();
+        let saved_changed = current.and_then(ObservedAgentLaunch::saved_options)
+            != launch.as_ref().and_then(ObservedAgentLaunch::saved_options)
+            || current.and_then(ObservedAgentLaunch::resumed_without_options_agent)
+                != launch
+                    .as_ref()
+                    .and_then(ObservedAgentLaunch::resumed_without_options_agent);
         self.agent_launch = launch;
         if saved_changed {
             self.agent_launch_revision += 1;
@@ -265,13 +272,13 @@ impl TerminalState {
         &mut self,
         agent: Agent,
         options: crate::agent_resume::AgentLaunchOptions,
-        bare_resume: bool,
+        resumed_without_options: bool,
     ) {
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             process_group_id: None,
             options,
-            bare_resume,
+            resumed_without_options,
         }));
     }
 
@@ -282,18 +289,19 @@ impl TerminalState {
         process_group_id: u32,
         options: crate::agent_resume::AgentLaunchOptions,
     ) {
-        let options = match self.agent_launch.as_ref() {
+        let (options, resumed_without_options) = match self.agent_launch.as_ref() {
             Some(current)
                 if current.agent == agent && current.process_group_id == Some(process_group_id) =>
             {
                 return;
             }
-            // A seeded record keeps its options when this platform cannot
-            // read the process command line (WSL), and when it was seeded by a
-            // restore that fell back to the bare resume command, whose process
-            // shows no options because Herdr typed it. Any other seed takes
-            // what the process shows, so a fresh bare agent never inherits
-            // options from a resumed one that already exited.
+            // A seeded record keeps its options, and its mark that the agent
+            // was resumed without them, when this platform cannot read the
+            // process command line (WSL), and when it was seeded by a restore
+            // that fell back to the bare resume command, whose process shows
+            // no options because Herdr typed it. Any other seed takes what the
+            // process shows, so a fresh bare agent never inherits options from
+            // a resumed one that already exited.
             Some(current)
                 if current.agent == agent
                     && current.process_group_id.is_none()
@@ -302,22 +310,39 @@ impl TerminalState {
                         crate::agent_resume::AgentLaunchOptions::Unavailable(
                             crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
                         )
-                    ) || current.bare_resume
+                    ) || current.resumed_without_options
                         && matches!(
                             &options,
                             crate::agent_resume::AgentLaunchOptions::Known(observed) if observed.is_empty()
                         )) =>
             {
-                current.options.clone()
+                (current.options.clone(), current.resumed_without_options)
             }
-            _ => options,
+            _ => (options, false),
         };
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             process_group_id: Some(process_group_id),
             options,
-            bare_resume: false,
+            resumed_without_options,
         }));
+    }
+
+    /// Whether the pane's agent was resumed without its launch options.
+    pub fn resumed_without_launch_options(&self) -> bool {
+        self.agent_launch
+            .as_ref()
+            .is_some_and(|launch| launch.resumed_without_options)
+    }
+
+    /// Whether to save beside a session of `agent_label` that it was resumed
+    /// without its launch options.
+    pub fn resumed_without_launch_options_for_session(&self, agent_label: &str) -> bool {
+        let agent = self
+            .agent_launch
+            .as_ref()
+            .and_then(ObservedAgentLaunch::resumed_without_options_agent);
+        agent.is_some() && crate::detect::parse_agent_label(agent_label) == agent
     }
 
     /// The options to save beside a session of `agent_label`, when they are
@@ -2760,6 +2785,67 @@ mod tests {
             terminal.launch_options_for_session("claude"),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn resumed_without_launch_options_lasts_while_that_agent_runs() {
+        let not_recorded = || {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+            )
+        };
+        let fallback = || {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.seed_agent_launch(Agent::Claude, not_recorded(), true);
+            terminal
+        };
+
+        // A fallback seed sets the mark, a save records it, and binding to the
+        // bare resume process keeps it.
+        let mut terminal = test_terminal();
+        let revision = terminal.agent_launch_revision();
+        terminal.seed_agent_launch(Agent::Claude, not_recorded(), true);
+        assert_ne!(terminal.agent_launch_revision(), revision);
+        assert!(terminal.resumed_without_launch_options());
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        assert_eq!(terminal.agent_launch().unwrap().process_group_id, Some(40));
+        assert!(terminal.resumed_without_launch_options());
+        assert!(terminal.resumed_without_launch_options_for_session("claude"));
+        assert!(!terminal.resumed_without_launch_options_for_session("codex"));
+
+        // Another process clears it.
+        terminal.observe_agent_launch(Agent::Claude, 41, known_options(&[]));
+        assert!(!terminal.resumed_without_launch_options());
+        assert!(!terminal.resumed_without_launch_options_for_session("claude"));
+
+        // So does the agent exiting.
+        let mut terminal = fallback();
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        assert!(!terminal.resumed_without_launch_options());
+
+        // And a change of agent.
+        let mut terminal = fallback();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(!terminal.resumed_without_launch_options());
+        let mut terminal = fallback();
+        terminal.observe_agent_launch(Agent::Codex, 40, known_options(&[]));
+        assert!(!terminal.resumed_without_launch_options());
+
+        // A kept restore or `herdr agent start` seed never sets it.
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(Agent::Claude, known_options(&["--placeholder"]), false);
+        assert!(!terminal.resumed_without_launch_options());
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        assert!(!terminal.resumed_without_launch_options());
+        assert!(!terminal.resumed_without_launch_options_for_session("claude"));
     }
 
     #[test]

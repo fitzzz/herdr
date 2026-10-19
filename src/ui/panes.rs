@@ -22,13 +22,27 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
 }
 
-fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
+/// Shown beside a pane whose agent a restore resumed without its launch options.
+const LAUNCH_OPTIONS_NOT_KEPT: &str = "launch options not kept";
+
+fn pane_border_title(
+    label: &str,
+    marker: Option<&str>,
+    pane_width: u16,
+    _focused: bool,
+) -> Option<String> {
     let label = label.trim();
-    if label.is_empty() || pane_width <= 4 {
+    if pane_width <= 4 {
         return None;
     }
+    let text = match (label.is_empty(), marker) {
+        (true, None) => return None,
+        (true, Some(marker)) => std::borrow::Cow::Borrowed(marker),
+        (false, None) => std::borrow::Cow::Borrowed(label),
+        (false, Some(marker)) => std::borrow::Cow::Owned(format!("{label} · {marker}")),
+    };
     let max_label_width = pane_width.saturating_sub(4) as usize;
-    Some(format!(" {} ", truncate_end(label, max_label_width)))
+    Some(format!(" {} ", truncate_end(&text, max_label_width)))
 }
 
 // Full view computation reaches this helper for active and background panes.
@@ -644,12 +658,22 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
-        let Some(title) = ws
+        let Some(terminal) = ws
             .pane_state(info.id)
             .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
         else {
+            continue;
+        };
+        let label = terminal.border_label(app.show_agent_labels_on_pane_borders);
+        let marker = terminal
+            .resumed_without_launch_options()
+            .then_some(LAUNCH_OPTIONS_NOT_KEPT);
+        let Some(title) = pane_border_title(
+            label.as_deref().unwrap_or_default(),
+            marker,
+            info.rect.width,
+            info.is_focused,
+        ) else {
             continue;
         };
         let y = info.rect.y;
@@ -892,28 +916,28 @@ mod tests {
     #[test]
     fn pane_border_title_trims_and_truncates() {
         assert_eq!(
-            pane_border_title(" claude ", 20, false).as_deref(),
+            pane_border_title(" claude ", None, 20, false).as_deref(),
             Some(" claude ")
         );
         assert_eq!(
-            pane_border_title(" claude ", 20, true).as_deref(),
+            pane_border_title(" claude ", None, 20, true).as_deref(),
             Some(" claude ")
         );
-        assert_eq!(pane_border_title("", 20, false), None);
+        assert_eq!(pane_border_title("", None, 20, false), None);
         assert_eq!(
-            pane_border_title("abcdef", 8, false).as_deref(),
+            pane_border_title("abcdef", None, 8, false).as_deref(),
             Some(" abc… ")
         );
         assert_eq!(
-            pane_border_title("abcdef", 8, true).as_deref(),
+            pane_border_title("abcdef", None, 8, true).as_deref(),
             Some(" abc… ")
         );
-        assert_eq!(pane_border_title("abcdef", 4, false), None);
+        assert_eq!(pane_border_title("abcdef", None, 4, false), None);
     }
 
     #[test]
     fn pane_border_title_truncates_cjk_by_display_width() {
-        let title = pane_border_title("1 模块组织（已定）", 12, false).unwrap();
+        let title = pane_border_title("1 模块组织（已定）", None, 12, false).unwrap();
 
         assert_eq!(title, " 1 模块… ");
         assert!(display_width(title.as_str()) <= 10);
@@ -949,6 +973,52 @@ mod tests {
         assert_eq!(buffer[(4, 0)].symbol(), "模");
         assert_eq!(buffer[(5, 0)].symbol(), " ");
         assert_eq!(buffer[(6, 0)].symbol(), "块");
+    }
+
+    #[test]
+    fn pane_border_title_marks_agents_resumed_without_launch_options() {
+        let render = |label: Option<&str>, resumed_without_options: bool| {
+            let mut app = AppState::test_new();
+            app.view.terminal_area = Rect::new(0, 0, 60, 3);
+            let ws = Workspace::test_new("test");
+            let pane_id = ws.tabs[0].root_pane;
+            app.view.pane_infos = vec![PaneInfo {
+                id: pane_id,
+                rect: Rect::new(0, 0, 60, 3),
+                inner_rect: Rect::default(),
+                scrollbar_rect: None,
+                borders: Borders::ALL,
+                is_focused: false,
+            }];
+            let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+            let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+            if let Some(label) = label {
+                terminal_state.set_manual_label(label.into());
+            }
+            terminal_state.seed_agent_launch(
+                crate::detect::Agent::Claude,
+                crate::agent_resume::AgentLaunchOptions::Unavailable(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                resumed_without_options,
+            );
+            app.terminals.insert(terminal_id, terminal_state);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 3)).unwrap();
+            terminal
+                .draw(|frame| render_view_pane_borders(&app, &ws, &[], frame))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..60)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        assert!(render(Some("claude"), true).contains(" claude · launch options not kept "));
+        assert!(render(None, true).contains(" launch options not kept "));
+        assert!(!render(Some("claude"), false).contains("launch options not kept"));
+        assert!(render(Some("claude"), false).contains(" claude "));
+        assert!(!render(None, false).contains("launch options not kept"));
     }
 
     #[test]
