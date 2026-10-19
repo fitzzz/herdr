@@ -1442,6 +1442,22 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::AgentLaunchObserved {
+                pane_id,
+                agent,
+                process_group_id,
+                argv,
+            } => {
+                if let Some(options) =
+                    crate::agent_resume::launch_options_from_process_argv(agent, argv.as_deref())
+                {
+                    self.update_terminal_state(pane_id, |terminal| {
+                        terminal.observe_agent_launch(agent, process_group_id, options);
+                        None
+                    });
+                }
+                Vec::new()
+            }
             AppEvent::CodexPromptObserved { pane_id, ready } => self
                 .update_terminal_state(pane_id, |terminal| {
                     terminal.observe_codex_prompt_ready(ready)
@@ -1676,10 +1692,14 @@ impl AppState {
             let previous_agent_name = terminal.agent_name.clone();
             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
             let resume_revision = terminal.reported_resume_revision();
+            let launch_revision = terminal.agent_launch_revision();
             let mutation = update(terminal);
             terminal.reconcile_reported_resume();
-            // Resume-only changes return no mutation but must still be saved.
-            if terminal.reported_resume_revision() != resume_revision {
+            // Resume-only and launch-option-only changes return no mutation but
+            // must still be saved.
+            if terminal.reported_resume_revision() != resume_revision
+                || terminal.agent_launch_revision() != launch_revision
+            {
                 self.session_dirty = true;
             }
             let mutation = mutation?;
@@ -3284,6 +3304,66 @@ mod tests {
             &[AgentState::Idle, AgentState::Working, AgentState::Idle],
             true,
         );
+    }
+
+    #[test]
+    fn launch_option_changes_mark_the_session_dirty() {
+        let mut state = app_with_workspaces(&["one"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        state.session_dirty = false;
+
+        state.update_terminal_state(pane_id, |terminal| {
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                10,
+                crate::agent_resume::AgentLaunchOptions::Known(vec!["--placeholder".into()]),
+            );
+            None
+        });
+        assert!(state.session_dirty);
+
+        state.session_dirty = false;
+        state.update_terminal_state(pane_id, |terminal| {
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                10,
+                crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+            );
+            None
+        });
+        assert!(
+            !state.session_dirty,
+            "the same process observed again changes nothing"
+        );
+    }
+
+    // needs W1 parser: expects `claude --model placeholder-model` to parse to
+    // the options `--model placeholder-model`.
+    #[test]
+    fn agent_launch_observed_event_records_options_from_the_command_line() {
+        let mut state = app_with_workspaces(&["one"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        state.session_dirty = false;
+
+        state.handle_app_event(AppEvent::AgentLaunchObserved {
+            pane_id,
+            agent: Agent::Claude,
+            process_group_id: 10,
+            argv: Some(vec![
+                "claude".into(),
+                "--model".into(),
+                "placeholder-model".into(),
+            ]),
+        });
+
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        assert_eq!(
+            state.terminals[&terminal_id].launch_options_for_session("claude"),
+            Some(vec!["--model".to_string(), "placeholder-model".to_string()])
+        );
+        assert!(state.session_dirty);
     }
 
     #[test]

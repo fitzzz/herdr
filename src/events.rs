@@ -89,6 +89,14 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
+    /// Process detection read the command line of a new Claude or Codex
+    /// process. `argv` is `None` where the platform does not read it.
+    AgentLaunchObserved {
+        pane_id: PaneId,
+        agent: Agent,
+        process_group_id: u32,
+        argv: Option<Vec<String>>,
+    },
     /// The current Codex input screen is visible during managed startup.
     CodexPromptObserved { pane_id: PaneId, ready: bool },
     /// Fallback detector state changed in a pane.

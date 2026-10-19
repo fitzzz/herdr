@@ -115,6 +115,28 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// The launch options of the Claude or Codex process running in a pane, kept
+/// so restore can repeat them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedAgentLaunch {
+    pub agent: Agent,
+    /// `None` until detection binds a record seeded by restore or
+    /// `herdr agent start` to the process that runs the agent.
+    pub process_group_id: Option<u32>,
+    pub options: crate::agent_resume::AgentLaunchOptions,
+}
+
+impl ObservedAgentLaunch {
+    fn saved_options(&self) -> Option<(Agent, &[String])> {
+        match &self.options {
+            crate::agent_resume::AgentLaunchOptions::Known(options) => {
+                Some((self.agent, options.as_slice()))
+            }
+            crate::agent_resume::AgentLaunchOptions::Unavailable(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecentAgentProcessExit {
     agent: Agent,
@@ -162,6 +184,11 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
+    agent_launch: Option<ObservedAgentLaunch>,
+    agent_launch_revision: u64,
+    /// Whether the restore that started this terminal repeated the agent's
+    /// launch options.
+    pub agent_launch_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
 }
 
 impl TerminalState {
@@ -202,7 +229,90 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
+            agent_launch: None,
+            agent_launch_revision: 0,
+            agent_launch_restore: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn agent_launch(&self) -> Option<&ObservedAgentLaunch> {
+        self.agent_launch.as_ref()
+    }
+
+    /// Changes whenever the launch options a session save would record change.
+    pub fn agent_launch_revision(&self) -> u64 {
+        self.agent_launch_revision
+    }
+
+    fn set_agent_launch(&mut self, launch: Option<ObservedAgentLaunch>) {
+        let saved_changed = self
+            .agent_launch
+            .as_ref()
+            .and_then(ObservedAgentLaunch::saved_options)
+            != launch.as_ref().and_then(ObservedAgentLaunch::saved_options);
+        self.agent_launch = launch;
+        if saved_changed {
+            self.agent_launch_revision += 1;
+        }
+    }
+
+    /// Records the options a session restore or `herdr agent start` launched
+    /// the agent with, before detection sees its process.
+    pub fn seed_agent_launch(
+        &mut self,
+        agent: Agent,
+        options: crate::agent_resume::AgentLaunchOptions,
+    ) {
+        self.set_agent_launch(Some(ObservedAgentLaunch {
+            agent,
+            process_group_id: None,
+            options,
+        }));
+    }
+
+    /// Detection read the command line of a Claude or Codex process.
+    pub fn observe_agent_launch(
+        &mut self,
+        agent: Agent,
+        process_group_id: u32,
+        options: crate::agent_resume::AgentLaunchOptions,
+    ) {
+        let options = match self.agent_launch.as_ref() {
+            Some(current)
+                if current.agent == agent && current.process_group_id == Some(process_group_id) =>
+            {
+                return;
+            }
+            // A seeded record keeps its options when this platform cannot
+            // read the process command line (WSL).
+            Some(current)
+                if current.agent == agent
+                    && current.process_group_id.is_none()
+                    && options
+                        == crate::agent_resume::AgentLaunchOptions::Unavailable(
+                            crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+                        ) =>
+            {
+                current.options.clone()
+            }
+            _ => options,
+        };
+        self.set_agent_launch(Some(ObservedAgentLaunch {
+            agent,
+            process_group_id: Some(process_group_id),
+            options,
+        }));
+    }
+
+    /// The options to save beside a session of `agent_label`, when they are
+    /// known for that same agent.
+    pub fn launch_options_for_session(&self, agent_label: &str) -> Option<Vec<String>> {
+        let (agent, options) = self
+            .agent_launch
+            .as_ref()
+            .and_then(ObservedAgentLaunch::saved_options)?;
+        (crate::detect::parse_agent_label(agent_label) == Some(agent)).then(|| options.to_vec())
     }
 
     pub fn set_detected_agent_process_at(
@@ -426,6 +536,14 @@ impl TerminalState {
             };
         }
         self.detected_agent = agent;
+        if agent.is_some()
+            && self
+                .agent_launch
+                .as_ref()
+                .is_some_and(|launch| Some(launch.agent) != agent)
+        {
+            self.set_agent_launch(None);
+        }
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
         }
@@ -557,6 +675,15 @@ impl TerminalState {
                     })
             {
                 self.persisted_agent_session = None;
+            }
+            if !newer_custom_authority
+                && agent.is_some()
+                && self
+                    .agent_launch
+                    .as_ref()
+                    .is_some_and(|launch| Some(launch.agent) == agent)
+            {
+                self.set_agent_launch(None);
             }
             if !newer_custom_authority
                 && agent.is_some()
@@ -2479,6 +2606,109 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    fn known_options(options: &[&str]) -> crate::agent_resume::AgentLaunchOptions {
+        crate::agent_resume::AgentLaunchOptions::Known(
+            options.iter().map(|option| option.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn agent_launch_observation_replaces_records_for_new_processes() {
+        let mut terminal = test_terminal();
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        let first_revision = terminal.agent_launch_revision();
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--bypass".to_string()])
+        );
+
+        // The same process observed again changes nothing.
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&[]));
+        assert_eq!(terminal.agent_launch_revision(), first_revision);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--bypass".to_string()])
+        );
+
+        // A replacement Claude process in a new process group replaces them.
+        terminal.observe_agent_launch(Agent::Claude, 11, known_options(&[]));
+        assert_ne!(terminal.agent_launch_revision(), first_revision);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(Vec::new())
+        );
+
+        // A different agent replaces them too, and they never apply to Claude.
+        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--search"]));
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--search".to_string()])
+        );
+    }
+
+    #[test]
+    fn seeded_agent_launch_binds_to_the_first_observed_process() {
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]));
+        let seeded_revision = terminal.agent_launch_revision();
+
+        // Where the command line cannot be read, the seeded options stay.
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            20,
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            ),
+        );
+        let launch = terminal.agent_launch().unwrap();
+        assert_eq!(launch.process_group_id, Some(20));
+        assert_eq!(launch.options, known_options(&["--seeded"]));
+        assert_eq!(terminal.agent_launch_revision(), seeded_revision);
+
+        // Once bound, a later process does not inherit them.
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            21,
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            ),
+        );
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
+
+        // A readable command line replaces seeded options.
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]));
+        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]));
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--observed".to_string()])
+        );
+    }
+
+    #[test]
+    fn agent_launch_is_cleared_when_the_agent_exits_or_changes() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        assert!(terminal.agent_launch().is_none());
+
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        let revision = terminal.agent_launch_revision();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        assert!(terminal.agent_launch().is_none());
+        assert_ne!(terminal.agent_launch_revision(), revision);
     }
 
     #[test]

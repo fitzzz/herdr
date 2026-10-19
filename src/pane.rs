@@ -290,6 +290,49 @@ async fn publish_agent_process_detected_event(
     }
 }
 
+/// Claude and Codex restore repeats the options read from the agent's command
+/// line, so each new agent process is reported once. Returns the observation to
+/// publish, if any.
+fn agent_launch_observation(
+    agent: Option<Agent>,
+    process_group_id: Option<u32>,
+    last_published: &mut Option<(Agent, u32)>,
+) -> Option<(Agent, u32)> {
+    let Some(agent) = agent.filter(|agent| matches!(agent, Agent::Claude | Agent::Codex)) else {
+        *last_published = None;
+        return None;
+    };
+    let observation = (agent, process_group_id?);
+    if *last_published == Some(observation) {
+        return None;
+    }
+    *last_published = Some(observation);
+    Some(observation)
+}
+
+async fn publish_agent_launch_observed_event(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    (agent, process_group_id): (Agent, u32),
+    argv: Option<Vec<String>>,
+) {
+    if let Err(e) = state_events
+        .send(AppEvent::AgentLaunchObserved {
+            pane_id,
+            agent,
+            process_group_id,
+            argv,
+        })
+        .await
+    {
+        warn!(
+            pane = pane_id.raw(),
+            err = %e,
+            "failed to deliver AgentLaunchObserved event"
+        );
+    }
+}
+
 async fn publish_codex_prompt_observation(
     state_events: &mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -661,24 +704,29 @@ struct ProcessProbeResult {
     foreground_is_pane_shell: bool,
     agent: Option<Agent>,
     process_name: Option<String>,
+    /// Command line of the process identified as the agent, moved out of the
+    /// probed job. `None` when the platform did not read it.
+    agent_argv: Option<Vec<String>>,
 }
 
+/// The hinted agent and the pid of the job member whose hint named it.
 fn agent_hint_for_foreground_job_members(
     job: &crate::platform::ForegroundJob,
     read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<Agent> {
+) -> Option<(Agent, u32)> {
     read_hint(job.process_group_id)
+        .map(|agent| (agent, job.process_group_id))
         .or_else(|| agent_hint_for_non_leader_foreground_job_members(job, read_hint))
 }
 
 fn agent_hint_for_non_leader_foreground_job_members(
     job: &crate::platform::ForegroundJob,
     read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<Agent> {
+) -> Option<(Agent, u32)> {
     job.processes
         .iter()
         .filter(|process| process.pid != job.process_group_id)
-        .find_map(|process| read_hint(process.pid))
+        .find_map(|process| read_hint(process.pid).map(|agent| (agent, process.pid)))
 }
 
 fn identify_process_group_leader_in_job(
@@ -696,30 +744,40 @@ fn identify_process_group_leader_in_job(
 }
 
 fn process_probe_result(
-    job: &crate::platform::ForegroundJob,
+    mut job: crate::platform::ForegroundJob,
     pid: u32,
     agent: Agent,
     process_name: String,
+    agent_pid: u32,
 ) -> ProcessProbeResult {
+    let agent_argv = job
+        .processes
+        .iter_mut()
+        .find(|process| process.pid == agent_pid)
+        .and_then(|process| process.argv.take());
     ProcessProbeResult {
         process_group_id: Some(job.process_group_id),
         foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
         agent: Some(agent),
         process_name: Some(process_name),
+        agent_argv,
     }
 }
 
 fn hinted_process_probe_result(
-    job: &crate::platform::ForegroundJob,
+    job: crate::platform::ForegroundJob,
     pid: u32,
     read_hint: impl Fn(u32) -> Option<Agent>,
-) -> Option<ProcessProbeResult> {
-    let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
-    Some(process_probe_result(
+) -> Result<ProcessProbeResult, crate::platform::ForegroundJob> {
+    let Some((agent, agent_pid)) = agent_hint_for_foreground_job_members(&job, read_hint) else {
+        return Err(job);
+    };
+    Ok(process_probe_result(
         job,
         pid,
         agent,
         crate::detect::agent_label(agent).to_string(),
+        agent_pid,
     ))
 }
 
@@ -730,43 +788,57 @@ fn probe_foreground_process_from_jobs(
     foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
 ) -> ProcessProbeResult {
-    if let Some(job) = leader_job.as_ref() {
-        if let Some(hinted) = hinted_process_probe_result(job, pid, read_hint) {
-            return hinted;
-        }
-        if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+    if let Some(job) = leader_job {
+        let job = match hinted_process_probe_result(job, pid, read_hint) {
+            Ok(hinted) => return hinted,
+            Err(job) => job,
+        };
+        if let Some((agent, process_name, index)) =
+            crate::detect::identify_agent_process_in_job(&job)
+        {
+            let agent_pid = job.processes[index].pid;
+            return process_probe_result(job, pid, agent, process_name, agent_pid);
         }
     }
 
-    let foreground_job = foreground_job();
-    if let Some(job) = foreground_job.as_ref() {
+    if let Some(mut job) = foreground_job() {
         if let Some(agent) = read_hint(job.process_group_id) {
+            let agent_pid = job.process_group_id;
             return process_probe_result(
                 job,
                 pid,
                 agent,
                 crate::detect::agent_label(agent).to_string(),
+                agent_pid,
             );
         }
-        if let Some((agent, process_name)) = identify_process_group_leader_in_job(job) {
-            return process_probe_result(job, pid, agent, process_name);
+        if let Some((agent, process_name)) = identify_process_group_leader_in_job(&job) {
+            let agent_pid = job.process_group_id;
+            return process_probe_result(job, pid, agent, process_name, agent_pid);
         }
-        if let Some(agent) = agent_hint_for_non_leader_foreground_job_members(job, read_hint) {
+        if let Some((agent, agent_pid)) =
+            agent_hint_for_non_leader_foreground_job_members(&job, read_hint)
+        {
             return process_probe_result(
                 job,
                 pid,
                 agent,
                 crate::detect::agent_label(agent).to_string(),
+                agent_pid,
             );
         }
 
-        let identified = crate::detect::identify_agent_in_job(job);
+        let identified = crate::detect::identify_agent_process_in_job(&job);
+        let agent_argv = identified
+            .as_ref()
+            .and_then(|(_, _, index)| job.processes.get_mut(*index))
+            .and_then(|process| process.argv.take());
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
-            agent: identified.as_ref().map(|(agent, _)| *agent),
-            process_name: identified.map(|(_, process_name)| process_name),
+            agent: identified.as_ref().map(|(agent, _, _)| *agent),
+            process_name: identified.map(|(_, process_name, _)| process_name),
+            agent_argv,
         };
     }
 
@@ -775,6 +847,7 @@ fn probe_foreground_process_from_jobs(
         foreground_is_pane_shell: false,
         agent: None,
         process_name: None,
+        agent_argv: None,
     }
 }
 
@@ -816,6 +889,7 @@ fn spawn_basic_detection_task(
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
+        let mut last_agent_launch_observation = None;
         let mut has_process_probe = false;
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
@@ -850,6 +924,7 @@ fn spawn_basic_detection_task(
                     last_visible_signal_refresh = None;
                     last_process_check = std::time::Instant::now();
                     last_foreground_pgid = None;
+                    last_agent_launch_observation = None;
                     has_process_probe = false;
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -982,6 +1057,19 @@ fn spawn_basic_detection_task(
                             agent_startup_grace_until = None;
                         }
                     }
+                }
+                if let Some(observation) = agent_launch_observation(
+                    new_agent,
+                    process_group_id,
+                    &mut last_agent_launch_observation,
+                ) {
+                    publish_agent_launch_observed_event(
+                        &state_events,
+                        pane_id,
+                        observation,
+                        probe.agent_argv,
+                    )
+                    .await;
                 }
             }
 
@@ -2729,6 +2817,7 @@ impl PaneRuntime {
                 #[cfg(windows)]
                 let mut last_observation = (Instant::now(), Some(0));
                 let mut last_foreground_pgid = None;
+                let mut last_agent_launch_observation = None;
                 let mut has_process_probe = false;
                 let mut acquisition_started_at = None;
                 let mut last_content_change_at = None;
@@ -2773,6 +2862,7 @@ impl PaneRuntime {
                             state = AgentState::Unknown;
                             last_visible_idle = false;
                             last_foreground_pgid = None;
+                            last_agent_launch_observation = None;
                             has_process_probe = false;
                             acquisition_started_at = None;
                             last_content_change_at = None;
@@ -2969,6 +3059,19 @@ impl PaneRuntime {
                                     );
                                 }
                                 agent_changed = true;
+                            }
+                            if let Some(observation) = agent_launch_observation(
+                                new_agent,
+                                process_group_id,
+                                &mut last_agent_launch_observation,
+                            ) {
+                                publish_agent_launch_observed_event(
+                                    &state_events,
+                                    pane_id,
+                                    observation,
+                                    probe.agent_argv,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -5170,7 +5273,7 @@ mod tests {
             agent_hint_for_foreground_job_members(&job, |pid| {
                 (pid == 42).then_some(Agent::Claude)
             }),
-            Some(Agent::Claude)
+            Some((Agent::Claude, 42))
         );
     }
 
@@ -5188,7 +5291,7 @@ mod tests {
             agent_hint_for_foreground_job_members(&job, |pid| {
                 (pid == 100).then_some(Agent::Codex)
             }),
-            Some(Agent::Codex)
+            Some((Agent::Codex, 100))
         );
     }
 
@@ -5272,6 +5375,111 @@ mod tests {
 
         assert_eq!(result.agent, Some(Agent::Claude));
         assert_eq!(result.process_name.as_deref(), Some("claude"));
+    }
+
+    fn foreground_process_with_argv(
+        pid: u32,
+        name: &str,
+        argv: &[&str],
+    ) -> crate::platform::ForegroundProcess {
+        crate::platform::ForegroundProcess {
+            argv: Some(argv.iter().map(|arg| arg.to_string()).collect()),
+            ..foreground_process(pid, name)
+        }
+    }
+
+    #[test]
+    fn process_probe_carries_the_identified_agent_argv() {
+        let job = || crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process_with_argv(99, "sh", &["sh", "-c", "wrapper"]),
+                foreground_process_with_argv(100, "claude", &["claude", "--placeholder"]),
+            ],
+        };
+
+        let identified =
+            probe_foreground_process_from_jobs(42, Some(99), None, || Some(job()), |_| None);
+        assert_eq!(identified.agent, Some(Agent::Claude));
+        assert_eq!(
+            identified.agent_argv,
+            Some(vec!["claude".to_string(), "--placeholder".to_string()])
+        );
+
+        let hinted = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(job()),
+            |pid| (pid == 100).then_some(Agent::Codex),
+        );
+        assert_eq!(hinted.agent, Some(Agent::Codex));
+        assert_eq!(
+            hinted.agent_argv,
+            Some(vec!["claude".to_string(), "--placeholder".to_string()])
+        );
+
+        let leader = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process_with_argv(99, "codex", &["codex", "-a"])],
+        };
+        let leader_result =
+            probe_foreground_process_from_jobs(42, Some(99), Some(leader), || None, |_| None);
+        assert_eq!(leader_result.agent, Some(Agent::Codex));
+        assert_eq!(
+            leader_result.agent_argv,
+            Some(vec!["codex".to_string(), "-a".to_string()])
+        );
+
+        let unread = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            Some(crate::platform::ForegroundJob {
+                process_group_id: 99,
+                processes: vec![foreground_process(99, "codex")],
+            }),
+            || None,
+            |_| None,
+        );
+        assert_eq!(unread.agent, Some(Agent::Codex));
+        assert_eq!(unread.agent_argv, None);
+    }
+
+    #[test]
+    fn agent_launch_observation_publishes_each_claude_or_codex_process_once() {
+        let mut last = None;
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), &mut last),
+            Some((Agent::Claude, 10))
+        );
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), &mut last),
+            None
+        );
+        // A replacement process of the same kind is a new observation.
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(11), &mut last),
+            Some((Agent::Claude, 11))
+        );
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Codex), Some(11), &mut last),
+            Some((Agent::Codex, 11))
+        );
+        // Other agents carry no launch options and reset the tracking.
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Pi), Some(12), &mut last),
+            None
+        );
+        assert_eq!(last, None);
+        assert_eq!(agent_launch_observation(None, Some(11), &mut last), None);
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Codex), Some(11), &mut last),
+            Some((Agent::Codex, 11))
+        );
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Codex), None, &mut last),
+            None
+        );
     }
 
     fn process_probe_input() -> ProcessProbeInput {

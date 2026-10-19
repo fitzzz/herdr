@@ -247,22 +247,31 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
 }
 
 pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
-    if let Some(process) = job
+    identify_agent_process_in_job(job).map(|(agent, name, _)| (agent, name))
+}
+
+/// Like [`identify_agent_in_job`], plus the index in `job.processes` of the
+/// process identified as the agent.
+pub fn identify_agent_process_in_job(
+    job: &crate::platform::ForegroundJob,
+) -> Option<(Agent, String, usize)> {
+    if let Some((index, process)) = job
         .processes
         .iter()
-        .find(|process| process.pid == job.process_group_id)
+        .enumerate()
+        .find(|(_, process)| process.pid == job.process_group_id)
     {
         let candidate = normalized_process_name(process);
         if let Some(agent) = identify_agent(&candidate) {
             if agent != Agent::Letta || is_interactive_letta_process(process) {
-                return Some((agent, candidate));
+                return Some((agent, candidate, index));
             }
         }
     }
 
-    let mut best: Option<(u8, Agent, String)> = None;
+    let mut best: Option<(u8, Agent, String, usize)> = None;
 
-    for process in &job.processes {
+    for (index, process) in job.processes.iter().enumerate() {
         let candidate = normalized_process_name(process);
         let Some(agent) = identify_agent(&candidate) else {
             continue;
@@ -273,12 +282,12 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
         let score = process_priority(process, &candidate);
 
         match &best {
-            Some((best_score, _, _)) if *best_score >= score => {}
-            _ => best = Some((score, agent, candidate)),
+            Some((best_score, _, _, _)) if *best_score >= score => {}
+            _ => best = Some((score, agent, candidate, index)),
         }
     }
 
-    best.map(|(_, agent, name)| (agent, name))
+    best.map(|(_, agent, name, index)| (agent, name, index))
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.

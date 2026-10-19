@@ -2923,6 +2923,54 @@ mod tests {
         );
     }
 
+    // needs W1 parser: expects `--model placeholder-model resume codex-session`
+    // to parse to the options `--model placeholder-model`.
+    #[tokio::test]
+    async fn agent_start_records_codex_launch_options() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-start-launch-options");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_start_launch_options".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                kind: "codex".into(),
+                pane_id,
+                args: vec![
+                    "--model".into(),
+                    "placeholder-model".into(),
+                    "resume".into(),
+                    "codex-session".into(),
+                ],
+                timeout_ms: Some(4_000),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        let terminal = &app.state.terminals[&terminal_id];
+        let launch = terminal
+            .agent_launch()
+            .expect("launch options should be seeded");
+        assert_eq!(launch.agent, crate::detect::Agent::Codex);
+        assert_eq!(launch.process_group_id, None);
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--model".to_string(), "placeholder-model".to_string()])
+        );
+    }
+
     #[test]
     fn pane_close_request_closes_only_the_target_tab_when_other_tabs_exist() {
         let mut app = test_app();

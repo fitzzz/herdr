@@ -263,7 +263,13 @@ impl App {
             return true;
         }
 
-        let runtime = match crate::terminal::TerminalRuntime::spawn(
+        let launch_options_notice = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.agent_launch_restore)
+            .and_then(|outcome| launch_options_notice(&plan.agent, outcome));
+        let runtime = match crate::terminal::TerminalRuntime::spawn_with_initial_history(
             pane_id,
             rows,
             cols,
@@ -273,6 +279,7 @@ impl App {
             self.state.host_terminal_appearance,
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             &launch_env,
+            launch_options_notice.as_deref(),
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -316,6 +323,41 @@ impl App {
         }
         true
     }
+}
+
+/// The line written into a restored pane whose agent resumed without the
+/// options it was launched with, so the user can relaunch it in the right mode.
+fn launch_options_notice(
+    agent: &str,
+    outcome: crate::agent_resume::LaunchOptionsRestore,
+) -> Option<String> {
+    use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+    let LaunchOptionsRestore::NotKept(reason) = outcome else {
+        return None;
+    };
+    let reason = match reason {
+        LaunchOptionsUnavailable::NotRecorded => "Herdr had not recorded them",
+        LaunchOptionsUnavailable::CommandLineUnreadable => {
+            "Herdr cannot read the agent's command line here"
+        }
+        LaunchOptionsUnavailable::UnrecognizedCommand => {
+            "Herdr did not recognize the agent's command line"
+        }
+        LaunchOptionsUnavailable::UnsupportedOption => {
+            "they include an option Herdr does not support"
+        }
+        LaunchOptionsUnavailable::ExceedsResumeLimits => "they do not fit in the restore command",
+    };
+    let agent = match crate::detect::parse_agent_label(agent) {
+        Some(crate::detect::Agent::Claude) => "Claude",
+        Some(crate::detect::Agent::Codex) => "Codex",
+        _ => agent,
+    };
+    Some(format!(
+        "\x1b[33mHerdr: this {agent} conversation was resumed without its launch options \
+         ({reason}). Relaunch it with the permission mode and options you need.\x1b[0m\r\n"
+    ))
 }
 
 fn derived_pending_agent_resume_pane_infos(
@@ -950,6 +992,83 @@ mod tests {
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn launch_options_notice_explains_each_fallback_and_skips_kept_options() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        assert_eq!(
+            launch_options_notice("claude", LaunchOptionsRestore::Kept),
+            None
+        );
+        let notice = launch_options_notice(
+            "claude",
+            LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::NotRecorded),
+        )
+        .unwrap();
+        assert!(notice.contains("Herdr: this Claude conversation was resumed without its launch options (Herdr had not recorded them)."));
+        assert!(notice.ends_with("\r\n"));
+        for reason in [
+            LaunchOptionsUnavailable::CommandLineUnreadable,
+            LaunchOptionsUnavailable::UnrecognizedCommand,
+            LaunchOptionsUnavailable::UnsupportedOption,
+            LaunchOptionsUnavailable::ExceedsResumeLimits,
+        ] {
+            let notice =
+                launch_options_notice("codex", LaunchOptionsRestore::NotKept(reason)).unwrap();
+            assert!(notice.contains("this Codex conversation"), "{reason:?}");
+            assert!(notice.contains("Relaunch it with the permission mode"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resume_writes_launch_options_notice_before_resume() {
+        for (outcome, expect_notice) in [
+            (
+                crate::agent_resume::LaunchOptionsRestore::NotKept(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                true,
+            ),
+            (crate::agent_resume::LaunchOptionsRestore::Kept, false),
+        ] {
+            let mut app = test_app();
+            let workspace = crate::workspace::Workspace::test_new("restored");
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+            app.state.view.pane_infos = workspace.tabs[0]
+                .layout
+                .panes(ratatui::layout::Rect::new(0, 0, 200, 30));
+            app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 200, 30);
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            });
+            terminal.agent_launch_restore = Some(outcome);
+
+            assert!(app.start_pending_agent_resumes(Instant::now(), true));
+            let text = app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .visible_text();
+            assert_eq!(
+                text.contains("resumed without its launch options"),
+                expect_notice,
+                "{outcome:?}: {text}"
+            );
+
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
         }
     }
 
