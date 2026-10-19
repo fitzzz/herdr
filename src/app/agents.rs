@@ -225,7 +225,7 @@ impl App {
             terminal.set_managed_agent_launch_session(session);
         }
         if let Some(options) = launch_options {
-            terminal.seed_agent_launch(kind, options);
+            terminal.seed_agent_launch(kind, options, false);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();

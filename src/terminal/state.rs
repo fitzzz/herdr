@@ -124,6 +124,8 @@ pub struct ObservedAgentLaunch {
     /// `herdr agent start` to the process that runs the agent.
     pub process_group_id: Option<u32>,
     pub options: crate::agent_resume::AgentLaunchOptions,
+    /// Seeded by a restore that fell back to the bare resume command.
+    pub bare_resume: bool,
 }
 
 impl ObservedAgentLaunch {
@@ -263,11 +265,13 @@ impl TerminalState {
         &mut self,
         agent: Agent,
         options: crate::agent_resume::AgentLaunchOptions,
+        bare_resume: bool,
     ) {
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             process_group_id: None,
             options,
+            bare_resume,
         }));
     }
 
@@ -285,14 +289,24 @@ impl TerminalState {
                 return;
             }
             // A seeded record keeps its options when this platform cannot
-            // read the process command line (WSL).
+            // read the process command line (WSL), and when it was seeded by a
+            // restore that fell back to the bare resume command, whose process
+            // shows no options because Herdr typed it. Any other seed takes
+            // what the process shows, so a fresh bare agent never inherits
+            // options from a resumed one that already exited.
             Some(current)
                 if current.agent == agent
                     && current.process_group_id.is_none()
-                    && options
-                        == crate::agent_resume::AgentLaunchOptions::Unavailable(
+                    && (matches!(
+                        options,
+                        crate::agent_resume::AgentLaunchOptions::Unavailable(
                             crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
-                        ) =>
+                        )
+                    ) || current.bare_resume
+                        && matches!(
+                            &options,
+                            crate::agent_resume::AgentLaunchOptions::Known(observed) if observed.is_empty()
+                        )) =>
             {
                 current.options.clone()
             }
@@ -302,6 +316,7 @@ impl TerminalState {
             agent,
             process_group_id: Some(process_group_id),
             options,
+            bare_resume: false,
         }));
     }
 
@@ -2652,7 +2667,7 @@ mod tests {
     #[test]
     fn seeded_agent_launch_binds_to_the_first_observed_process() {
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]));
+        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]), false);
         let seeded_revision = terminal.agent_launch_revision();
 
         // Where the command line cannot be read, the seeded options stay.
@@ -2680,11 +2695,70 @@ mod tests {
 
         // A readable command line replaces seeded options.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]));
+        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]), false);
         terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]));
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--observed".to_string()])
+        );
+    }
+
+    #[test]
+    fn seeded_agent_launch_survives_the_bare_resume_process() {
+        // A fallback restore seeds unknown options; the bare resume process
+        // Herdr typed must not turn them into "launched with no options".
+        let mut terminal = test_terminal();
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        let launch = terminal.agent_launch().unwrap();
+        assert_eq!(launch.process_group_id, Some(40));
+        assert_eq!(launch.options, not_recorded);
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+
+        // Saved options that did not fit the restore command stay saved.
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(
+            Agent::Codex,
+            known_options(&["--placeholder-a", "--placeholder-b"]),
+            true,
+        );
+        terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]));
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec![
+                "--placeholder-a".to_string(),
+                "--placeholder-b".to_string()
+            ])
+        );
+
+        // Any options the process does show replace the seed.
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(Agent::Claude, not_recorded, true);
+        terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]));
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--other".to_string()])
+        );
+    }
+
+    #[test]
+    fn kept_or_started_agent_launch_takes_an_empty_observation() {
+        // A seed from a restore that kept its options, or from `herdr agent
+        // start`, may outlive its process; a bare agent typed afterwards must
+        // not inherit its options.
+        let mut terminal = test_terminal();
+        terminal.seed_agent_launch(
+            Agent::Claude,
+            known_options(&["--placeholder-a", "--placeholder-b"]),
+            false,
+        );
+        terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]));
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(Vec::new())
         );
     }
 
