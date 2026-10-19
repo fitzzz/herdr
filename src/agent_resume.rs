@@ -150,6 +150,69 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
+/// The options a Claude or Codex process was launched with, without the parts
+/// that pick or start a conversation, a one-time prompt, or print-and-exit mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentLaunchOptions {
+    Known(Vec<String>),
+    Unavailable(LaunchOptionsUnavailable),
+}
+
+/// Why restore cannot repeat an agent's launch options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchOptionsUnavailable {
+    /// Nothing recorded them, for example a session file from an older Herdr.
+    NotRecorded,
+    /// Herdr does not read this process's command line, for example inside WSL.
+    CommandLineUnreadable,
+    /// The command line does not have a shape Herdr knows for this agent.
+    UnrecognizedCommand,
+    /// An option Herdr cannot classify, so it cannot tell its value from a prompt.
+    UnsupportedOption,
+    /// The options do not fit the restore command limits.
+    ExceedsResumeLimits,
+}
+
+/// Whether a Claude or Codex restore repeated the agent's launch options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchOptionsRestore {
+    Kept,
+    NotKept(LaunchOptionsUnavailable),
+}
+
+/// Launch options from a running process's full command line (`argv[0]`
+/// included). `None` for agents whose restore does not carry launch options.
+pub fn launch_options_from_process_argv(
+    agent: crate::detect::Agent,
+    argv: Option<&[String]>,
+) -> Option<AgentLaunchOptions> {
+    let _ = (agent, argv);
+    None
+}
+
+/// Launch options from the arguments after the agent executable, as given to
+/// `herdr agent start -- <args>`. `None` for agents whose restore does not
+/// carry launch options.
+pub fn launch_options_from_agent_args(
+    agent: crate::detect::Agent,
+    args: &[String],
+) -> Option<AgentLaunchOptions> {
+    let _ = (agent, args);
+    None
+}
+
+/// The restore plan for a saved session together with its launch options.
+/// The outcome is `None` for agents whose restore does not carry launch options.
+pub fn plan_with_launch_options(
+    source: &str,
+    agent: &str,
+    session_ref: &AgentSessionRef,
+    launch_options: Option<&[String]>,
+) -> Option<(AgentResumePlan, Option<LaunchOptionsRestore>)> {
+    let _ = launch_options;
+    plan(source, agent, session_ref).map(|plan| (plan, None))
+}
+
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(
