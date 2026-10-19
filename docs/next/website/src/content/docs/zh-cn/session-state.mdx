@@ -93,8 +93,8 @@ Herdr 会恢复通过当前官方 Herdr 集成上报了原生会话引用的窗�
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
-| Claude Code | `6` | `claude --resume <id>` |
-| Codex | `5` | `codex resume <id>` |
+| Claude Code | `6` | `claude <launch options> --resume <id>` |
+| Codex | `5` | `codex resume <id> <launch options>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
 | Grok CLI | `2` | `grok --resume <id>` |
 | GitHub Copilot CLI | `2` | `copilot --resume=<id>` |
@@ -108,6 +108,10 @@ Herdr 会恢复通过当前官方 Herdr 集成上报了原生会话引用的窗�
 | Kilo Code CLI | `1` | `kilo --session <id>` |
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
+
+Claude Code 和 Codex 会带着启动时的选项恢复,例如权限或审批模式、沙箱、模型、effort、额外目录、允许的工具以及 `-c` 配置覆盖。Herdr 从正在运行的智能体命令行读取这些选项,并按原样保存到会话文件中。它不包括选择或开始会话的部分(例如 `--resume`、`--continue` 或 `codex resume --last`),也不包括一次性提示词和打印后退出模式;保存的会话 ID 会取代它们。
+
+当 Herdr 不知道某个智能体的启动选项时,它会用不带 `<launch options>` 的基本恢复命令恢复会话,并在窗格中显示提示,方便你用需要的模式重新启动智能体。这种情况出现在旧版 Herdr 保存的会话文件、Herdr 不读取智能体命令行的 WSL 中、智能体使用了 Herdr 无法识别的选项启动,以及选项超出恢复命令限制(64 个参数、8 KiB、不含撇号)时。
 
 运行 `herdr integration status` 查看已安装的集成版本。用 `herdr integration install <agent>` 重新安装过期的集成。
 
