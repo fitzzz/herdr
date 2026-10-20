@@ -210,15 +210,7 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
 }
 
 fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
+    if super::is_plain_unix_word(value) {
         return value.to_string();
     }
 

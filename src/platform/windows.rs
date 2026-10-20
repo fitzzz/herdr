@@ -3273,6 +3273,34 @@ mod tests {
     }
 
     #[test]
+    fn cmd_restore_command_keeps_ampersands_and_spaced_values_in_one_argument() {
+        use base64::Engine as _;
+
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            "one & two".into(),
+            "--resume".into(),
+            "placeholder-session".into(),
+        ];
+        let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
+        assert!(!command.contains('&'), "{command}");
+        assert!(!command.contains("one two"), "{command}");
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&utf16).unwrap(),
+            "if((Get-Command claude -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& claude '--append-system-prompt' 'one & two' '--resume' 'placeholder-session'}else{Start-Process -FilePath claude -ArgumentList '--append-system-prompt \"one & two\" --resume placeholder-session' -NoNewWindow -Wait}"
+        );
+    }
+
+    #[test]
     fn windows_shells_round_trip_agent_arguments_through_a_real_command() {
         let _lock = crate::integration::integration_env_lock();
         let base = std::env::temp_dir().join(format!(

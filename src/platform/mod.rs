@@ -390,23 +390,17 @@ fn normalized_process_name(name: &str) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn is_powershell_process_name(name: &str) -> bool {
-    matches!(
-        normalized_process_name(name).as_str(),
-        "pwsh" | "powershell"
-    )
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_unix_shell_command(
     argv: &[String],
     shell_name: &str,
     quote_posix_arg: fn(&str) -> String,
 ) -> Option<String> {
-    let quote = if is_powershell_process_name(shell_name) {
-        quote_powershell_arg
-    } else {
-        quote_posix_arg
+    let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
+        "pwsh" | "powershell" => quote_powershell_arg,
+        "fish" => quote_fish_arg,
+        "csh" | "tcsh" => quote_csh_arg,
+        // Unknown names, including wrappers, keep POSIX quoting.
+        _ => quote_posix_arg,
     };
     let mut parts = argv.iter();
     let mut command = quote(parts.next()?);
@@ -415,6 +409,38 @@ pub(crate) fn interactive_unix_shell_command(
         command.push_str(&quote(part));
     }
     Some(command)
+}
+
+/// Inside fish single quotes `\\` and `\'` are escapes, so every backslash
+/// is doubled and every quote escaped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_fish_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// csh and tcsh expand `!` history references even inside single quotes, so a
+/// `!` is closed out of the quotes and escaped there, like a quote is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_csh_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''").replace('!', "'\\!'"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn is_plain_unix_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
 }
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
@@ -654,6 +680,62 @@ mod tests {
             interactive_shell_command(&argv, "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_quotes_backslashes_for_fish() {
+        let argv = vec![
+            "claude".into(),
+            "--settings".into(),
+            r#"{"pattern":"\\d"}"#.into(),
+            r"trailing\".into(),
+            "a'b".into(),
+        ];
+        assert_eq!(
+            interactive_shell_command(&argv, "fish").as_deref(),
+            Some(r#"claude --settings '{"pattern":"\\\\d"}' 'trailing\\' 'a\'b'"#)
+        );
+        assert_eq!(
+            interactive_shell_command(&argv, "/usr/bin/fish"),
+            interactive_shell_command(&argv, "fish")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_escapes_history_for_csh_and_tcsh() {
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            "wow! a'b".into(),
+            "plain".into(),
+        ];
+        for shell in ["csh", "tcsh", "-tcsh"] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(r"claude --append-system-prompt 'wow'\!' a'\''b' plain"),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_keeps_posix_quoting_for_sh_family_and_unknown_shells() {
+        let argv = vec![
+            "claude".into(),
+            r#"{"pattern":"\\d"}"#.into(),
+            "wow!".into(),
+            "a'b".into(),
+        ];
+        for shell in ["bash", "zsh", "sh", "/bin/sh", "my-shell-wrapper"] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(r#"claude '{"pattern":"\\d"}' 'wow!' 'a'\''b'"#),
+                "{shell}"
+            );
+        }
     }
 
     #[test]

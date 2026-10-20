@@ -233,7 +233,10 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        // The pane runs the configured shell, so the command is quoted for it.
+        let shell = crate::pane::pane_shell(&self.state.default_shell);
+        let Some(resume_command) = crate::platform::interactive_shell_command(&plan.argv, &shell)
+        else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -380,33 +383,6 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
         pane_inner.width.saturating_sub(1),
         pane_inner.height,
     )
-}
-
-fn shell_command_from_argv(argv: &[String]) -> Option<String> {
-    let mut parts = argv.iter();
-    let first = shell_quote(parts.next()?);
-    let mut command = first;
-    for part in parts {
-        command.push(' ');
-        command.push_str(&shell_quote(part));
-    }
-    Some(command)
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='
-            )
-    }) {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -1057,21 +1033,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shell_command_from_argv_quotes_resume_arguments() {
-        let argv = vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            "session with ' quote".to_string(),
-        ];
-
-        assert_eq!(
-            shell_command_from_argv(&argv).as_deref(),
-            Some("claude --resume 'session with '\\'' quote'")
-        );
-        assert_eq!(shell_command_from_argv(&[]), None);
-    }
-
+    #[cfg(unix)]
     #[test]
     fn empty_launch_option_value_is_restored_quoted() {
         let argv = [
@@ -1104,7 +1066,7 @@ mod tests {
             Some(crate::agent_resume::LaunchOptionsRestore::Kept)
         );
         assert_eq!(
-            shell_command_from_argv(&plan.argv).as_deref(),
+            crate::platform::interactive_shell_command(&plan.argv, "bash").as_deref(),
             Some("claude --append-system-prompt '' --permission-mode plan --resume claude-session")
         );
     }
