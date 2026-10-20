@@ -459,6 +459,13 @@ fn unavailable_restored_terminal(
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
+        // Seed the saved options so the next save keeps them until the
+        // directory comes back.
+        if let Some((agent, options, resumed_without_options)) =
+            restored_agent_launch(pane.agent_session.as_ref(), None, true, false)
+        {
+            terminal.seed_agent_launch(agent, options, resumed_without_options);
+        }
         if let Some(resume) = saved_reported_resume(pane) {
             terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
         }
@@ -923,12 +930,13 @@ fn restore_plan_for_snapshot(
 /// The launch options a restored terminal starts with, so a save before
 /// detection reads the agent's command line keeps them. A native restore that
 /// fell back to the bare command keeps its options unknown, so the next save
-/// does not record the bare command as the agent's launch options; a handoff
-/// pane keeps that mark from its saved session while the agent runs on.
+/// does not record the bare command as the agent's launch options. A handoff
+/// pane, whose agent runs on, and a pane whose directory is missing, which
+/// saves its session unchanged, keep that mark from their saved session.
 fn restored_agent_launch(
     session: Option<&PaneAgentSessionSnapshot>,
     native_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
-    imported: bool,
+    keep_saved_mark: bool,
     duplicate_agent_session: bool,
 ) -> Option<(
     crate::detect::Agent,
@@ -940,12 +948,10 @@ fn restored_agent_launch(
     }
     let session = session?;
     let agent = crate::detect::parse_agent_label(&session.agent)?;
-    // A handoff keeps the agent running, so it keeps the mark that a
-    // previous restore resumed it without its options.
     let resumed_without_options = match native_restore {
         Some(crate::agent_resume::LaunchOptionsRestore::NotKept(_)) => true,
         Some(crate::agent_resume::LaunchOptionsRestore::Kept) => false,
-        None => imported && session.resumed_without_launch_options,
+        None => keep_saved_mark && session.resumed_without_launch_options,
     };
     let options = match (&session.launch_options, native_restore) {
         (Some(saved), _) => crate::agent_resume::AgentLaunchOptions::Known(saved.clone()),
@@ -1724,6 +1730,41 @@ mod tests {
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
 
         assert!(restored_terminal_agent_session(Some(&session), true).is_none());
+    }
+
+    #[test]
+    fn unavailable_restored_terminal_keeps_saved_launch_options_for_the_next_save() {
+        let mut snapshot: SessionSnapshot = serde_json::from_str(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
+        let unavailable = |pane: &super::super::snapshot::PaneSnapshot| {
+            unavailable_restored_terminal(
+                Some(pane),
+                std::path::PathBuf::from("/placeholder/missing"),
+                "Saved directory is unavailable.".into(),
+            )
+        };
+
+        pane.agent_session = Some(launch_options_session(
+            "claude",
+            Some(placeholder_launch_options()),
+        ));
+        let terminal = unavailable(pane);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        assert!(!terminal.resumed_without_launch_options_for_session("claude"));
+
+        pane.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+            resumed_without_launch_options: true,
+            ..launch_options_session("codex", None)
+        });
+        let terminal = unavailable(pane);
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
+        assert!(terminal.resumed_without_launch_options_for_session("codex"));
     }
 
     #[tokio::test]
