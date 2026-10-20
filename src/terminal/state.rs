@@ -289,30 +289,47 @@ impl TerminalState {
         process_id: u32,
         options: crate::agent_resume::AgentLaunchOptions,
     ) {
+        let unreadable = matches!(
+            options,
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            )
+        );
         let (options, resumed_without_options) = match self.agent_launch.as_ref() {
-            Some(current) if current.agent == agent && current.process_id == Some(process_id) => {
+            // The same process is observed again only when its command line
+            // became readable; that replaces a record that could not read it.
+            Some(current)
+                if current.agent == agent
+                    && current.process_id == Some(process_id)
+                    && (unreadable
+                        || !matches!(
+                            current.options,
+                            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+                            )
+                        )) =>
+            {
                 return;
             }
             // A seeded record keeps its options, and its mark that the agent
             // was resumed without them, when this platform cannot read the
             // process command line (WSL), and when it was seeded by a restore
             // that fell back to the bare resume command, whose process shows
-            // no options because Herdr typed it. Any other seed takes what the
-            // process shows, so a fresh bare agent never inherits options from
-            // a resumed one that already exited.
+            // no options because Herdr typed it, or shows a command Herdr does
+            // not recognize (a wrapper named after the agent). Any other seed
+            // takes what the process shows, so a fresh bare agent never
+            // inherits options from a resumed one that already exited.
             Some(current)
                 if current.agent == agent
                     && current.process_id.is_none()
-                    && (matches!(
-                        options,
-                        crate::agent_resume::AgentLaunchOptions::Unavailable(
-                            crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
-                        )
-                    ) || current.resumed_without_options
-                        && matches!(
-                            &options,
-                            crate::agent_resume::AgentLaunchOptions::Known(observed) if observed.is_empty()
-                        )) =>
+                    && (unreadable
+                        || current.resumed_without_options
+                            && match &options {
+                                crate::agent_resume::AgentLaunchOptions::Known(observed) => {
+                                    observed.is_empty()
+                                }
+                                crate::agent_resume::AgentLaunchOptions::Unavailable(_) => true,
+                            }) =>
             {
                 (current.options.clone(), current.resumed_without_options)
             }
@@ -2713,6 +2730,61 @@ mod tests {
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-b".to_string()])
         );
+    }
+
+    #[test]
+    fn fallback_seed_keeps_its_mark_for_an_unrecognized_bare_process() {
+        let mut terminal = test_terminal();
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            100,
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::UnrecognizedCommand,
+            ),
+        );
+        let record = terminal.agent_launch().unwrap();
+        assert_eq!(record.process_id, Some(100));
+        assert_eq!(record.options, not_recorded);
+        assert!(terminal.resumed_without_launch_options());
+    }
+
+    #[test]
+    fn unreadable_launch_record_takes_a_later_readable_observation_of_the_same_process() {
+        let unreadable = || {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            )
+        };
+        let mut terminal = test_terminal();
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
+        assert_eq!(terminal.agent_launch().unwrap().options, unreadable());
+        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--placeholder"]));
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--placeholder".to_string()])
+        );
+        // A readable record is never downgraded by a later unreadable read.
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--placeholder".to_string()])
+        );
+
+        // A fallback seed bound through an unreadable read keeps its mark.
+        let mut terminal = test_terminal();
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.observe_agent_launch(Agent::Claude, 40, unreadable());
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
+        assert!(terminal.resumed_without_launch_options());
     }
 
     #[test]
