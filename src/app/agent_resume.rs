@@ -146,13 +146,8 @@ impl App {
         tab: &crate::workspace::Tab,
         terminal_area: Rect,
     ) -> Vec<crate::layout::PaneInfo> {
-        let mut pane_infos = derived_pending_agent_resume_pane_infos(
-            tab,
-            terminal_area,
-            self.state.pane_borders,
-            self.state.pane_gaps,
-            self.state.pane_outer_borders,
-        );
+        let mut pane_infos =
+            derived_pending_agent_resume_pane_infos(&self.state, tab, terminal_area);
 
         if self.state.active == Some(ws_idx)
             && self
@@ -354,21 +349,20 @@ fn launch_options_notice(
 }
 
 fn derived_pending_agent_resume_pane_infos(
+    state: &crate::app::AppState,
     tab: &crate::workspace::Tab,
     terminal_area: Rect,
-    pane_borders: crate::config::PaneBordersConfig,
-    pane_gaps: bool,
-    pane_outer_borders: bool,
 ) -> Vec<crate::layout::PaneInfo> {
     crate::ui::apply_pane_chrome(
         tab.layout.panes(terminal_area),
-        pane_borders,
-        pane_gaps,
-        pane_outer_borders,
+        state.pane_borders,
+        state.pane_gaps,
+        state.pane_outer_borders,
     )
     .into_iter()
     .map(|mut info| {
-        let pane_inner = crate::ui::pane_inner_rect(info.rect, info.borders);
+        let pane_inner =
+            crate::ui::pane_content_rect(&state.terminals, tab, info.id, info.rect, info.borders);
         info.inner_rect = stable_terminal_inner_rect(pane_inner);
         info
     })
