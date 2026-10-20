@@ -1370,8 +1370,6 @@ mod tests {
         )
     }
 
-    // needs W1 parser: expects plan_with_launch_options to place saved
-    // options in the fixed Claude and Codex resume command shapes.
     #[test]
     fn pane_restore_startup_resumes_with_saved_launch_options() {
         for (agent, expected) in [
@@ -1406,8 +1404,6 @@ mod tests {
         }
     }
 
-    // needs W1 parser: expects plan_with_launch_options to report a missing
-    // record as NotRecorded.
     #[test]
     fn pane_restore_startup_without_saved_launch_options_uses_bare_command() {
         for (agent, expected) in [

@@ -3337,8 +3337,6 @@ mod tests {
         );
     }
 
-    // needs W1 parser: expects `claude --model placeholder-model` to parse to
-    // the options `--model placeholder-model`.
     #[test]
     fn agent_launch_observed_event_records_options_from_the_command_line() {
         let mut state = app_with_workspaces(&["one"]);

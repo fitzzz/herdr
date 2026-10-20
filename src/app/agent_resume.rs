@@ -337,17 +337,10 @@ fn launch_options_notice(
         return None;
     };
     let reason = match reason {
-        LaunchOptionsUnavailable::NotRecorded => "Herdr had not recorded them",
-        LaunchOptionsUnavailable::CommandLineUnreadable => {
-            "Herdr cannot read the agent's command line here"
-        }
-        LaunchOptionsUnavailable::UnrecognizedCommand => {
-            "Herdr did not recognize the agent's command line"
-        }
-        LaunchOptionsUnavailable::UnsupportedOption => {
-            "they include an option Herdr does not support"
-        }
         LaunchOptionsUnavailable::ExceedsResumeLimits => "they do not fit in the restore command",
+        // Restore falls back only when the options were not saved or do not
+        // fit; options Herdr could not read are never saved.
+        _ => "Herdr had not recorded them",
     };
     let agent = match crate::detect::parse_agent_label(agent) {
         Some(crate::detect::Agent::Claude) => "Claude",
@@ -1010,17 +1003,15 @@ mod tests {
         .unwrap();
         assert!(notice.contains("Herdr: this Claude conversation was resumed without its launch options (Herdr had not recorded them)."));
         assert!(notice.ends_with("\r\n"));
-        for reason in [
-            LaunchOptionsUnavailable::CommandLineUnreadable,
-            LaunchOptionsUnavailable::UnrecognizedCommand,
-            LaunchOptionsUnavailable::UnsupportedOption,
-            LaunchOptionsUnavailable::ExceedsResumeLimits,
-        ] {
-            let notice =
-                launch_options_notice("codex", LaunchOptionsRestore::NotKept(reason)).unwrap();
-            assert!(notice.contains("this Codex conversation"), "{reason:?}");
-            assert!(notice.contains("Relaunch it with the permission mode"));
-        }
+        let notice = launch_options_notice(
+            "codex",
+            LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::ExceedsResumeLimits),
+        )
+        .unwrap();
+        assert!(notice.contains(
+            "this Codex conversation was resumed without its launch options (they do not fit in the restore command)."
+        ));
+        assert!(notice.contains("Relaunch it with the permission mode"));
     }
 
     #[cfg(unix)]

@@ -2923,8 +2923,6 @@ mod tests {
         );
     }
 
-    // needs W1 parser: expects `--model placeholder-model resume codex-session`
-    // to parse to the options `--model placeholder-model`.
     #[tokio::test]
     async fn agent_start_records_codex_launch_options() {
         let mut app = test_app();
