@@ -1445,14 +1445,14 @@ impl AppState {
             AppEvent::AgentLaunchObserved {
                 pane_id,
                 agent,
-                process_group_id,
+                process_id,
                 argv,
             } => {
                 if let Some(options) =
                     crate::agent_resume::launch_options_from_process_argv(agent, argv.as_deref())
                 {
                     self.update_terminal_state(pane_id, |terminal| {
-                        terminal.observe_agent_launch(agent, process_group_id, options);
+                        terminal.observe_agent_launch(agent, process_id, options);
                         None
                     });
                 }
@@ -3346,7 +3346,7 @@ mod tests {
         state.handle_app_event(AppEvent::AgentLaunchObserved {
             pane_id,
             agent: Agent::Claude,
-            process_group_id: 10,
+            process_id: 10,
             argv: Some(vec![
                 "claude".into(),
                 "--model".into(),

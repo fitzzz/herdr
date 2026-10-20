@@ -2351,7 +2351,7 @@ mod tests {
             .agent_launch()
             .expect("saved options should be seeded");
         assert_eq!(launch.agent, crate::detect::Agent::Codex);
-        assert_eq!(launch.process_group_id, None);
+        assert_eq!(launch.process_id, None);
         assert_eq!(
             launch.options,
             crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options())

@@ -2962,7 +2962,7 @@ mod tests {
             .agent_launch()
             .expect("launch options should be seeded");
         assert_eq!(launch.agent, crate::detect::Agent::Codex);
-        assert_eq!(launch.process_group_id, None);
+        assert_eq!(launch.process_id, None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--model".to_string(), "placeholder-model".to_string()])

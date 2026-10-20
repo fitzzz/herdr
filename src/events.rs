@@ -94,7 +94,7 @@ pub enum AppEvent {
     AgentLaunchObserved {
         pane_id: PaneId,
         agent: Agent,
-        process_group_id: u32,
+        process_id: u32,
         argv: Option<Vec<String>>,
     },
     /// The current Codex input screen is visible during managed startup.
