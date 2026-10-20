@@ -689,16 +689,23 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
 }
 
 fn process_argv(pid: u32) -> Option<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmdline_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// Splits `/proc/<pid>/cmdline` into arguments. Every argument ends in a NUL,
+/// so only the empty part after the final one is dropped; empty arguments
+/// such as `--append-system-prompt ''` stay in place.
+fn cmdline_argv(bytes: &[u8]) -> Option<Vec<String>> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
     if bytes.is_empty() {
         return None;
     }
-    let parts: Vec<String> = bytes
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
+    Some(
+        bytes
+            .split(|&b| b == 0)
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
 }
 
 /// Get the current working directory of a process.
@@ -2156,6 +2163,33 @@ mod tests {
         let args = std::fs::read_to_string(&path).expect("args file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(args, "--app-name\nHerdr\n--\n-danger\nbody\n");
+    }
+
+    #[test]
+    fn cmdline_argv_keeps_empty_arguments() {
+        assert_eq!(
+            cmdline_argv(b"claude\0--append-system-prompt\0\0--permission-mode\0plan\0"),
+            Some(
+                [
+                    "claude",
+                    "--append-system-prompt",
+                    "",
+                    "--permission-mode",
+                    "plan"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        // A trailing empty argument stays; only the terminator is dropped.
+        assert_eq!(
+            cmdline_argv(b"codex\0\0"),
+            Some(vec!["codex".to_string(), String::new()])
+        );
+        // A rewritten title without the final terminator still reads.
+        assert_eq!(cmdline_argv(b"claude"), Some(vec!["claude".to_string()]));
+        assert_eq!(cmdline_argv(b""), None);
+        assert_eq!(cmdline_argv(b"\0"), None);
     }
 
     #[test]

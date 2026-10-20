@@ -1077,4 +1077,41 @@ mod tests {
         );
         assert_eq!(shell_command_from_argv(&[]), None);
     }
+
+    #[test]
+    fn empty_launch_option_value_is_restored_quoted() {
+        let argv = [
+            "claude",
+            "--append-system-prompt",
+            "",
+            "--permission-mode",
+            "plan",
+        ]
+        .map(String::from);
+        let Some(crate::agent_resume::AgentLaunchOptions::Known(options)) =
+            crate::agent_resume::launch_options_from_process_argv(
+                crate::detect::Agent::Claude,
+                Some(&argv),
+            )
+        else {
+            panic!("an empty option value should parse");
+        };
+        assert_eq!(options, argv[1..].to_vec());
+        let session = crate::agent_resume::AgentSessionRef::id("claude-session").unwrap();
+        let (plan, outcome) = crate::agent_resume::plan_with_launch_options(
+            "herdr:claude",
+            "claude",
+            &session,
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
+        assert_eq!(
+            shell_command_from_argv(&plan.argv).as_deref(),
+            Some("claude --append-system-prompt '' --permission-mode plan --resume claude-session")
+        );
+    }
 }
