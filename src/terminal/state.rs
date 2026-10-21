@@ -191,6 +191,16 @@ fn session_for_process(
     }
 }
 
+/// The options a session restore or `herdr agent start` launched an agent
+/// with, seeded before detection sees its process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLaunchSeed {
+    pub agent: Agent,
+    pub options: crate::agent_resume::AgentLaunchOptions,
+    /// The restore fell back to the bare resume command.
+    pub resumed_without_options: bool,
+}
+
 /// The launch options of the Claude or Codex process running in a pane, kept
 /// so restore can repeat them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,18 +366,13 @@ impl TerminalState {
 
     /// Records the options a session restore or `herdr agent start` launched
     /// the agent with, before detection sees its process.
-    pub fn seed_agent_launch(
-        &mut self,
-        agent: Agent,
-        options: crate::agent_resume::AgentLaunchOptions,
-        resumed_without_options: bool,
-    ) {
+    pub fn seed_agent_launch(&mut self, seed: AgentLaunchSeed) {
         let session = self.current_session_ref().cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
-            agent,
+            agent: seed.agent,
             process_id: None,
-            options,
-            resumed_without_options,
+            options: seed.options,
+            resumed_without_options: seed.resumed_without_options,
             seen_session: session.clone(),
             session,
             earlier_session: None,
@@ -2881,7 +2886,11 @@ mod tests {
         let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
-        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded.clone(),
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
@@ -2904,7 +2913,11 @@ mod tests {
         let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
-        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded.clone(),
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(
             Agent::Claude,
             100,
@@ -2932,7 +2945,11 @@ mod tests {
                 session_ref: crate::agent_resume::AgentSessionRef::id("placeholder-session")
                     .unwrap(),
             });
-            terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: not_recorded.clone(),
+                resumed_without_options: true,
+            });
             terminal
         };
 
@@ -3218,11 +3235,11 @@ mod tests {
 
         // Started by `herdr agent start` with the same options.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(
-            Agent::Claude,
-            known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
-            false,
-        );
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
+            resumed_without_options: false,
+        });
         observe_launcher_then_agent(&mut terminal, None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3236,11 +3253,11 @@ mod tests {
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("placeholder-session").unwrap(),
         });
-        terminal.seed_agent_launch(
-            Agent::Claude,
-            known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
-            false,
-        );
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
+            resumed_without_options: false,
+        });
         observe_launcher_then_agent(&mut terminal, Some("placeholder-session"));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3294,7 +3311,11 @@ mod tests {
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded.clone(),
+            resumed_without_options: true,
+        });
         observe_launcher_then_agent(&mut terminal, None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
@@ -3328,7 +3349,11 @@ mod tests {
         let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
-        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded.clone(),
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(Agent::Claude, 40, unreadable(), None);
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
@@ -3338,7 +3363,11 @@ mod tests {
     #[test]
     fn seeded_agent_launch_binds_to_the_first_observed_process() {
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]), false);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Codex,
+            options: known_options(&["--seeded"]),
+            resumed_without_options: false,
+        });
         let seeded_revision = terminal.agent_launch_revision();
 
         // Where the command line cannot be read, the seeded options stay.
@@ -3368,7 +3397,11 @@ mod tests {
 
         // A readable command line replaces seeded options.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]), false);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Codex,
+            options: known_options(&["--seeded"]),
+            resumed_without_options: false,
+        });
         terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
@@ -3384,7 +3417,11 @@ mod tests {
         let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
-        terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded.clone(),
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         let launch = terminal.agent_launch().unwrap();
         assert_eq!(launch.process_id, Some(40));
@@ -3393,11 +3430,11 @@ mod tests {
 
         // Saved options that did not fit the restore command stay saved.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(
-            Agent::Codex,
-            known_options(&["--placeholder-a", "--placeholder-b"]),
-            true,
-        );
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Codex,
+            options: known_options(&["--placeholder-a", "--placeholder-b"]),
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
@@ -3409,7 +3446,11 @@ mod tests {
 
         // Any options the process does show replace the seed.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Claude, not_recorded, true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded,
+            resumed_without_options: true,
+        });
         terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]), None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3423,11 +3464,11 @@ mod tests {
         // start`, may outlive its process; a bare agent typed afterwards must
         // not inherit its options.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(
-            Agent::Claude,
-            known_options(&["--placeholder-a", "--placeholder-b"]),
-            false,
-        );
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: known_options(&["--placeholder-a", "--placeholder-b"]),
+            resumed_without_options: false,
+        });
         terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]), None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3445,7 +3486,11 @@ mod tests {
         let fallback = || {
             let mut terminal = test_terminal();
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-            terminal.seed_agent_launch(Agent::Claude, not_recorded(), true);
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: not_recorded(),
+                resumed_without_options: true,
+            });
             terminal
         };
 
@@ -3453,7 +3498,11 @@ mod tests {
         // bare resume process keeps it.
         let mut terminal = test_terminal();
         let revision = terminal.agent_launch_revision();
-        terminal.seed_agent_launch(Agent::Claude, not_recorded(), true);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: not_recorded(),
+            resumed_without_options: true,
+        });
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
@@ -3489,7 +3538,11 @@ mod tests {
 
         // A kept restore or `herdr agent start` seed never sets it.
         let mut terminal = test_terminal();
-        terminal.seed_agent_launch(Agent::Claude, known_options(&["--placeholder"]), false);
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: known_options(&["--placeholder"]),
+            resumed_without_options: false,
+        });
         assert!(!terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         assert!(!terminal.resumed_without_launch_options());

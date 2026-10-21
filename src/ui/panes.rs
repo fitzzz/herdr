@@ -1042,13 +1042,13 @@ mod tests {
             if let Some(label) = label {
                 terminal_state.set_manual_label(label.into());
             }
-            terminal_state.seed_agent_launch(
-                crate::detect::Agent::Claude,
-                crate::agent_resume::AgentLaunchOptions::Unavailable(
+            terminal_state.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options,
-            );
+            });
             app.terminals.insert(terminal_id, terminal_state);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 3)).unwrap();
@@ -1352,13 +1352,13 @@ mod tests {
                 Some(crate::detect::Agent::Claude),
                 crate::detect::AgentState::Idle,
             );
-            terminal.seed_agent_launch(
-                crate::detect::Agent::Claude,
-                crate::agent_resume::AgentLaunchOptions::Unavailable(
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
-                true,
-            );
+                resumed_without_options: true,
+            });
             let area = Rect::new(0, 0, 40, 8);
             let render = |app: &mut AppState| {
                 app.view.pane_infos = compute_pane_infos(
@@ -1415,13 +1415,13 @@ mod tests {
         app.terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .seed_agent_launch(
-                crate::detect::Agent::Claude,
-                crate::agent_resume::AgentLaunchOptions::Unavailable(
+            .seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
-                true,
-            );
+                resumed_without_options: true,
+            });
         let area = Rect::new(0, 0, 40, 8);
         app.view.pane_infos = compute_pane_infos(
             &app,

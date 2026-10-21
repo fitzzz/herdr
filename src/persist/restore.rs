@@ -463,10 +463,8 @@ fn unavailable_restored_terminal(
         }
         // Seed the saved options so the next save keeps them until the
         // directory comes back.
-        if let Some((agent, options, resumed_without_options)) =
-            restored_agent_launch(pane.agent_session.as_ref(), None, true, false)
-        {
-            terminal.seed_agent_launch(agent, options, resumed_without_options);
+        if let Some(seed) = restored_agent_launch(pane.agent_session.as_ref(), None, true, false) {
+            terminal.seed_agent_launch(seed);
         }
         if let Some(resume) = saved_reported_resume(pane) {
             terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
@@ -643,8 +641,8 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            if let Some((agent, options, resumed_without_options)) = restored_agent_launch {
-                terminal.seed_agent_launch(agent, options, resumed_without_options);
+            if let Some(seed) = restored_agent_launch {
+                terminal.seed_agent_launch(seed);
             }
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
@@ -752,8 +750,8 @@ fn restore_tab(
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
                 }
-                if let Some((agent, options, resumed_without_options)) = restored_agent_launch {
-                    terminal.seed_agent_launch(agent, options, resumed_without_options);
+                if let Some(seed) = restored_agent_launch {
+                    terminal.seed_agent_launch(seed);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -963,11 +961,7 @@ fn restored_agent_launch(
     native_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
     keep_saved_mark: bool,
     duplicate_agent_session: bool,
-) -> Option<(
-    crate::detect::Agent,
-    crate::agent_resume::AgentLaunchOptions,
-    bool,
-)> {
+) -> Option<crate::terminal::AgentLaunchSeed> {
     if duplicate_agent_session {
         return None;
     }
@@ -990,7 +984,11 @@ fn restored_agent_launch(
         }
         (None, _) => return None,
     };
-    Some((agent, options, resumed_without_options))
+    Some(crate::terminal::AgentLaunchSeed {
+        agent,
+        options,
+        resumed_without_options,
+    })
 }
 
 fn log_launch_options_restore(
@@ -1490,11 +1488,13 @@ mod tests {
                 false,
                 first.duplicate_agent_session
             ),
-            Some((
-                crate::detect::Agent::Claude,
-                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
-                false
-            ))
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options()
+                ),
+                resumed_without_options: false
+            })
         );
     }
 
@@ -1508,11 +1508,11 @@ mod tests {
         };
         assert_eq!(
             restored_agent_launch(Some(&flagged(None)), None, true, false),
-            Some((
-                crate::detect::Agent::Claude,
-                AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
-                true
-            ))
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true
+            })
         );
         assert_eq!(
             restored_agent_launch(
@@ -1521,11 +1521,11 @@ mod tests {
                 true,
                 false
             ),
-            Some((
-                crate::detect::Agent::Claude,
-                AgentLaunchOptions::Known(placeholder_launch_options()),
-                true
-            ))
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                resumed_without_options: true
+            })
         );
         assert_eq!(
             restored_agent_launch(Some(&flagged(None)), None, true, true),
@@ -1554,11 +1554,11 @@ mod tests {
         let not_recorded = LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::NotRecorded);
         assert_eq!(
             restored_agent_launch(Some(&without), Some(not_recorded), false, false),
-            Some((
-                crate::detect::Agent::Claude,
-                AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
-                true
-            ))
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true
+            })
         );
         assert_eq!(
             restored_agent_launch(Some(&without), None, false, false),
@@ -1578,11 +1578,11 @@ mod tests {
         ] {
             assert_eq!(
                 restored_agent_launch(Some(&saved), outcome, false, false),
-                Some((
-                    crate::detect::Agent::Codex,
-                    AgentLaunchOptions::Known(placeholder_launch_options()),
-                    bare_resume
-                )),
+                Some(crate::terminal::AgentLaunchSeed {
+                    agent: crate::detect::Agent::Codex,
+                    options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                    resumed_without_options: bare_resume
+                }),
                 "{outcome:?}"
             );
         }
@@ -2489,13 +2489,13 @@ mod tests {
                 session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
             });
             if flagged {
-                terminal.seed_agent_launch(
-                    crate::detect::Agent::Claude,
-                    crate::agent_resume::AgentLaunchOptions::Unavailable(
+                terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                    agent: crate::detect::Agent::Claude,
+                    options: crate::agent_resume::AgentLaunchOptions::Unavailable(
                         crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                     ),
-                    true,
-                );
+                    resumed_without_options: true,
+                });
             }
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,

@@ -225,7 +225,11 @@ impl App {
             terminal.set_managed_agent_launch_session(session);
         }
         if let Some(options) = launch_options {
-            terminal.seed_agent_launch(kind, options, false);
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: kind,
+                options,
+                resumed_without_options: false,
+            });
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();

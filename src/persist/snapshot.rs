@@ -1515,13 +1515,13 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .unwrap()
-                .seed_agent_launch(
-                    seed_agent,
-                    crate::agent_resume::AgentLaunchOptions::Unavailable(
+                .seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                    agent: seed_agent,
+                    options: crate::agent_resume::AgentLaunchOptions::Unavailable(
                         crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                     ),
-                    flagged,
-                );
+                    resumed_without_options: flagged,
+                });
             capture_from_state(&state).workspaces[0].tabs[0].panes[&root.raw()]
                 .agent_session
                 .as_ref()
