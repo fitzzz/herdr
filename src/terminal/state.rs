@@ -123,13 +123,20 @@ struct AgentNameOwner {
 /// wrapper named after the agent), or resumes the seeded conversation with
 /// options a wrapper added. Any other seed takes what the process shows, so a
 /// fresh agent never inherits options from a resumed one that already exited.
+/// A seed bound to a process while it still holds the seed's options is
+/// decided again when that process shows a better reading, such as the agent
+/// a launcher script execs in its own process.
 fn seed_keeps_record(
     seed: &ObservedAgentLaunch,
+    process_id: u32,
     observed: &crate::agent_resume::AgentLaunchOptions,
     resumed_session: Option<&str>,
 ) -> bool {
     use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
-    if seed.process_id.is_some() {
+    if seed
+        .process_id
+        .is_some_and(|bound| bound != process_id || seed.seed_reading.is_none())
+    {
         return false;
     }
     if matches!(
@@ -172,6 +179,9 @@ fn session_for_process(
     match previous.filter(|previous| previous.agent == agent) {
         // Another reading of the same process keeps the pairing it had.
         Some(previous) if previous.process_id == Some(process_id) => previous.session.clone(),
+        // A command line that resumes another conversation does not run the
+        // current one.
+        _ if resumed_session.is_some() => None,
         // A seed binds to the process it started: the same launch.
         Some(previous) if previous.process_id.is_none() => current_session.cloned(),
         // A new process owns the current conversation only when no earlier
@@ -223,6 +233,10 @@ pub struct ObservedAgentLaunch {
     /// The last conversation an earlier process owned, carried while this
     /// record is unpaired, so a later process is never paired with it.
     earlier_session: Option<crate::agent_resume::AgentSessionRef>,
+    /// While the record still holds a seed's options for its process, the
+    /// rank of the reading they were kept through, so a better reading of
+    /// that process decides again.
+    seed_reading: Option<u8>,
 }
 
 impl ObservedAgentLaunch {
@@ -376,6 +390,7 @@ impl TerminalState {
             seen_session: session.clone(),
             session,
             earlier_session: None,
+            seed_reading: None,
         }));
     }
 
@@ -400,6 +415,7 @@ impl TerminalState {
                 _ => 2,
             }
         }
+        let rank = reading_rank(&options);
         let current = self
             .agent_launch
             .as_ref()
@@ -409,15 +425,20 @@ impl TerminalState {
         // process; that replaces a record that could not read or place it.
         if current.is_some_and(|current| {
             current.process_id == Some(process_id)
-                && reading_rank(&options) <= reading_rank(&current.options)
+                && rank
+                    <= current
+                        .seed_reading
+                        .unwrap_or_else(|| reading_rank(&current.options))
         }) {
             return;
         }
-        let (options, resumed_without_options) = match current {
-            Some(current) if seed_keeps_record(current, &options, resumed_session) => {
-                (current.options.clone(), current.resumed_without_options)
-            }
-            _ => (options, false),
+        let (options, resumed_without_options, seed_reading) = match current {
+            Some(current) if seed_keeps_record(current, process_id, &options, resumed_session) => (
+                current.options.clone(),
+                current.resumed_without_options,
+                Some(rank),
+            ),
+            _ => (options, false, None),
         };
         let current_session = self.current_session_ref();
         let session = session_for_process(
@@ -448,6 +469,7 @@ impl TerminalState {
             session,
             seen_session,
             earlier_session,
+            seed_reading,
         }));
     }
 
@@ -2967,8 +2989,13 @@ mod tests {
         assert!(terminal.resumed_without_launch_options());
         assert_eq!(terminal.launch_options_for_session("claude"), None);
 
-        // A process resuming another conversation, or none, takes its own.
-        for resumed in [Some("placeholder-other"), None] {
+        // A process resuming another conversation, or none, takes its own
+        // options; one resuming another conversation does not run the seeded
+        // one, so they wait for its own conversation.
+        for (resumed, saved) in [
+            (Some("placeholder-other"), None),
+            (None, Some(vec!["--placeholder-wrapper".to_string()])),
+        ] {
             let mut terminal = seeded();
             terminal.observe_agent_launch(
                 Agent::Claude,
@@ -2978,9 +3005,10 @@ mod tests {
             );
             assert!(!terminal.resumed_without_launch_options());
             assert_eq!(
-                terminal.launch_options_for_session("claude"),
-                Some(vec!["--placeholder-wrapper".to_string()])
+                terminal.agent_launch().unwrap().options,
+                known_options(&["--placeholder-wrapper"])
             );
+            assert_eq!(terminal.launch_options_for_session("claude"), saved);
         }
     }
 
@@ -3000,6 +3028,7 @@ mod tests {
             session: session.map(id),
             seen_session: None,
             earlier_session: earlier_session.map(id),
+            seed_reading: None,
         }
     }
 
@@ -3014,8 +3043,33 @@ mod tests {
         let kept = launch_record(Agent::Claude, None, false, Some("seeded"), None);
         let fallback = launch_record(Agent::Claude, None, true, Some("seeded"), None);
         let bound = launch_record(Agent::Claude, Some(10), true, Some("seeded"), None);
+        let kept_through_launcher = ObservedAgentLaunch {
+            seed_reading: Some(1),
+            ..bound.clone()
+        };
         for (case, seed, observed, resumed, keeps) in [
             ("bound record is no seed", &bound, &unreadable, None, false),
+            (
+                "seed kept through this process, agent's own options",
+                &kept_through_launcher,
+                &wrapper,
+                None,
+                false,
+            ),
+            (
+                "seed kept through this process, no options",
+                &kept_through_launcher,
+                &empty,
+                None,
+                true,
+            ),
+            (
+                "seed kept through this process, resumes seeded",
+                &kept_through_launcher,
+                &wrapper,
+                Some("seeded"),
+                true,
+            ),
             ("kept seed, unreadable", &kept, &unreadable, None, true),
             ("kept seed, unrecognized", &kept, &unrecognized, None, false),
             ("kept seed, no options", &kept, &empty, None, false),
@@ -3063,8 +3117,14 @@ mod tests {
                 false,
             ),
         ] {
-            assert_eq!(seed_keeps_record(seed, observed, resumed), keeps, "{case}");
+            assert_eq!(
+                seed_keeps_record(seed, 10, observed, resumed),
+                keeps,
+                "{case}"
+            );
         }
+        // A seed kept through one process is bound to it.
+        assert!(!seed_keeps_record(&kept_through_launcher, 11, &empty, None));
     }
 
     #[test]
@@ -3167,6 +3227,30 @@ mod tests {
                 11,
                 Some("other"),
                 None,
+            ),
+            (
+                "first process resuming another one",
+                None,
+                Some(&current),
+                10,
+                Some("other"),
+                None,
+            ),
+            (
+                "seed's process resuming another one",
+                Some(&seed),
+                Some(&current),
+                10,
+                Some("other"),
+                None,
+            ),
+            (
+                "same process resuming another one keeps its pairing",
+                Some(&owner),
+                Some(&current),
+                10,
+                Some("other"),
+                Some("current"),
             ),
             (
                 "other agent's record",
@@ -3305,8 +3389,8 @@ mod tests {
         assert_eq!(terminal.agent_launch().unwrap().options, unrecognized);
         assert_eq!(terminal.agent_launch_revision(), revision);
 
-        // A fallback seed keeps its options and mark through the launcher and
-        // through the agent it execs.
+        // A fallback seed keeps its options and mark through a launcher that
+        // never execs.
         let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
@@ -3316,7 +3400,96 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
         });
+        for _ in 0..2 {
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                100,
+                crate::agent_resume::launch_options_from_process_argv(
+                    Agent::Claude,
+                    Some(&launcher),
+                )
+                .unwrap(),
+                None,
+            );
+        }
+        assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
+        assert!(terminal.resumed_without_launch_options());
+    }
+
+    #[test]
+    fn a_fork_of_the_seeded_conversation_does_not_keep_the_fallback_seed() {
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("placeholder-session").unwrap(),
+        });
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+            ),
+            resumed_without_options: true,
+        });
+        let argv = [
+            "claude",
+            "--resume",
+            "placeholder-session",
+            "--fork-session",
+            "--model",
+            "placeholder",
+        ]
+        .map(String::from);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            100,
+            crate::agent_resume::launch_options_from_process_argv(Agent::Claude, Some(&argv))
+                .unwrap(),
+            crate::agent_resume::resumed_session_from_process_argv(Agent::Claude, &argv).as_deref(),
+        );
+        assert_eq!(
+            terminal.agent_launch().unwrap().options,
+            known_options(&["--model", "placeholder"])
+        );
+        assert!(!terminal.resumed_without_launch_options());
+    }
+
+    #[test]
+    fn a_fallback_seed_kept_through_a_launcher_decides_again_on_the_agent_it_execs() {
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        let fallback_seed = |terminal: &mut TerminalState| {
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: not_recorded.clone(),
+                resumed_without_options: true,
+            });
+        };
+
+        // The agent shows options of its own: the user started it by hand.
+        let mut terminal = test_terminal();
+        fallback_seed(&mut terminal);
         observe_launcher_then_agent(&mut terminal, None);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(
+                ["--model", "placeholder", "--permission-mode", "plan"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert!(!terminal.resumed_without_launch_options());
+
+        // The agent resumes the seeded conversation: the restored process.
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("placeholder-session").unwrap(),
+        });
+        fallback_seed(&mut terminal);
+        observe_launcher_then_agent(&mut terminal, Some("placeholder-session"));
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
     }
