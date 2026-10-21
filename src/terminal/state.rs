@@ -164,41 +164,55 @@ fn resumes(
 }
 
 /// The conversation the launch record of `process_id` owns, given the record
-/// it replaces and the pane's current conversation.
+/// it replaces and the pane's current conversation, and the last conversation
+/// an earlier process owned, carried while the new record is unpaired.
 fn session_for_process(
     previous: Option<&ObservedAgentLaunch>,
     agent: Agent,
     current_session: Option<&crate::agent_resume::AgentSessionRef>,
     process_id: u32,
     resumed_session: Option<&str>,
-) -> Option<crate::agent_resume::AgentSessionRef> {
+) -> (
+    Option<crate::agent_resume::AgentSessionRef>,
+    Option<crate::agent_resume::AgentSessionRef>,
+) {
     // A command line that resumes the current conversation proves it runs it.
-    if resumes(resumed_session, current_session) {
-        return current_session.cloned();
+    let resumes_current = resumes(resumed_session, current_session);
+    let previous_of_agent = previous.filter(|previous| previous.agent == agent);
+    // Another reading of the same process keeps the pairing it had.
+    if let Some(previous) =
+        previous_of_agent.filter(|previous| previous.process_id == Some(process_id))
+    {
+        let session = if resumes_current {
+            current_session
+        } else {
+            previous.session.as_ref()
+        };
+        return (session.cloned(), previous.earlier_session.clone());
     }
-    match previous.filter(|previous| previous.agent == agent) {
-        // Another reading of the same process keeps the pairing it had.
-        Some(previous) if previous.process_id == Some(process_id) => previous.session.clone(),
+    // A seed binds to the process it started, the same launch, so no earlier
+    // process ran the current conversation. Otherwise the last conversation
+    // an earlier process owned stays unpaired until the new process reports
+    // its own.
+    let earlier = match previous_of_agent {
+        Some(previous) if previous.process_id.is_none() => None,
+        _ => previous.and_then(|previous| {
+            previous
+                .session
+                .as_ref()
+                .or(previous.earlier_session.as_ref())
+        }),
+    };
+    let session = if resumes_current {
+        current_session
+    } else if resumed_session.is_some() {
         // A command line that resumes another conversation does not run the
         // current one.
-        _ if resumed_session.is_some() => None,
-        // A seed binds to the process it started: the same launch.
-        Some(previous) if previous.process_id.is_none() => current_session.cloned(),
-        // A new process owns the current conversation only when no earlier
-        // process ran it; that one stays unpaired until the new process
-        // reports its own.
-        _ => {
-            let earlier = previous.and_then(|previous| {
-                previous
-                    .session
-                    .as_ref()
-                    .or(previous.earlier_session.as_ref())
-            });
-            current_session
-                .filter(|session| earlier != Some(*session))
-                .cloned()
-        }
-    }
+        None
+    } else {
+        current_session.filter(|session| earlier != Some(*session))
+    };
+    (session.cloned(), earlier.cloned())
 }
 
 /// The options a session restore or `herdr agent start` launched an agent
@@ -441,25 +455,13 @@ impl TerminalState {
             _ => (options, false, None),
         };
         let current_session = self.current_session_ref();
-        let session = session_for_process(
+        let (session, earlier_session) = session_for_process(
             self.agent_launch.as_ref(),
             agent,
             current_session,
             process_id,
             resumed_session,
         );
-        let earlier_session = match self.agent_launch.as_ref() {
-            Some(launch) if launch.agent == agent && launch.process_id == Some(process_id) => {
-                launch.earlier_session.clone()
-            }
-            Some(launch) if launch.agent == agent && launch.process_id.is_none() => None,
-            launch => launch.and_then(|launch| {
-                launch
-                    .session
-                    .clone()
-                    .or_else(|| launch.earlier_session.clone())
-            }),
-        };
         let seen_session = current_session.cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
@@ -3138,7 +3140,7 @@ mod tests {
             launch_record(Agent::Claude, Some(10), false, None, Some("current"));
         let owner_of_other = launch_record(Agent::Claude, Some(10), false, Some("other"), None);
         let codex_owner = launch_record(Agent::Codex, Some(10), false, Some("current"), None);
-        for (case, previous, current_session, process_id, resumed, expected) in [
+        for (case, previous, current_session, process_id, resumed, expected, carried) in [
             (
                 "first process",
                 None,
@@ -3146,8 +3148,9 @@ mod tests {
                 10,
                 None,
                 Some("current"),
+                None,
             ),
-            ("no conversation yet", None, None, 10, None, None),
+            ("no conversation yet", None, None, 10, None, None, None),
             (
                 "seed binds its process",
                 Some(&seed),
@@ -3155,6 +3158,7 @@ mod tests {
                 10,
                 None,
                 Some("current"),
+                None,
             ),
             (
                 "same process keeps its pairing",
@@ -3163,12 +3167,14 @@ mod tests {
                 10,
                 None,
                 Some("current"),
+                None,
             ),
             (
                 "same unpaired process stays unpaired",
                 Some(&unpaired),
                 Some(&current),
                 10,
+                None,
                 None,
                 None,
             ),
@@ -3179,6 +3185,7 @@ mod tests {
                 10,
                 Some("current"),
                 Some("current"),
+                None,
             ),
             (
                 "new process after the owner",
@@ -3187,6 +3194,16 @@ mod tests {
                 11,
                 None,
                 None,
+                Some("current"),
+            ),
+            (
+                "same unpaired process carries the earlier one",
+                Some(&unpaired_after_owner),
+                Some(&current),
+                10,
+                None,
+                None,
+                Some("current"),
             ),
             (
                 "new process after an unpaired one",
@@ -3195,6 +3212,7 @@ mod tests {
                 11,
                 None,
                 None,
+                Some("current"),
             ),
             (
                 "new process after an unpaired first one",
@@ -3203,6 +3221,7 @@ mod tests {
                 11,
                 None,
                 Some("current"),
+                None,
             ),
             (
                 "new process after another owner",
@@ -3211,12 +3230,14 @@ mod tests {
                 11,
                 None,
                 Some("current"),
+                Some("other"),
             ),
             (
                 "new process resuming the current one",
                 Some(&owner),
                 Some(&current),
                 11,
+                Some("current"),
                 Some("current"),
                 Some("current"),
             ),
@@ -3227,6 +3248,7 @@ mod tests {
                 11,
                 Some("other"),
                 None,
+                Some("current"),
             ),
             (
                 "first process resuming another one",
@@ -3234,6 +3256,7 @@ mod tests {
                 Some(&current),
                 10,
                 Some("other"),
+                None,
                 None,
             ),
             (
@@ -3243,6 +3266,7 @@ mod tests {
                 10,
                 Some("other"),
                 None,
+                None,
             ),
             (
                 "same process resuming another one keeps its pairing",
@@ -3251,6 +3275,7 @@ mod tests {
                 10,
                 Some("other"),
                 Some("current"),
+                None,
             ),
             (
                 "other agent's record",
@@ -3259,6 +3284,7 @@ mod tests {
                 11,
                 None,
                 None,
+                Some("current"),
             ),
         ] {
             assert_eq!(
@@ -3269,7 +3295,7 @@ mod tests {
                     process_id,
                     resumed
                 ),
-                expected.map(id),
+                (expected.map(id), carried.map(id)),
                 "{case}"
             );
         }
