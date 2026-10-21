@@ -1,5 +1,137 @@
 use super::*;
 
+#[test]
+fn worktree_list_completion_keeps_metadata_and_plugin_servicing_linear() {
+    use crate::events::{AppEvent, WorktreeReadData, WorktreeReadResult};
+    use api::schema::{Method, WorktreeListParams};
+
+    let mut server = test_headless_server();
+    let root = std::env::temp_dir().join(format!(
+        "herdr-list-servicing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let count = 256;
+    server.app.state.workspaces = (0..count)
+        .map(|index| {
+            let mut workspace = crate::workspace::Workspace::test_new("list-servicing");
+            let checkout = if index == 0 {
+                root.clone()
+            } else {
+                root.join(format!("workspace-{index}"))
+            };
+            workspace.identity_cwd = checkout.clone();
+            workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+                key: "list-servicing".into(),
+                label: "list-servicing".into(),
+                repo_root: root.clone(),
+                checkout_path: checkout,
+                is_linked_worktree: index != 0,
+            });
+            workspace
+        })
+        .collect();
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    let pane = server.app.state.workspaces[0].focused_pane_id().unwrap();
+    let pane_id = server.app.public_pane_id(0, pane).unwrap();
+    let (respond_to, responses) = std::sync::mpsc::channel();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    server
+        .app
+        .event_tx
+        .try_send(AppEvent::WorktreeReadFinished(Box::new(
+            WorktreeReadResult {
+                _permit: permit,
+                client_local: false,
+                request: api::schema::Request {
+                    id: "worktrees".into(),
+                    method: Method::WorktreeList(WorktreeListParams::default()),
+                },
+                source_workspace_id: Some(server.app.state.workspaces[0].id.clone()),
+                source_cwd: Some(root.clone()),
+                result: Ok(WorktreeReadData {
+                    source_checkout_path: root.clone(),
+                    source_repo_root: root.clone(),
+                    repo_key: "list-servicing".into(),
+                    repo_name: "list-servicing".into(),
+                    entries: (0..count)
+                        .map(|index| crate::worktree::ExistingWorktree {
+                            path: root.join(format!("entry-{index}")),
+                            branch: Some(format!("branch-{index}")),
+                            is_bare: false,
+                            is_detached: false,
+                            is_prunable: false,
+                        })
+                        .collect(),
+                }),
+                respond_to: respond_to.clone(),
+            },
+        )))
+        .unwrap();
+    let (requests, receiver) = mpsc::unbounded_channel();
+    server.app.api_rx = receiver;
+    for (id, method) in [
+        (
+            "plugins",
+            Method::PluginList(api::schema::PluginListParams::default()),
+        ),
+        (
+            "metadata",
+            Method::PaneReportMetadata(
+                serde_json::from_value(serde_json::json!({
+                    "pane_id": pane_id, "source": "lookup-test", "tokens": { "test": "kept" }
+                }))
+                .unwrap(),
+            ),
+        ),
+    ] {
+        requests
+            .send(api::ApiRequestMessage {
+                request: api::schema::Request {
+                    id: id.into(),
+                    method,
+                },
+                projection: None,
+                respond_to: respond_to.clone(),
+                response_write_complete: None,
+            })
+            .unwrap();
+    }
+    let started = Instant::now();
+    let (_, calls) = crate::worktree::canonicalization_calls::measure(|| {
+        server.drain_api_requests_with_shutdown_check();
+    });
+    let replies: Vec<serde_json::Value> = responses
+        .try_iter()
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 3);
+    assert_eq!(replies[0]["id"], "worktrees");
+    assert_eq!(replies[1]["id"], "plugins");
+    assert_eq!(replies[2]["id"], "metadata");
+    assert!(
+        replies.iter().all(|reply| reply.get("error").is_none()),
+        "{replies:?}"
+    );
+    assert_eq!(
+        replies[0]["result"]["worktrees"].as_array().unwrap().len(),
+        count
+    );
+    println!("worktree-list + plugin/metadata servicing: entries={count} workspaces={count} canonicalizations={calls} elapsed_us={}", started.elapsed().as_micros());
+    assert!(
+        calls <= count * 3 + 16,
+        "{calls} canonicalizations before metadata/plugin responses"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc::Receiver<String> {
     let (sender, receiver) = mpsc::unbounded_channel();
     server.app.api_rx = receiver;
