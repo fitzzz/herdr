@@ -36,4 +36,8 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `terminal.input.open`, `terminal.input.write` and
+    /// `terminal.input.reconcile`.
+    #[serde(default)]
+    pub terminal_input_ack: bool,
 }

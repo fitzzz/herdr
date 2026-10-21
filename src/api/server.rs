@@ -76,6 +76,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        terminal_input_ack: true,
     })
 }
 
@@ -643,6 +644,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
+        Method::TerminalInputOpen(_) => "terminal.input.open",
+        Method::TerminalInputWrite(_) => "terminal.input.write",
+        Method::TerminalInputReconcile(_) => "terminal.input.reconcile",
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
@@ -1487,6 +1491,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_input_ack: false,
             }),
             None,
             None,

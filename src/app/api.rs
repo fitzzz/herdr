@@ -11,6 +11,7 @@ pub(super) mod responses;
 mod session;
 mod status;
 mod tabs;
+mod terminal_input;
 mod workspaces;
 mod worktrees;
 
@@ -1171,6 +1172,19 @@ impl App {
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
                 return self.handle_pane_send_input(request.id, params);
+            }
+            Method::TerminalInputOpen(params) => {
+                return self.handle_terminal_input_open(request.id, params);
+            }
+            Method::TerminalInputReconcile(params) => {
+                return self.handle_terminal_input_reconcile(request.id, params);
+            }
+            Method::TerminalInputWrite(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "terminal.input.write is handled asynchronously by the app runtime",
+                );
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PopupClose(_) => {

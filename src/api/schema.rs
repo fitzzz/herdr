@@ -11,6 +11,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod terminal_input;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -25,6 +26,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use terminal_input::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -199,6 +201,12 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "terminal.input.open")]
+    TerminalInputOpen(TerminalInputOpenParams),
+    #[serde(rename = "terminal.input.write")]
+    TerminalInputWrite(TerminalInputWriteParams),
+    #[serde(rename = "terminal.input.reconcile")]
+    TerminalInputReconcile(TerminalInputReconcileParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.report_agent")]

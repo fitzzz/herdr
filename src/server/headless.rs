@@ -3282,6 +3282,14 @@ impl HeadlessServer {
         }
         if matches!(
             &msg.request.method,
+            api::schema::Method::TerminalInputWrite(_)
+        ) {
+            self.app
+                .handle_deferred_terminal_input_request(msg.request, msg.respond_to);
+            return changed;
+        }
+        if matches!(
+            &msg.request.method,
             api::schema::Method::WorktreeCreate(_)
                 | api::schema::Method::WorktreeRemove(_)
                 | api::schema::Method::WorktreeList(_)

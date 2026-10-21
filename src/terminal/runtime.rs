@@ -491,6 +491,10 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub(crate) fn input_streams(&self) -> &super::input_streams::TerminalInputStreams {
+        self.0.input_streams()
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,

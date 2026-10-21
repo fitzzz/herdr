@@ -4357,6 +4357,78 @@
           ],
           "type": "object"
         },
+        "TerminalInputOpenParams": {
+          "properties": {
+            "incarnation": {
+              "description": "Incarnation the client is bound to. Omit to bind to the current one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        "TerminalInputReconcileParams": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id"
+          ],
+          "type": "object"
+        },
+        "TerminalInputWriteParams": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "seq": {
+              "description": "Starts at 1 and increases by exactly 1 per write on the stream.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq"
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -5905,6 +5977,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.write",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputWriteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.reconcile",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputReconcileParams"
             }
           },
           "required": [
@@ -9807,6 +9927,38 @@
             },
             {
               "properties": {
+                "stream": {
+                  "$ref": "#/schemas/success_response/$defs/TerminalInputStreamInfo"
+                },
+                "type": {
+                  "const": "terminal_input_stream",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "terminal_input_written",
+                  "type": "string"
+                },
+                "write": {
+                  "$ref": "#/schemas/success_response/$defs/TerminalInputWriteAck"
+                }
+              },
+              "required": [
+                "type",
+                "write"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "pane_id": {
                   "type": "string"
                 },
@@ -10457,6 +10609,11 @@
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
               "type": "boolean"
+            },
+            "terminal_input_ack": {
+              "default": false,
+              "description": "Supports `terminal.input.open`, `terminal.input.write` and\n`terminal.input.reconcile`.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -10577,6 +10734,74 @@
             "focused",
             "pane_count",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "TerminalInputStreamInfo": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "last_admitted_seq": {
+              "description": "Highest sequence admitted to the terminal's ordered PTY write queue.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_written_seq": {
+              "description": "Every sequence up to this one was written to the PTY.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "last_admitted_seq",
+            "last_written_seq"
+          ],
+          "type": "object"
+        },
+        "TerminalInputWriteAck": {
+          "properties": {
+            "digest": {
+              "description": "Hex SHA-256 of the request's text and keys.",
+              "type": "string"
+            },
+            "duplicate": {
+              "description": "True when an earlier request with this sequence already wrote it.",
+              "type": "boolean"
+            },
+            "incarnation": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq",
+            "digest",
+            "duplicate"
           ],
           "type": "object"
         },
