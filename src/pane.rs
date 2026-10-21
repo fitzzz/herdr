@@ -290,29 +290,37 @@ async fn publish_agent_process_detected_event(
     }
 }
 
+/// The agent and process last reported by [`agent_launch_observation`], with
+/// the program its command line ran (`argv[0]`) when it was read.
+type PublishedAgentLaunch = (Agent, u32, Option<String>);
+
 /// Claude and Codex restore repeats the options read from the agent's command
 /// line, so each new agent process is reported once, also when a wrapper runs
-/// one after another in the same process group. A process whose command line
-/// could not be read is reported once more when a later probe reads it, since
-/// the read is skipped while the process sleeps uninterruptibly. Returns the
-/// observation to publish, if any.
+/// one after another in the same process group. A process is reported once
+/// more when a later probe reads a command line it could not read before (the
+/// read is skipped while the process sleeps uninterruptibly), and when its
+/// program changed, as when a launcher script execs the agent in its own
+/// process. Returns the observation to publish, if any.
 fn agent_launch_observation(
     agent: Option<Agent>,
     agent_pid: Option<u32>,
-    argv_read: bool,
-    last_published: &mut Option<(Agent, u32, bool)>,
+    argv: Option<&[String]>,
+    last_published: &mut Option<PublishedAgentLaunch>,
 ) -> Option<(Agent, u32)> {
     let Some(agent) = agent.filter(|agent| matches!(agent, Agent::Claude | Agent::Codex)) else {
         *last_published = None;
         return None;
     };
     let agent_pid = agent_pid?;
-    if let Some((last_agent, last_pid, last_read)) = *last_published {
-        if (last_agent, last_pid) == (agent, agent_pid) && (last_read || !argv_read) {
+    let program = argv.and_then(<[String]>::first);
+    if let Some((last_agent, last_pid, last_program)) = last_published.as_ref() {
+        if (*last_agent, *last_pid) == (agent, agent_pid)
+            && (program.is_none() || last_program.as_ref() == program)
+        {
             return None;
         }
     }
-    *last_published = Some((agent, agent_pid, argv_read));
+    *last_published = Some((agent, agent_pid, program.cloned()));
     Some((agent, agent_pid))
 }
 
@@ -1073,7 +1081,7 @@ fn spawn_basic_detection_task(
                 if let Some(observation) = agent_launch_observation(
                     new_agent,
                     probe.agent_pid,
-                    probe.agent_argv.is_some(),
+                    probe.agent_argv.as_deref(),
                     &mut last_agent_launch_observation,
                 ) {
                     publish_agent_launch_observed_event(
@@ -3076,7 +3084,7 @@ impl PaneRuntime {
                             if let Some(observation) = agent_launch_observation(
                                 new_agent,
                                 probe.agent_pid,
-                                probe.agent_argv.is_some(),
+                                probe.agent_argv.as_deref(),
                                 &mut last_agent_launch_observation,
                             ) {
                                 publish_agent_launch_observed_event(
@@ -5487,7 +5495,7 @@ mod tests {
             if let Some(observation) = agent_launch_observation(
                 probe.agent,
                 probe.agent_pid,
-                probe.agent_argv.is_some(),
+                probe.agent_argv.as_deref(),
                 &mut last,
             ) {
                 observed.push((observation, probe.agent_argv));
@@ -5510,66 +5518,112 @@ mod tests {
 
     #[test]
     fn agent_launch_observation_publishes_each_claude_or_codex_process_once() {
+        let claude_argv = ["claude".to_string()];
         let mut last = None;
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), true, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&claude_argv), &mut last),
             Some((Agent::Claude, 10))
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), true, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&claude_argv), &mut last),
             None
         );
         // A replacement process of the same kind is a new observation.
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(11), true, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(11), Some(&claude_argv), &mut last),
             Some((Agent::Claude, 11))
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Codex), Some(11), true, &mut last),
+            agent_launch_observation(Some(Agent::Codex), Some(11), Some(&claude_argv), &mut last),
             Some((Agent::Codex, 11))
         );
         // Other agents carry no launch options and reset the tracking.
         assert_eq!(
-            agent_launch_observation(Some(Agent::Pi), Some(12), true, &mut last),
+            agent_launch_observation(Some(Agent::Pi), Some(12), Some(&claude_argv), &mut last),
             None
         );
         assert_eq!(last, None);
         assert_eq!(
-            agent_launch_observation(None, Some(11), true, &mut last),
+            agent_launch_observation(None, Some(11), Some(&claude_argv), &mut last),
             None
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Codex), Some(11), true, &mut last),
+            agent_launch_observation(Some(Agent::Codex), Some(11), Some(&claude_argv), &mut last),
             Some((Agent::Codex, 11))
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Codex), None, true, &mut last),
+            agent_launch_observation(Some(Agent::Codex), None, Some(&claude_argv), &mut last),
             None
         );
     }
 
     #[test]
     fn agent_launch_observation_reports_a_process_again_once_its_command_line_is_read() {
+        let claude_argv = ["claude".to_string()];
         let mut last = None;
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), false, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), None, &mut last),
             Some((Agent::Claude, 10))
         );
         // Still unreadable (always the case on WSL): nothing new to report.
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), false, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), None, &mut last),
             None
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), true, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&claude_argv), &mut last),
             Some((Agent::Claude, 10))
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), true, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&claude_argv), &mut last),
             None
         );
         assert_eq!(
-            agent_launch_observation(Some(Agent::Claude), Some(10), false, &mut last),
+            agent_launch_observation(Some(Agent::Claude), Some(10), None, &mut last),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_launch_observation_reports_a_launcher_that_execs_the_agent_in_its_process() {
+        let launcher = [
+            "/usr/bin/python3",
+            "/home/placeholder/bin/claude",
+            "--model",
+            "placeholder",
+            "--permission-mode",
+            "plan",
+        ]
+        .map(String::from);
+        let agent = [
+            "/home/placeholder/.local/share/claude/latest/claude",
+            "--model",
+            "placeholder",
+            "--permission-mode",
+            "plan",
+        ]
+        .map(String::from);
+        let mut last = None;
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&launcher), &mut last),
+            Some((Agent::Claude, 10))
+        );
+        // A launcher that has not exec'd yet, or never does, is not reported again.
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&launcher), &mut last),
+            None
+        );
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), None, &mut last),
+            None
+        );
+        // The same process now runs the agent itself.
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&agent), &mut last),
+            Some((Agent::Claude, 10))
+        );
+        assert_eq!(
+            agent_launch_observation(Some(Agent::Claude), Some(10), Some(&agent), &mut last),
             None
         );
     }
