@@ -227,14 +227,21 @@ pub fn launch_options_from_agent_args(
 }
 
 /// The conversation id a Claude or Codex process command line resumes
-/// (`claude --resume <id>`, `codex resume <id>`), when it names one.
+/// (`claude --resume <id>`, `codex resume <id>`), when it names one. A fork
+/// (`claude --resume <id> --fork-session`) runs a new conversation and names
+/// none; Codex forks with `codex fork`, which is not read as a resume.
 pub fn resumed_session_from_process_argv(
     agent: crate::detect::Agent,
     argv: &[String],
 ) -> Option<String> {
     let args = &argv[agent_args_start(argv)?..];
     match agent {
-        crate::detect::Agent::Claude => parse_claude_args(args).ok()?.session_id,
+        crate::detect::Agent::Claude => {
+            parse_claude_args(args)
+                .ok()
+                .filter(|launch| !launch.fork)?
+                .session_id
+        }
         crate::detect::Agent::Codex => {
             parse_codex_args(args)
                 .ok()
@@ -579,11 +586,14 @@ enum ParserStyle {
 }
 
 /// One argument from a launch command line.
-enum LaunchArg {
-    /// An option and the number of arguments it used, itself included.
+enum LaunchArg<'a> {
+    /// An option, the number of arguments it used, itself included, and its
+    /// first value in any form: `--name value`, `--name=value`, `-x value`,
+    /// `-xvalue` or a cluster such as `-fxvalue`.
     Option {
         spec: &'static LaunchOptionSpec,
         len: usize,
+        value: Option<&'a str>,
     },
     Operand,
     /// `--`: every later argument is an operand.
@@ -610,11 +620,11 @@ fn variadic_tail(args: &[String]) -> usize {
 
 /// Classifies `args[0]`, following commander's `parseOptions` (Claude) and
 /// clap (Codex).
-fn next_launch_arg(
+fn next_launch_arg<'a>(
     specs: &'static [LaunchOptionSpec],
     style: ParserStyle,
-    args: &[String],
-) -> Result<LaunchArg, LaunchOptionsUnavailable> {
+    args: &'a [String],
+) -> Result<LaunchArg<'a>, LaunchOptionsUnavailable> {
     use LaunchOptionsUnavailable::UnsupportedOption;
     let Some(arg) = args.first() else {
         return Err(UnsupportedOption);
@@ -628,14 +638,18 @@ fn next_launch_arg(
     let rest = &args[1..];
     // A value given inline cannot continue into the next arguments in
     // commander; in clap it is unclear, and they might be the session id.
-    let inline_value = |spec: &'static LaunchOptionSpec| {
+    let inline_value = |spec: &'static LaunchOptionSpec, value: &'a str| {
         if spec.arity == Variadic && style == ParserStyle::Clap && variadic_tail(rest) > 0 {
             return Err(UnsupportedOption);
         }
-        Ok(LaunchArg::Option { spec, len: 1 })
+        Ok(LaunchArg::Option {
+            spec,
+            len: 1,
+            value: Some(value),
+        })
     };
-
-    if let Some(spec) = find_option(specs, arg) {
+    // An option whose values, if any, are the next arguments.
+    let separate_values = |spec: &'static LaunchOptionSpec| {
         let len = match spec.arity {
             Flag => 1,
             Value if rest.is_empty() => return Err(UnsupportedOption),
@@ -647,17 +661,29 @@ fn next_launch_arg(
             Variadic if rest.is_empty() => return Err(UnsupportedOption),
             Variadic => 2 + variadic_tail(&rest[1..]),
         };
-        return Ok(LaunchArg::Option { spec, len });
+        Ok(LaunchArg::Option {
+            spec,
+            len,
+            value: (len > 1).then(|| rest[0].as_str()),
+        })
+    };
+
+    if let Some(spec) = find_option(specs, arg) {
+        return separate_values(spec);
     }
 
-    if let Some((name, _)) = arg.split_once('=').filter(|_| arg.starts_with("--")) {
+    if let Some((name, value)) = arg.split_once('=').filter(|_| arg.starts_with("--")) {
         let spec = find_option(specs, name).ok_or(UnsupportedOption)?;
         return match spec.arity {
             // Neither parser accepts a value for a flag; a dropped one is
             // harmless to drop with it (Claude's `--tmux=classic`).
             Flag if spec.keep => Err(UnsupportedOption),
-            Flag => Ok(LaunchArg::Option { spec, len: 1 }),
-            _ => inline_value(spec),
+            Flag => Ok(LaunchArg::Option {
+                spec,
+                len: 1,
+                value: None,
+            }),
+            _ => inline_value(spec, value),
         };
     }
 
@@ -681,13 +707,10 @@ fn next_launch_arg(
         let after = &cluster[short.len_utf8()..];
         if after.is_empty() {
             // The last short option reads the next arguments like `-x` alone.
-            let next = std::iter::once(format!("-{short}"))
-                .chain(rest.iter().cloned())
-                .collect::<Vec<_>>();
-            return next_launch_arg(specs, style, &next);
+            return separate_values(spec);
         }
         if spec.arity != Flag {
-            return inline_value(spec);
+            return inline_value(spec, after);
         }
         cluster = after;
     }
@@ -702,8 +725,10 @@ fn next_launch_arg(
 #[derive(Debug, Default)]
 struct ClaudeLaunch {
     options: Vec<String>,
-    /// The conversation `--resume <id>` or `--resume=<id>` names.
+    /// The conversation `--resume <id>`, in any form, names.
     session_id: Option<String>,
+    /// `--fork-session`: the resumed conversation is copied into a new one.
+    fork: bool,
 }
 
 fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, LaunchOptionsUnavailable> {
@@ -712,15 +737,14 @@ fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, LaunchOptionsUnava
     let mut index = 0;
     while index < args.len() {
         match next_launch_arg(CLAUDE_OPTIONS, ParserStyle::Commander, &args[index..])? {
-            LaunchArg::Option { spec, len } => {
+            LaunchArg::Option { spec, len, value } => {
                 if spec.keep {
                     launch.options.extend_from_slice(&args[index..index + len]);
                 }
-                if spec.names[0] == "-r" {
-                    launch.session_id = match len {
-                        2 => Some(args[index + 1].clone()),
-                        _ => args[index].strip_prefix("--resume=").map(String::from),
-                    };
+                match spec.names[0] {
+                    "-r" => launch.session_id = value.map(String::from),
+                    "--fork-session" => launch.fork = true,
+                    _ => {}
                 }
                 index += len;
             }
@@ -761,7 +785,7 @@ fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, LaunchOptionsUnavail
             next_launch_arg(CODEX_OPTIONS, ParserStyle::Clap, &args[index..])?
         };
         match arg {
-            LaunchArg::Option { spec, len } => {
+            LaunchArg::Option { spec, len, .. } => {
                 if !launch.resume && !spec.top_level {
                     return Err(UnsupportedOption);
                 }
@@ -2075,6 +2099,40 @@ mod tests {
                 ][..],
                 Some("placeholder-id"),
             ),
+            (
+                Agent::Claude,
+                &["claude", "-rplaceholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Claude,
+                &["claude", "-pr", "placeholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Claude,
+                &["claude", "-prplaceholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            // A fork runs a new conversation, not the one it starts from.
+            (
+                Agent::Claude,
+                &[
+                    "claude",
+                    "--resume",
+                    "placeholder-id",
+                    "--fork-session",
+                    "--permission-mode",
+                    "bypassPermissions",
+                ][..],
+                None,
+            ),
+            (
+                Agent::Claude,
+                &["claude", "--fork-session", "-rplaceholder-id"][..],
+                None,
+            ),
+            (Agent::Codex, &["codex", "fork", "placeholder-id"][..], None),
             (Agent::Claude, &["claude", "--resume"][..], None),
             (Agent::Claude, &["claude", "--verbose"][..], None),
             (

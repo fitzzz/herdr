@@ -3547,6 +3547,67 @@ mod tests {
     }
 
     #[test]
+    fn a_new_process_resuming_the_current_conversation_by_an_attached_id_owns_it() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+        observe_claude_argv(
+            &mut state,
+            pane_id,
+            std::process::id(),
+            &[
+                "claude",
+                "--permission-mode",
+                "bypassPermissions",
+                "-rsession-a",
+            ],
+        );
+        let expected = (
+            "session-a".to_string(),
+            claude_resume(&["--permission-mode", "bypassPermissions"], "session-a"),
+        );
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
+        report_claude_session(&mut state, pane_id, 2, "session-a");
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
+    }
+
+    #[test]
+    fn a_forked_process_does_not_own_the_conversation_it_forks() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+        observe_claude_argv(
+            &mut state,
+            pane_id,
+            std::process::id(),
+            &[
+                "claude",
+                "--resume",
+                "session-a",
+                "--fork-session",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        );
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            ("session-a".into(), claude_resume(&[], "session-a"))
+        );
+        report_claude_session(&mut state, pane_id, 2, "session-fork");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-fork".into(),
+                claude_resume(&["--permission-mode", "bypassPermissions"], "session-fork")
+            )
+        );
+    }
+
+    #[test]
     fn a_conversation_reported_after_its_process_exited_waits_for_the_next_process() {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
