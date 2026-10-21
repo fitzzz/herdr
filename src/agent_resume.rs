@@ -349,9 +349,9 @@ struct LaunchOptionSpec {
     arity: OptionArity,
     /// Repeated on restore; otherwise dropped.
     keep: bool,
-    /// Codex only: accepted before a subcommand, and by `codex resume`.
+    /// Codex only: accepted before a subcommand. `codex resume` accepts
+    /// every option.
     top_level: bool,
-    resume: bool,
 }
 
 const fn kept(names: &'static [&'static str], arity: OptionArity) -> LaunchOptionSpec {
@@ -360,7 +360,6 @@ const fn kept(names: &'static [&'static str], arity: OptionArity) -> LaunchOptio
         arity,
         keep: true,
         top_level: true,
-        resume: true,
     }
 }
 
@@ -370,7 +369,6 @@ const fn dropped(names: &'static [&'static str], arity: OptionArity) -> LaunchOp
         arity,
         keep: false,
         top_level: true,
-        resume: true,
     }
 }
 
@@ -383,7 +381,6 @@ const fn dropped_resume_only(
         arity,
         keep: false,
         top_level: false,
-        resume: true,
     }
 }
 
@@ -733,13 +730,7 @@ fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, LaunchOptionsUnavail
         };
         match arg {
             LaunchArg::Option { spec, len } => {
-                let accepted = if launch.resume {
-                    spec.resume
-                } else {
-                    spec.top_level
-                };
-                // A kept option is repeated after `codex resume`.
-                if !accepted || (spec.keep && !spec.resume) {
+                if !launch.resume && !spec.top_level {
                     return Err(UnsupportedOption);
                 }
                 match spec.names[0] {
