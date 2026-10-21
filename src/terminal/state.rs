@@ -127,6 +127,13 @@ pub struct ObservedAgentLaunch {
     /// The agent was resumed by a restore that fell back to the bare resume
     /// command; stays set while the record is bound to that process.
     pub resumed_without_options: bool,
+    /// The conversation known to run in this process. Options are saved only
+    /// beside this conversation, so a wrapper that starts another process
+    /// never pairs one process's options with the other's conversation.
+    pub session: Option<crate::agent_resume::AgentSessionRef>,
+    /// The pane's conversation when this record last looked, so only a
+    /// conversation reported since then is paired with it.
+    seen_session: Option<crate::agent_resume::AgentSessionRef>,
 }
 
 impl ObservedAgentLaunch {
@@ -259,7 +266,9 @@ impl TerminalState {
             || current.and_then(ObservedAgentLaunch::resumed_without_options_agent)
                 != launch
                     .as_ref()
-                    .and_then(ObservedAgentLaunch::resumed_without_options_agent);
+                    .and_then(ObservedAgentLaunch::resumed_without_options_agent)
+            || current.map(|launch| &launch.session)
+                != launch.as_ref().map(|launch| &launch.session);
         self.agent_launch = launch;
         if saved_changed {
             self.agent_launch_revision += 1;
@@ -274,11 +283,14 @@ impl TerminalState {
         options: crate::agent_resume::AgentLaunchOptions,
         resumed_without_options: bool,
     ) {
+        let session = self.current_session_ref().cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             process_id: None,
             options,
             resumed_without_options,
+            seen_session: session.clone(),
+            session,
         }));
     }
 
@@ -335,12 +347,79 @@ impl TerminalState {
             }
             _ => (options, false),
         };
+        let current_session = self.current_session_ref();
+        let session = match self.agent_launch.as_ref() {
+            // A readable read of the same process, or a seed binding to the
+            // process it started: the same launch keeps its conversation.
+            Some(current)
+                if current.agent == agent
+                    && current.process_id.is_none_or(|pid| pid == process_id) =>
+            {
+                current_session.cloned()
+            }
+            // A new process owns a conversation only when it is not the one the
+            // previous process ran; that one stays unpaired until the new
+            // process reports its own.
+            current => current_session
+                .filter(|session| {
+                    current.and_then(|current| current.session.as_ref()) != Some(*session)
+                })
+                .cloned(),
+        };
+        let seen_session = current_session.cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             process_id: Some(process_id),
             options,
             resumed_without_options,
+            session,
+            seen_session,
         }));
+    }
+
+    /// The conversation a session save records for this pane.
+    fn current_session_ref(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        self.hook_authority
+            .as_ref()
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .map(|session| &session.session_ref)
+            })
+    }
+
+    /// Pairs a newly reported conversation with the launch record when it is
+    /// the same launch: a record not yet bound to a process, or a process that
+    /// is still running (a conversation change inside it, such as Claude
+    /// `/clear`). A conversation reported after the recorded process exited
+    /// belongs to the process that replaced it, which detection binds next.
+    pub fn sync_agent_launch_session(&mut self, process_running: impl FnOnce(u32) -> bool) {
+        let Some(session) = self.current_session_ref().cloned() else {
+            return;
+        };
+        let Some(launch) = self.agent_launch.as_mut() else {
+            return;
+        };
+        if launch.seen_session.as_ref() == Some(&session) {
+            return;
+        }
+        launch.seen_session = Some(session.clone());
+        if launch.session.as_ref() == Some(&session)
+            || launch.process_id.is_some_and(|pid| !process_running(pid))
+        {
+            return;
+        }
+        launch.session = Some(session);
+        self.agent_launch_revision += 1;
+    }
+
+    /// The launch record, when its options belong to the conversation a
+    /// session save records.
+    fn launch_for_current_session(&self) -> Option<&ObservedAgentLaunch> {
+        self.agent_launch.as_ref().filter(|launch| {
+            launch.process_id.is_none() || launch.session.as_ref() == self.current_session_ref()
+        })
     }
 
     /// Whether the pane's agent was resumed without its launch options.
@@ -354,8 +433,7 @@ impl TerminalState {
     /// without its launch options.
     pub fn resumed_without_launch_options_for_session(&self, agent_label: &str) -> bool {
         let agent = self
-            .agent_launch
-            .as_ref()
+            .launch_for_current_session()
             .and_then(ObservedAgentLaunch::resumed_without_options_agent);
         agent.is_some() && crate::detect::parse_agent_label(agent_label) == agent
     }
@@ -364,8 +442,7 @@ impl TerminalState {
     /// known for that same agent.
     pub fn launch_options_for_session(&self, agent_label: &str) -> Option<Vec<String>> {
         let (agent, options) = self
-            .agent_launch
-            .as_ref()
+            .launch_for_current_session()
             .and_then(ObservedAgentLaunch::saved_options)?;
         (crate::detect::parse_agent_label(agent_label) == Some(agent)).then(|| options.to_vec())
     }

@@ -1695,6 +1695,7 @@ impl AppState {
             let launch_revision = terminal.agent_launch_revision();
             let mutation = update(terminal);
             terminal.reconcile_reported_resume();
+            terminal.sync_agent_launch_session(crate::platform::process_exists);
             // Resume-only and launch-option-only changes return no mutation but
             // must still be saved.
             if terminal.reported_resume_revision() != resume_revision
@@ -3334,6 +3335,142 @@ mod tests {
         assert!(
             !state.session_dirty,
             "the same process observed again changes nothing"
+        );
+    }
+
+    /// A process id no running process has, on every platform.
+    const EXITED_PROCESS_ID: u32 = 0x3FFF_FFFF;
+
+    fn report_claude_session(state: &mut AppState, pane_id: PaneId, seq: u64, session: &str) {
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(seq),
+            session_ref: crate::agent_resume::AgentSessionRef::id(session),
+            session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
+        });
+    }
+
+    fn observe_claude_process(
+        state: &mut AppState,
+        pane_id: PaneId,
+        process_id: u32,
+        option: &str,
+    ) {
+        state.handle_app_event(AppEvent::AgentLaunchObserved {
+            pane_id,
+            agent: Agent::Claude,
+            process_id,
+            argv: Some(vec![
+                "claude".into(),
+                "--permission-mode".into(),
+                option.into(),
+            ]),
+        });
+    }
+
+    /// The saved conversation and the restore command built from it.
+    fn saved_claude_restore(state: &AppState, pane_id: PaneId) -> (String, Vec<String>) {
+        let snapshot = crate::persist::capture(
+            &state.workspaces,
+            &state.terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            state.active,
+            0,
+        );
+        let session = snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()]
+            .agent_session
+            .clone()
+            .expect("the conversation is saved");
+        let (plan, _) = crate::agent_resume::plan_with_launch_options(
+            &session.source,
+            &session.agent,
+            &crate::agent_resume::AgentSessionRef::id(&session.value).unwrap(),
+            session.launch_options.as_deref(),
+        )
+        .unwrap();
+        (session.value, plan.argv)
+    }
+
+    fn claude_resume(options: &[&str], session: &str) -> Vec<String> {
+        std::iter::once("claude")
+            .chain(options.iter().copied())
+            .chain(["--resume", session])
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_new_process_seen_before_its_conversation_does_not_lend_its_options() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-a".into(),
+                claude_resume(&["--permission-mode", "plan"], "session-a")
+            )
+        );
+
+        // The wrapper starts process B before B reports its conversation.
+        observe_claude_process(&mut state, pane_id, std::process::id(), "bypassPermissions");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            ("session-a".into(), claude_resume(&[], "session-a"))
+        );
+        report_claude_session(&mut state, pane_id, 2, "session-b");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-b".into(),
+                claude_resume(&["--permission-mode", "bypassPermissions"], "session-b")
+            )
+        );
+    }
+
+    #[test]
+    fn a_conversation_reported_after_its_process_exited_waits_for_the_next_process() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+
+        // Process A has exited; B reports its conversation before detection
+        // sees B.
+        report_claude_session(&mut state, pane_id, 2, "session-b");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            ("session-b".into(), claude_resume(&[], "session-b"))
+        );
+        observe_claude_process(&mut state, pane_id, std::process::id(), "bypassPermissions");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-b".into(),
+                claude_resume(&["--permission-mode", "bypassPermissions"], "session-b")
+            )
+        );
+    }
+
+    #[test]
+    fn a_conversation_change_inside_one_process_keeps_its_options() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        observe_claude_process(&mut state, pane_id, std::process::id(), "plan");
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, 2, "session-a2");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-a2".into(),
+                claude_resume(&["--permission-mode", "plan"], "session-a2")
+            )
         );
     }
 
