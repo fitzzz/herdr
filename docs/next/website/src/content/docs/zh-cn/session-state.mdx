@@ -111,7 +111,7 @@ Herdr 会恢复通过当前官方 Herdr 集成上报了原生会话引用的窗�
 
 Claude Code 和 Codex 会带着启动时的选项恢复,例如权限或审批模式、沙箱、模型、effort、额外目录、允许的工具以及 `-c` 配置覆盖。Herdr 从正在运行的智能体命令行读取这些选项,并按原样保存到会话文件中。它不包括选择或开始会话的部分(例如 `--resume`、`--continue` 或 `codex resume --last`),也不包括一次性提示词和打印后退出模式;保存的会话 ID 会取代它们。
 
-当 Herdr 不知道某个智能体的启动选项时,它会用不带 `<launch options>` 的基本恢复命令恢复会话,并在该智能体退出前于窗格上边框显示 `launch options not kept`(窗格没有上边框时,显示在窗格顶部的一行),方便你用需要的模式重新启动智能体。这种情况出现在旧版 Herdr 保存的会话文件、Herdr 不读取智能体命令行的 WSL 中、智能体使用了 Herdr 无法识别的选项启动,以及选项超出恢复命令限制(64 个参数、8 KiB、不含撇号)时。
+当 Herdr 不知道某个智能体的启动选项时,它会用不带 `<launch options>` 的基本恢复命令恢复会话,并在该智能体退出前于窗格上边框显示 `launch options not kept`(窗格没有上边框时,显示在窗格顶部的一行),方便你用需要的模式重新启动智能体。这种情况出现在旧版 Herdr 保存的会话文件、Herdr 不读取智能体命令行的 WSL 中、智能体使用了 Herdr 无法识别的选项启动,以及选项超出恢复命令限制(64 个参数、8 KiB、不含撇号),或要输入的恢复命令超过窗格 shell 一行能接收的长度(Windows 命令提示符为 8,191 个字符;bash、zsh、fish 以外的 shell 在 Linux 上为 4,095 字节,在 macOS 上为 1,023 字节)时。
 
 运行 `herdr integration status` 查看已安装的集成版本。用 `herdr integration install <agent>` 重新安装过期的集成。
 
