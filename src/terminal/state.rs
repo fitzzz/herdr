@@ -401,15 +401,20 @@ impl TerminalState {
     /// `/clear`). A conversation reported after the recorded process exited
     /// belongs to the process that replaced it, which detection binds next.
     pub fn sync_agent_launch_session(&mut self, process_running: impl FnOnce(u32) -> bool) {
-        let Some(session) = self.current_session_ref().cloned() else {
+        let Some(session) = self.current_session_ref() else {
             return;
         };
+        if self
+            .agent_launch
+            .as_ref()
+            .is_none_or(|launch| launch.seen_session.as_ref() == Some(session))
+        {
+            return;
+        }
+        let session = session.clone();
         let Some(launch) = self.agent_launch.as_mut() else {
             return;
         };
-        if launch.seen_session.as_ref() == Some(&session) {
-            return;
-        }
         launch.seen_session = Some(session.clone());
         if launch.session.as_ref() == Some(&session)
             || launch.process_id.is_some_and(|pid| !process_running(pid))
