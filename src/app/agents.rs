@@ -375,6 +375,18 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        self.agent_info_from_pane(&pane)
+    }
+
+    pub(super) fn agent_info_from_pane(
+        &self,
+        pane: &crate::api::schema::PaneInfo,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let terminal = self.state.terminals.get(pane.terminal_id.as_str())?;
+        if !terminal.is_agent_terminal() {
+            return None;
+        }
+        let pane = pane.clone();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -395,6 +407,7 @@ impl App {
             launch_pending: terminal.managed_agent_launch_pending(),
             interactive_ready: terminal.managed_agent_interactive_ready(),
             state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
+            state_change_epoch: terminal.state_change_epoch.clone(),
             completion_seq: terminal.last_agent_completion_seq,
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead, Write};
 
 use base64::Engine;
 use interprocess::local_socket::traits::Stream as _;
@@ -8,18 +8,44 @@ use tracing::info;
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientMouseButton,
-    ClientMouseKind, ClientMousePosition, RenderEncoding, ServerMessage, MAX_GRAPHICS_FRAME_SIZE,
+    ClientMouseKind, ClientMousePosition, RenderEncoding, ServerMessage, TerminalFrame,
+    MAX_GRAPHICS_FRAME_SIZE,
 };
 use crate::server::socket_paths::client_socket_path;
 
 use super::{do_handshake, init_logging, write_to_server, ClientError};
 
+/// What a terminal session helper writes to stdout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSessionOutput {
+    /// One JSON line per frame.
+    Ansi,
+    /// Asks the server for terminal cells. Stdout starts with one
+    /// `terminal.stream` JSON line naming the encoding the server agreed to.
+    /// For `ansi` the JSON lines follow; for `cells`, binary records
+    /// `u32 body_len | u8 type | body` (little endian) follow:
+    /// 1 = a `herdr.terminal.cells.v1` record, 2 = closed
+    /// (`u8 has_reason | utf8 reason`), 3 = an ANSI frame that replaces the
+    /// cells stream for good (`u64 seq | u16 width | u16 height | u8 full | bytes`).
+    Cells,
+}
+
+const RECORD_CELLS: u8 = 1;
+const RECORD_CLOSED: u8 = 2;
+const RECORD_ANSI: u8 = 3;
+
 /// Runs a read-only terminal session observer and prints one JSON envelope per frame.
-pub fn run_terminal_session_observe(target: String, cols: u16, rows: u16) -> io::Result<()> {
+pub fn run_terminal_session_observe(
+    target: String,
+    cols: u16,
+    rows: u16,
+    output: TerminalSessionOutput,
+) -> io::Result<()> {
     let mut stream =
         connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
+    request_output(&mut stream, output)?;
     write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
-    write_terminal_session_output(stream)
+    write_terminal_session_output(stream, output)
 }
 
 /// Runs a writable terminal session controller.
@@ -28,6 +54,7 @@ pub fn run_terminal_session_control(
     takeover: bool,
     cols: u16,
     rows: u16,
+    output: TerminalSessionOutput,
 ) -> io::Result<()> {
     let mut stream = connect_terminal_session_stream(
         target.clone(),
@@ -35,6 +62,7 @@ pub fn run_terminal_session_control(
         rows,
         "controlling terminal session",
     )?;
+    request_output(&mut stream, output)?;
     write_to_server(
         &mut stream,
         &ClientMessage::ControlTerminal { target, takeover },
@@ -66,7 +94,16 @@ pub fn run_terminal_session_control(
         let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
     });
 
-    write_terminal_session_output(stream)
+    write_terminal_session_output(stream, output)
+}
+
+/// Asks for terminal cells before attaching, so the welcome precedes every frame.
+fn request_output(stream: &mut LocalStream, output: TerminalSessionOutput) -> io::Result<()> {
+    if output == TerminalSessionOutput::Cells {
+        let hello = protocol::terminal_cells::hello_message().map_err(io::Error::other)?;
+        write_to_server(stream, &hello)?;
+    }
+    Ok(())
 }
 
 fn connect_terminal_session_stream(
@@ -120,41 +157,185 @@ fn connect_terminal_session_stream(
     Ok(stream)
 }
 
-fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
+fn write_terminal_session_output(
+    mut stream: LocalStream,
+    output: TerminalSessionOutput,
+) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
+    let mut writer = TerminalOutputWriter::new(output);
     loop {
         match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
-            Ok(ServerMessage::Terminal(frame)) => {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
-                let line = serde_json::json!({
-                    "type": "terminal.frame",
-                    "seq": frame.seq,
-                    "encoding": "ansi",
-                    "width": frame.width,
-                    "height": frame.height,
-                    "full": frame.full,
-                    "bytes": encoded,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+            Ok(message) => {
+                if writer.write(&mut stdout, message)? == OutputFlow::Closed {
+                    return Ok(());
+                }
             }
-            Ok(ServerMessage::ServerShutdown { reason }) => {
-                let line = serde_json::json!({
-                    "type": "terminal.closed",
-                    "reason": reason,
-                });
-                serde_json::to_writer(&mut stdout, &line)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-                return Ok(());
-            }
-            Ok(ServerMessage::Graphics { .. }) => {}
-            Ok(_) => {}
             Err(protocol::FramingError::UnexpectedEof) => return Ok(()),
             Err(err) => return Err(io::Error::other(err.to_string())),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OutputFlow {
+    Open,
+    Closed,
+}
+
+/// Turns server messages into the helper's stdout format.
+enum TerminalOutputWriter {
+    /// JSON lines; the `terminal.stream` line is written already or never.
+    Json,
+    /// Cells were requested and the server has not answered yet.
+    AwaitingWelcome,
+    /// Binary records after an accepted welcome.
+    Cells,
+}
+
+impl TerminalOutputWriter {
+    fn new(output: TerminalSessionOutput) -> Self {
+        match output {
+            TerminalSessionOutput::Ansi => Self::Json,
+            TerminalSessionOutput::Cells => Self::AwaitingWelcome,
+        }
+    }
+
+    fn write(&mut self, out: &mut impl Write, message: ServerMessage) -> io::Result<OutputFlow> {
+        use protocol::terminal_cells::{self, CellsWelcome};
+        match self {
+            Self::AwaitingWelcome => match message {
+                ServerMessage::EndpointControl { kind, data }
+                    if kind == terminal_cells::WELCOME_KIND =>
+                {
+                    let welcome = serde_json::from_str::<CellsWelcome>(&data).map_err(|err| {
+                        io::Error::other(format!("invalid terminal cells welcome: {err}"))
+                    })?;
+                    if welcome.codec.as_deref() == Some(terminal_cells::CODEC) {
+                        write_json_line(
+                            out,
+                            &serde_json::json!({
+                                "type": "terminal.stream",
+                                "encoding": "cells",
+                                "codec": terminal_cells::CODEC,
+                            }),
+                        )?;
+                        *self = Self::Cells;
+                    } else {
+                        write_ansi_stream_line(out, welcome.error.as_deref())?;
+                        *self = Self::Json;
+                    }
+                    Ok(OutputFlow::Open)
+                }
+                ServerMessage::EndpointControl { kind, .. }
+                    if kind == terminal_cells::FRAME_KIND =>
+                {
+                    Err(io::Error::other("terminal cells frame before the welcome"))
+                }
+                // A server without terminal cells ignores the hello and streams ANSI.
+                message @ (ServerMessage::Terminal(_) | ServerMessage::ServerShutdown { .. }) => {
+                    write_ansi_stream_line(out, Some("the server does not offer terminal cells"))?;
+                    *self = Self::Json;
+                    self.write(out, message)
+                }
+                _ => Ok(OutputFlow::Open),
+            },
+            Self::Json => match message {
+                ServerMessage::Terminal(frame) => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&frame.bytes);
+                    write_json_line(
+                        out,
+                        &serde_json::json!({
+                            "type": "terminal.frame",
+                            "seq": frame.seq,
+                            "encoding": "ansi",
+                            "width": frame.width,
+                            "height": frame.height,
+                            "full": frame.full,
+                            "bytes": encoded,
+                        }),
+                    )?;
+                    Ok(OutputFlow::Open)
+                }
+                ServerMessage::ServerShutdown { reason } => {
+                    write_json_line(
+                        out,
+                        &serde_json::json!({
+                            "type": "terminal.closed",
+                            "reason": reason,
+                        }),
+                    )?;
+                    Ok(OutputFlow::Closed)
+                }
+                ServerMessage::EndpointControl { kind, .. }
+                    if kind == terminal_cells::FRAME_KIND =>
+                {
+                    Err(io::Error::other("terminal cells frame on an ANSI stream"))
+                }
+                _ => Ok(OutputFlow::Open),
+            },
+            Self::Cells => match message {
+                ServerMessage::EndpointControl { kind, data }
+                    if kind == terminal_cells::FRAME_KIND =>
+                {
+                    let record = terminal_cells::decode_frame_message(&data).map_err(|err| {
+                        io::Error::other(format!("invalid terminal cells frame: {err:?}"))
+                    })?;
+                    write_record(out, RECORD_CELLS, &[&record])?;
+                    Ok(OutputFlow::Open)
+                }
+                ServerMessage::Terminal(TerminalFrame {
+                    seq,
+                    width,
+                    height,
+                    full,
+                    bytes,
+                }) => {
+                    let mut header = Vec::with_capacity(13);
+                    header.extend_from_slice(&seq.to_le_bytes());
+                    header.extend_from_slice(&width.to_le_bytes());
+                    header.extend_from_slice(&height.to_le_bytes());
+                    header.push(u8::from(full));
+                    write_record(out, RECORD_ANSI, &[&header, &bytes])?;
+                    Ok(OutputFlow::Open)
+                }
+                ServerMessage::ServerShutdown { reason } => {
+                    let reason = reason.unwrap_or_default();
+                    let has_reason = [u8::from(!reason.is_empty())];
+                    write_record(out, RECORD_CLOSED, &[&has_reason, reason.as_bytes()])?;
+                    Ok(OutputFlow::Closed)
+                }
+                _ => Ok(OutputFlow::Open),
+            },
+        }
+    }
+}
+
+fn write_json_line(out: &mut impl Write, line: &serde_json::Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, line)?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+fn write_ansi_stream_line(out: &mut impl Write, reason: Option<&str>) -> io::Result<()> {
+    write_json_line(
+        out,
+        &serde_json::json!({
+            "type": "terminal.stream",
+            "encoding": "ansi",
+            "reason": reason,
+        }),
+    )
+}
+
+fn write_record(out: &mut impl Write, kind: u8, body: &[&[u8]]) -> io::Result<()> {
+    let len = body.iter().map(|part| part.len()).sum::<usize>();
+    let len = u32::try_from(len).map_err(|_| io::Error::other("terminal record too large"))?;
+    out.write_all(&len.to_le_bytes())?;
+    out.write_all(&[kind])?;
+    for part in body {
+        out.write_all(part)?;
+    }
+    out.flush()
 }
 
 #[derive(serde::Deserialize)]
@@ -332,3 +513,7 @@ pub(super) fn terminal_control_command_from_json(raw: &str) -> Result<ClientMess
         TerminalControlCommand::Release {} => Ok(ClientMessage::Detach),
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_sessions_tests.rs"]
+mod tests;

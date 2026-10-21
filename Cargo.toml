@@ -21,10 +21,16 @@ include = [
 ]
 
 [workspace]
-members = ["crates/ghostty-vt"]
-default-members = [".", "crates/ghostty-vt"]
+members = ["crates/cell-damage", "crates/ghostty-vt"]
+default-members = [".", "crates/cell-damage", "crates/ghostty-vt"]
+
+[features]
+# Optional GPU row damage for server frame encoding. Loads the NVIDIA driver and
+# NVRTC at run time; building with it needs no CUDA toolkit.
+cuda = ["cell-damage/cuda"]
 
 [dependencies]
+cell-damage = { path = "crates/cell-damage" }
 ghostty-vt = { path = "crates/ghostty-vt" }
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }

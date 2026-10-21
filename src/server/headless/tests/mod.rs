@@ -6,14 +6,18 @@ mod event_fairness;
 mod native_graphics;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
+mod render_accel;
 #[path = "pane_graphics.rs"]
 mod retained_graphics_tests;
+mod retained_terminal;
+mod shell_scroll_invalidation;
 #[path = "surface_delta.rs"]
 mod surface_delta_tests;
 #[path = "surface_interest.rs"]
 mod surface_interest_tests;
 #[path = "surface_scroll.rs"]
 mod surface_scroll_tests;
+mod terminal_cells_negotiation;
 
 fn client_shell_projection(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -108,6 +112,11 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         client_socket_path: socket_path,
         client_socket_identity,
         clients: HashMap::new(),
+        pending_render_recoveries: HashSet::new(),
+        render_recoveries_waiting_for_drain: HashSet::new(),
+        render_recoveries_waiting_for_change: HashMap::new(),
+        render_recovery_attempts: 0,
+        test_render_frame_limit: MAX_GRAPHICS_FRAME_SIZE,
         native_graphics: Default::default(),
         #[cfg(unix)]
         next_client_id: 1,
@@ -122,6 +131,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         server_config_diagnostic_without_keybindings: None,
         terminal_attach_owners: HashMap::new(),
         pending_alt_screen_reads: Vec::new(),
+        next_idle_screen_sweep: Instant::now() + IDLE_SCREEN_SWEEP_INTERVAL,
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,
         headless_size,
@@ -1667,16 +1677,19 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
     let _ = recv_pane_surface(&first_render, "first baseline");
     let _ = recv_pane_surface(&second_render, "second baseline");
 
-    // Foreground renders last. Its old hyperlink forces a fallback after the first plan.
+    // Foreground renders last. Only the background client has received the
+    // new link's URI, so the foreground plan falls back after the first plan.
     server.foreground_client_id = Some(8);
     let crate::server::render_stream::ClientRenderState::Semantic { last_surface, .. } =
-        &mut server.clients.get_mut(&8).unwrap().render_state
+        &mut server.clients.get_mut(&7).unwrap().render_state
     else {
         panic!("semantic client");
     };
     let linked = last_surface.as_mut().unwrap();
-    linked.frame.hyperlinks.push("https://example.com".into());
-    linked.frame.cells[0].hyperlink = Some(0);
+    linked
+        .frame
+        .hyperlinks
+        .push("https://example.test/late".into());
     let before = [7, 8].map(|id| {
         server.clients[&id]
             .render_state
@@ -1685,7 +1698,11 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
             .clone()
     });
 
-    write_shared_test_pane(&mut server, pane_id, b"\rNEXT\x1b[?1003h");
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\r\x1b]8;;https://example.test/late\x1b\\NEXT\x1b]8;;\x1b\\\x1b[?1003h",
+    );
     assert!(!server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
     assert!(first_render.try_recv().is_err());
     assert!(second_render.try_recv().is_err());
@@ -1695,6 +1712,52 @@ async fn late_retained_fallback_leaves_all_client_baselines_unchanged() {
             Some(&expected)
         );
     }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn retained_patches_rebind_known_hyperlinks_and_fall_back_for_new_ones() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, render) = connect_matching_test_shell(&mut server, 7);
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/known\x1b\\known\x1b]8;;\x1b\\\r\n",
+    );
+    server.render_and_stream();
+    let baseline = recv_pane_surface(&render, "baseline");
+    let known = baseline
+        .frame
+        .hyperlinks
+        .iter()
+        .position(|uri| uri == "https://example.test/known")
+        .expect("baseline link") as u32;
+
+    let sources = HashSet::from([pane_id]);
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/known\x1b\\again\x1b]8;;\x1b\\",
+    );
+    assert!(server.render_retained_pane_surface_and_stream(&sources));
+    let patch = recv_pane_surface_patch(&render, "linked patch");
+    let linked = patch
+        .rows
+        .iter()
+        .flat_map(|row| &row.cells)
+        .filter(|cell| cell.hyperlink.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(linked.len(), "again".len());
+    assert!(linked.iter().all(|cell| cell.hyperlink == Some(known)));
+
+    // A URI the client has never received needs a complete surface.
+    write_shared_test_pane(
+        &mut server,
+        pane_id,
+        b"\x1b]8;;https://example.test/new\x1b\\new\x1b]8;;\x1b\\",
+    );
+    assert!(!server.render_retained_pane_surface_and_stream(&sources));
     shutdown_test_runtimes(&mut server);
 }
 
@@ -1749,13 +1812,333 @@ async fn backpressured_shell_does_not_disable_retained_patches_for_responsive_pe
         read_server_message(slow_render.recv().expect("slow queued first patch")),
         ServerMessage::PaneSurfacePatch(_)
     ));
-    assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
-    server.render_and_stream();
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+            client_id: 8
+        }),
+        RenderImpact::None
+    );
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
     assert!(matches!(
         read_server_message(slow_render.recv().expect("slow full recovery surface")),
         ServerMessage::PaneSurface(_)
     ));
 
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_drained_recovery_preserves_pending_baseline_without_global_invalidation() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (responsive_control, responsive_render) = connect_matching_test_shell(&mut server, 7);
+    let (_slow_control, slow_render) = connect_matching_test_shell(&mut server, 8);
+    server.render_and_stream();
+    let _ = responsive_render.recv().expect("responsive baseline");
+    let _ = slow_render.recv().expect("slow baseline");
+
+    write_shared_test_pane(&mut server, pane_id, b"\rONE");
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let _ = responsive_render.recv().expect("responsive first patch");
+    let accepted = server.clients[&8]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+    write_shared_test_pane(&mut server, pane_id, b"\rLATEST");
+    assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
+    let _ = responsive_render.recv().expect("responsive latest patch");
+    let _ = slow_render.recv().expect("slow accepted patch");
+    assert_eq!(server.clients[&8].deferred_render(), DeferredRender::Full);
+    while responsive_control.try_recv().is_ok() {}
+    let peer_surface = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+    let peer_snapshot = server.clients[&7].shell_snapshot.clone();
+    let peer_revision = server.clients[&7].shell_projection_revision;
+
+    server
+        .server_event_tx
+        .try_send(ServerEvent::ClientWriterDrained { client_id: 8 })
+        .unwrap();
+    assert!(
+        !server.drain_server_events(),
+        "one drained writer must not invalidate every client's surface"
+    );
+    assert_eq!(
+        server.clients[&8].deferred_render(),
+        DeferredRender::Full,
+        "recovery remains pending until its replacement is accepted"
+    );
+    assert_eq!(
+        server.clients[&8].render_state.last_pane_surface(),
+        Some(&accepted)
+    );
+    assert!(server.has_pending_presentation_work(false, false));
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let recovered = recv_pane_surface(&slow_render, "output-stopped recovery");
+    assert!(frame_text(&recovered.frame).contains("LATEST"));
+    assert_eq!(server.clients[&8].deferred_render(), DeferredRender::None);
+    assert!(server.pending_render_recoveries.is_empty());
+    assert_eq!(
+        server.clients[&7].render_state.last_pane_surface(),
+        Some(&peer_surface)
+    );
+    assert_eq!(server.clients[&7].shell_snapshot, peer_snapshot);
+    assert_eq!(server.clients[&7].shell_projection_revision, peer_revision);
+    assert!(responsive_render.try_recv().is_err());
+    assert!(responsive_control.try_recv().is_err());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_recovery_coalesces_pty_damage_and_preserves_second_backpressure() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, responsive) = connect_matching_test_shell(&mut server, 7);
+    let (_slow_control, slow) = connect_matching_test_shell(&mut server, 8);
+    server.render_and_stream();
+    let _ = recv_pane_surface(&responsive, "responsive baseline");
+    // The initial slow frame occupies its lane. Changed content defers its replacement.
+    write_shared_test_pane(&mut server, pane_id, b"\rFIRST");
+    server.render_and_stream();
+    let _ = recv_pane_surface(&responsive, "responsive changed full surface");
+    assert_eq!(server.clients[&8].deferred_render(), DeferredRender::Full);
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+            client_id: 8
+        }),
+        RenderImpact::None
+    );
+    let pending_baseline = server.clients[&8]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+
+    write_shared_test_pane(&mut server, pane_id, b"\rCOALESCED");
+    assert!(server.render_pending_work(false, false, &HashSet::from([pane_id])));
+    let patch = recv_pane_surface_patch(&responsive, "PTY work beside blocked recovery");
+    assert!(!patch.rows.is_empty());
+    assert!(
+        responsive.try_recv().is_err(),
+        "responsive recipient got a recovery frame"
+    );
+    assert_eq!(server.clients[&8].deferred_render(), DeferredRender::Full);
+    assert!(server.pending_render_recoveries.contains(&8));
+    assert_eq!(
+        server.clients[&8].render_state.last_pane_surface(),
+        Some(&pending_baseline)
+    );
+    let attempts = server.render_recovery_attempts;
+    server.app.render_dirty.take();
+    assert!(!server.has_pending_presentation_work(false, false));
+    for _ in 0..15 {
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(
+        server.render_recovery_attempts, attempts,
+        "an occupied lane must not invoke dense recovery on each presentation tick"
+    );
+    let _ = recv_pane_surface(&slow, "old queued baseline");
+
+    // No further PTY output is needed. The second drain must recover all damage.
+    server
+        .server_event_tx
+        .try_send(ServerEvent::ClientWriterDrained { client_id: 8 })
+        .unwrap();
+    assert!(!server.drain_server_events());
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let recovered = recv_pane_surface(&slow, "second drain recovery");
+    assert!(frame_text(&recovered.frame).contains("COALESCED"));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(responsive.try_recv().is_err());
+
+    // A global change subsumes ready recovery without issuing a second frame.
+    server.clients.get_mut(&8).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 });
+    server.clients.get_mut(&7).unwrap().request_repaint();
+    server.clients.get_mut(&8).unwrap().request_repaint();
+    server.app.full_redraw_pending = true;
+    write_shared_test_pane(&mut server, pane_id, b"\rGLOBAL");
+    assert!(server.render_pending_work(true, false, &HashSet::from([pane_id])));
+    let _ = recv_pane_surface(&responsive, "global peer replacement");
+    let replacement = recv_pane_surface(&slow, "global recovery replacement");
+    assert!(frame_text(&replacement.frame).contains("GLOBAL"));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(slow.try_recv().is_err());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_recovery_blocked_surface_still_delivers_completion_and_config_controls() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    server.app.state.ensure_test_terminals();
+    let (control, frames) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let accepted = server.clients[&7]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+    // Keep the first frame queued, forcing replacement recovery to find a full lane.
+    write_shared_test_pane(&mut server, pane_id, b"\rCHANGED");
+    server.render_and_stream();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    assert!(server.render_recoveries_waiting_for_drain.contains(&7));
+    // test_channel forwards controls on a separate thread: an empty receiver
+    // does not prove earlier startup projections have left the writer queue.
+    // Fence that FIFO before mutating config or completion state.
+    let prior_revision = server.clients[&7].shell_projection_revision;
+    assert!(!server.clients[&7].shell_uses_endpoint_keybindings);
+    assert!(server.send_to_client(7, ServerMessage::TerminalBell { count: 0 }));
+    let mut prior_snapshot_revision = None;
+    loop {
+        match read_server_message(
+            control
+                .recv_timeout(Duration::from_secs(1))
+                .expect("control fence"),
+        ) {
+            ServerMessage::TerminalBell { count: 0 } => break,
+            ServerMessage::EndpointControl { kind, data }
+                if kind == protocol::endpoint::ENDPOINT_SNAPSHOT_KIND =>
+            {
+                let prior: protocol::ClientShellSnapshot = serde_json::from_str(&data).unwrap();
+                assert_eq!(prior.boot_id, server.client_shell_boot_id);
+                assert!(prior.revision <= prior_revision);
+                assert_eq!(prior.config_diagnostic, None, "startup projection origin");
+                prior_snapshot_revision = Some(prior.revision);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(prior_snapshot_revision, Some(prior_revision));
+
+    let terminal_id = server.app.state.workspaces[0]
+        .terminal_id(pane_id)
+        .unwrap()
+        .clone();
+    let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Pi),
+        crate::detect::AgentState::Idle,
+    );
+    terminal.last_agent_state_change_seq = Some(77);
+    terminal.last_agent_completion_seq = Some(77);
+    server.server_config_diagnostic_without_keybindings = Some("updated server config".into());
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    assert!(server.render_pending_work(true, false, &HashSet::new()));
+    let (snapshot, completions) = client_shell_projection(&control);
+    assert!(
+        snapshot.revision > prior_revision,
+        "updated projection must follow the fence"
+    );
+    assert_eq!(
+        snapshot.config_diagnostic.as_deref(),
+        Some("updated server config")
+    );
+    assert_eq!(completions.completions.get(&public_pane_id), Some(&77));
+    assert_eq!(
+        server.clients[&7].render_state.last_pane_surface(),
+        Some(&accepted)
+    );
+    assert_eq!(server.clients[&7].deferred_render(), DeferredRender::Full);
+    let queued = recv_pane_surface(&frames, "original accepted surface");
+    assert_eq!(queued, accepted);
+    assert!(
+        frames.try_recv().is_err(),
+        "semantic pass published a blocked surface"
+    );
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let recovered = recv_pane_surface(&frames, "surface after control delivery");
+    assert_eq!(recovered.projection_revision, snapshot.revision);
+    assert!(server.pending_render_recoveries.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_recovery_oversized_text_waits_for_shape_change_without_dense_polling() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, frames) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let accepted = recv_pane_surface(&frames, "baseline");
+    write_shared_test_pane(&mut server, pane_id, b"\rLARGE");
+    server.clients.get_mut(&7).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    // The production non-graphics framing branch, under a bounded test-only cap.
+    server.test_render_frame_limit = 1000;
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    assert!(server.render_recoveries_waiting_for_change.contains_key(&7));
+    assert_eq!(
+        server.clients[&7].render_state.last_pane_surface(),
+        Some(&accepted)
+    );
+    let attempts = server.render_recovery_attempts;
+    server.app.render_dirty.take();
+    for _ in 0..15 {
+        assert!(!server.has_pending_presentation_work(false, false));
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(server.render_recovery_attempts, attempts);
+    assert!(frames.try_recv().is_err());
+    // Relevant producer content wakes a retry, even if it remains unrepresentable.
+    write_shared_test_pane(&mut server, pane_id, b"\rCHANGED");
+    // Consume the same damage wake at the dispatch boundary and preserve the cap.
+    assert!(server.render_pending_work(false, false, &HashSet::from([pane_id])));
+    assert!(server.render_recoveries_waiting_for_change.contains_key(&7));
+    server.clients.get_mut(&7).unwrap().terminal_size = (1, 1);
+    assert!(server.has_pending_presentation_work(false, false));
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let represented = recv_pane_surface(&frames, "representable smaller surface");
+    assert_eq!((represented.frame.width, represented.frame.height), (1, 1));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(server.render_recoveries_waiting_for_change.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_recovery_waits_for_synchronized_output_and_stale_drains_are_harmless() {
+    let mut server = test_headless_server();
+    let pane_id = install_shared_view_test_runtime(&mut server);
+    let (_control, frames) = connect_matching_test_shell(&mut server, 7);
+    server.render_and_stream();
+    let baseline = recv_pane_surface(&frames, "baseline");
+    server.clients.get_mut(&7).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    write_shared_test_pane(&mut server, pane_id, b"\x1b[?2026h\rPARTIAL");
+    for _ in 0..15 {
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(
+        server.render_recovery_attempts, 0,
+        "synchronized output must block recovery before dense collection"
+    );
+    assert!(frames.try_recv().is_err());
+    assert!(server.pending_render_recoveries.contains(&7));
+    assert_eq!(
+        server.clients[&7].render_state.last_pane_surface(),
+        Some(&baseline)
+    );
+    write_shared_test_pane(&mut server, pane_id, b"\rCOMPLETE\x1b[?2026l");
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let complete = recv_pane_surface(&frames, "synchronized recovery");
+    assert!(frame_text(&complete.frame).contains("COMPLETE"));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 }));
+    assert!(server.pending_render_recoveries.is_empty());
+    server.clients.get_mut(&7).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+    server.remove_client(7);
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 }));
+    assert!(!server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 999 }));
+    assert!(!server.render_pending_work(false, false, &HashSet::new()));
     shutdown_test_runtimes(&mut server);
 }
 
@@ -1791,8 +2174,13 @@ async fn full_render_backpressure_does_not_disable_responsive_peer_patches() {
     ));
 
     let _ = slow_render.recv().expect("slow queued initial surface");
-    assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 8 }));
-    server.render_and_stream();
+    assert_eq!(
+        server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+            client_id: 8
+        }),
+        RenderImpact::None
+    );
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
     assert!(matches!(
         read_server_message(slow_render.recv().expect("slow full recovery surface")),
         ServerMessage::PaneSurface(_)
@@ -1857,6 +2245,93 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
         Some("server keybinding warning\ntheme warning")
     );
 
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn metadata_render_shares_observation_and_keeps_inactive_client_overlays() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("metadata-clients");
+    let first_pane = workspace.tabs[0].root_pane;
+    let second_tab = workspace.test_add_tab(Some("other"));
+    let second_pane = workspace.tabs[second_tab].root_pane;
+    workspace.tabs[second_tab].zoomed = true;
+    workspace.insert_test_runtime(
+        first_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"FIRST"),
+    );
+    workspace.insert_test_runtime(
+        second_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"SECOND"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    server.app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Follow;
+    server.app.state.tab_bar_right = vec![crate::app::state::TabBarStatusSegment::Zoom];
+    for (pane, cwd) in [
+        (first_pane, "/metadata/first"),
+        (second_pane, "/metadata/second"),
+    ] {
+        let id = server.app.state.workspaces[0]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        let terminal = server.app.state.terminals.get_mut(&id).unwrap();
+        terminal.cwd = cwd.into();
+        terminal.agent_name = Some(format!("metadata-{}", pane.raw()));
+        terminal.last_agent_completion_seq = Some(3);
+    }
+    let (first_control, _first_render) = connect_test_shell(&mut server, 71, 80, 24);
+    let (second_control, second_render) = connect_test_shell(&mut server, 72, 80, 24);
+    let _ = client_shell_projection(&first_control);
+    let _ = client_shell_projection(&second_control);
+    let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+    assert!(server.focus_shell_client_on_tab(72, &second_tab_id));
+    server.clients.get_mut(&72).unwrap().shell_surface_active = false;
+    while second_render.try_recv().is_ok() {}
+    server.server_config_diagnostic_without_keybindings = Some("metadata-config".into());
+    let id = server.app.state.workspaces[0]
+        .terminal_id(first_pane)
+        .unwrap()
+        .clone();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&id)
+        .unwrap()
+        .last_agent_completion_seq = Some(4);
+    let before = server.app.test_metadata_observation_counts();
+    server.render_and_stream();
+    let after = server.app.test_metadata_observation_counts();
+    let (first, first_completions) = client_shell_projection(&first_control);
+    let (second, second_completions) = client_shell_projection(&second_control);
+    assert_eq!(after.0 - before.0, 1, "one fresh base per render pass");
+    assert_eq!(first.workspaces[0].new_workspace_cwd, "/metadata/first");
+    assert_eq!(second.workspaces[0].new_workspace_cwd, "/metadata/second");
+    assert_ne!(first.focused_tab_id, second.focused_tab_id);
+    assert_ne!(first.focused_pane_id, second.focused_pane_id);
+    assert!(first.tab_bar_right.is_empty());
+    assert_eq!(second.tab_bar_right[0].text, "ZOOM");
+    assert_eq!(first.config_diagnostic.as_deref(), Some("metadata-config"));
+    assert_eq!(second.config_diagnostic, first.config_diagnostic);
+    assert_eq!(
+        first_completions.completions,
+        second_completions.completions
+    );
+    assert!(first_completions
+        .completions
+        .iter()
+        .any(|(_, seq)| *seq == 4));
+    assert_eq!(first_completions.revision, first.revision);
+    assert_eq!(second_completions.revision, second.revision);
+    assert!(
+        second_render.try_recv().is_err(),
+        "inactive surface still receives metadata only"
+    );
     shutdown_test_runtimes(&mut server);
 }
 
@@ -3299,6 +3774,7 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
     let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
     let popup_runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"");
     server.app.install_test_popup_runtime(popup_runtime);
+    server.popup_owner_tab_id = server.app.public_tab_id(0, 0);
     server.clients.insert(
         11,
         ClientConnection::new_with_mode(
@@ -3311,6 +3787,11 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
         ),
     );
     server.foreground_client_id = Some(11);
+    assert_eq!(
+        server.popup_owner_tab_id.as_deref(),
+        server.shell_tab_id_for_client(11).as_deref(),
+        "the fixture must route the pane release through its owning popup"
+    );
 
     let render_impact =
         server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
@@ -3330,6 +3811,16 @@ async fn client_shell_release_under_popup_renders_when_it_resets_scrollback() {
         });
 
     assert_eq!(render_impact, RenderImpact::Full);
+    assert_eq!(
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .and_then(|runtime| runtime.scroll_metrics())
+            .expect("pane scroll metrics after release")
+            .offset_from_bottom,
+        0
+    );
     assert!(!input_rx.recv().await.expect("encoded release").is_empty());
     shutdown_test_runtimes(&mut server);
 }
@@ -3573,7 +4064,7 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
         11,
         ClientConnection::new_with_mode(
             ClientConnectionMode::ClientShell,
-            (80, 24),
+            (80, 2),
             crate::kitty_graphics::HostCellSize::default(),
             1,
             RenderEncoding::SemanticFrame,
@@ -3581,6 +4072,21 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
         ),
     );
     server.foreground_client_id = Some(11);
+
+    // This test covers a scroll reset on an already controlled terminal. First
+    // input on an unclaimed tab also changes geometry and correctly requires Full.
+    assert!(server.claim_unowned_shell_tab_geometry(11, false));
+    let runtime = server
+        .app
+        .state
+        .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+        .unwrap();
+    runtime.scroll_up(1);
+    assert!(runtime
+        .scroll_metrics()
+        .is_some_and(|metrics| metrics.offset_from_bottom > 0));
+    let stable_size = runtime.current_size();
+    server.app.render_dirty.take();
 
     let render_impact =
         server.handle_server_event_with_render_impact(ServerEvent::ClientShellPaneInput {
@@ -3591,7 +4097,20 @@ async fn client_shell_text_input_renders_only_when_resetting_scrollback() {
             )],
         });
 
-    assert_eq!(render_impact, RenderImpact::Full);
+    assert_eq!(render_impact, RenderImpact::None);
+    let damage = server.app.render_dirty.take();
+    assert!(!damage.generic);
+    assert_eq!(damage.pty_sources, HashSet::from([pane_id]));
+    assert_eq!(
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .unwrap()
+            .current_size(),
+        stable_size,
+        "a scroll-only reset must leave the controlled geometry unchanged"
+    );
     assert_eq!(
         input_rx.try_recv().expect("text must reach the PTY"),
         Bytes::from_static(b"x")
@@ -4254,8 +4773,13 @@ fn backpressured_observer_skips_runtime_access_and_recovers_without_new_output()
         assert!(control.try_recv().is_err());
 
         let _ = frames.recv().expect("previously accepted frame");
-        assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 }));
-        server.render_and_stream();
+        assert_eq!(
+            server.handle_server_event_with_render_impact(ServerEvent::ClientWriterDrained {
+                client_id: 7
+            }),
+            RenderImpact::None
+        );
+        assert!(server.render_pending_work(false, false, &HashSet::new()));
         let ServerMessage::Terminal(frame) = read_server_message(frames.recv().unwrap()) else {
             panic!("terminal update");
         };

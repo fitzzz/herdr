@@ -153,6 +153,9 @@ pub struct TerminalState {
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
+    /// A fresh observation namespace for an explicitly admitted legacy handoff.
+    /// Old exporters do not transfer the public state/completion watermarks.
+    pub state_change_epoch: Option<String>,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
@@ -193,6 +196,7 @@ impl TerminalState {
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
+            state_change_epoch: None,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
             revision: 0,
@@ -252,6 +256,20 @@ impl TerminalState {
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+    }
+
+    /// Begin a fresh sequence namespace after preserving a legacy terminal ID.
+    ///
+    /// Admission supplies a nonempty, one-use migration token. Captured public
+    /// watermarks cannot prove what happened before the old exporter froze, so
+    /// they are deliberately not installed. This changes no effective state or
+    /// acquisition policy and creates no completion; a later completion must
+    /// still come through the ordinary state-transition handler.
+    #[cfg(unix)]
+    pub(crate) fn begin_handoff_observation_epoch(&mut self, epoch: String) {
+        self.state_change_epoch = Some(epoch);
+        self.last_agent_state_change_seq = None;
+        self.last_agent_completion_seq = None;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -2456,6 +2474,66 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_drops_watermarks_without_changing_authority() {
+        let mut terminal = test_terminal();
+        let id = terminal.id.clone();
+        let now = Instant::now();
+        terminal.set_detected_agent_process_at(Agent::Claude, now);
+        terminal.hook_authority = Some(HookAuthority {
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            state: AgentState::Idle,
+            message: None,
+            reported_at: now,
+            session_ref: crate::agent_resume::AgentSessionRef::id("continuing-session"),
+        });
+        terminal.state = AgentState::Idle;
+        terminal.finish_agent_process_acquisition();
+        terminal
+            .hook_report_sequences
+            .insert("herdr:claude".into(), 27);
+        terminal.last_agent_state_change_seq = Some(42);
+        terminal.last_agent_completion_seq = Some(42);
+        terminal.revision = 19;
+        let authority = terminal.hook_authority.clone();
+
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+
+        assert_eq!(terminal.id, id);
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert_eq!(terminal.last_agent_state_change_seq, None);
+        assert_eq!(terminal.last_agent_completion_seq, None);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(terminal.hook_authority, authority);
+        assert_eq!(terminal.hook_report_sequences["herdr:claude"], 27);
+        assert!(!terminal.agent_process_acquisition_pending);
+        assert_eq!(terminal.revision, 19);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_stays_with_a_respawned_terminal() {
+        let mut terminal = test_terminal();
+        assert!(terminal.state_change_epoch.is_none());
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+        terminal.last_agent_state_change_seq = Some(3);
+        terminal.last_agent_completion_seq = Some(3);
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert!(terminal.last_agent_state_change_seq.is_none());
+        assert!(terminal.last_agent_completion_seq.is_none());
     }
 
     fn test_session_path(name: &str) -> String {

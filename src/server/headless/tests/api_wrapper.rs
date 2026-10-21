@@ -174,7 +174,13 @@ fn notification_messages(
     );
     let mut messages = Vec::new();
     loop {
-        let message = read_server_message(receiver.try_recv().expect("notification or barrier"));
+        // The test writer forwards queued control messages to `receiver` on its
+        // own drain thread, so a message can still be in flight here.
+        let message = read_server_message(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("notification or barrier"),
+        );
         if matches!(&message, ServerMessage::EndpointControl { kind, .. } if kind == "test.wrapper-barrier")
         {
             return messages;

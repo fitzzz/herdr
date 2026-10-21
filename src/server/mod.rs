@@ -11,6 +11,8 @@ pub(crate) mod clients;
 pub(crate) mod clipboard_image;
 #[cfg(unix)]
 pub(crate) mod handoff;
+#[cfg(target_os = "linux")]
+pub(crate) mod handoff_identity;
 pub mod headless;
 pub(crate) mod keybindings;
 pub(crate) mod notifications;
@@ -20,3 +22,4 @@ mod render_scale_benchmark;
 pub(crate) mod render_stream;
 pub mod socket_paths;
 pub(crate) mod terminal_attach;
+pub(crate) mod terminal_encoder;

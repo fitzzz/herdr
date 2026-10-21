@@ -218,6 +218,11 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// Sequence comparisons are valid only within the same observation epoch.
+    /// Absent on ordinary terminals; present after an admitted legacy handoff
+    /// that preserved terminal identity without old completion watermarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_change_epoch: Option<String>,
     /// The current idle transition completed work, independently of who has viewed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_seq: Option<u64>,

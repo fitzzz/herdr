@@ -3303,6 +3303,32 @@ impl<'a> RowIter<'a> {
         }
     }
 
+    /// Every packed cell of the current row in one native call. The slice
+    /// points into render-state memory, which cannot be updated while the
+    /// render state stays borrowed for `'a`. Decode values with [`RawCell`]
+    /// only when [`raw_cell_layout_verified`] holds.
+    pub fn cells_raw(&self) -> Result<&'a [ffi::GhosttyCell], Error> {
+        let mut view = ffi::GhosttyCellsView {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        // SAFETY: the view output matches the requested row data type.
+        unsafe {
+            ffi::ghostty_render_state_row_get(
+                self.iterator.raw,
+                ffi::GhosttyRenderStateRowData_GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW,
+                (&mut view as *mut ffi::GhosttyCellsView).cast(),
+            )
+            .into_result()?;
+        }
+        if view.ptr.is_null() || view.len == 0 {
+            return Ok(&[]);
+        }
+        // SAFETY: native code returned `len` contiguous cells owned by the render
+        // state, which outlives `'a` and cannot be updated while borrowed.
+        Ok(unsafe { slice::from_raw_parts(view.ptr, view.len) })
+    }
+
     pub fn populate_cells<'b>(
         &'b mut self,
         cells: &'b mut RowCells,
@@ -3619,6 +3645,279 @@ impl<'a> RowCellIter<'a> {
 
     pub fn grapheme_text_into(&self, bytes: &mut Vec<u8>, text: &mut String) -> Result<(), Error> {
         text.clear();
+        // Offer only initialized elements, not allocation capacity. Keep one byte
+        // for a cold/empty ASCII read; grow only when native code reports its size.
+        // Truncating after a long grapheme keeps later ASCII reads bounded to one byte.
+        if bytes.is_empty() {
+            bytes.push(0);
+        }
+        let mut buffer = ffi::GhosttyBuffer {
+            ptr: bytes.as_mut_ptr(),
+            cap: bytes.len(),
+            len: 0,
+        };
+        match self.read_graphemes_utf8_buffer(&mut buffer) {
+            ffi::GhosttyResult_GHOSTTY_SUCCESS => {}
+            ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE => {
+                if buffer.len == 0 {
+                    bytes.clear();
+                    return self.raw_cell_text_into(text);
+                }
+                bytes.resize(buffer.len, 0);
+                buffer = ffi::GhosttyBuffer {
+                    ptr: bytes.as_mut_ptr(),
+                    cap: bytes.len(),
+                    len: 0,
+                };
+                self.read_graphemes_utf8_buffer(&mut buffer).into_result()?;
+            }
+            other => {
+                bytes.clear();
+                return Err(Error(other));
+            }
+        }
+        if buffer.len > bytes.len() {
+            return Err(Error(ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE));
+        }
+        if buffer.len == 0 {
+            bytes.clear();
+            return self.raw_cell_text_into(text);
+        }
+        bytes.truncate(buffer.len);
+        match std::str::from_utf8(bytes) {
+            Ok(value) => text.push_str(value),
+            Err(_) => text.push_str(&String::from_utf8_lossy(bytes)),
+        }
+        Ok(())
+    }
+
+    fn read_graphemes_utf8_buffer(&self, buffer: &mut ffi::GhosttyBuffer) -> ffi::GhosttyResult {
+        #[cfg(test)]
+        {
+            tests::GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(reads.get() + 1));
+            tests::GRAPHEME_UTF8_OFFERED_BYTES
+                .with(|offered| offered.set(offered.get() + buffer.cap));
+        }
+        // SAFETY: the iterator is live and the buffer describes initialized, writable
+        // bytes for the duration of this call (or a null pointer with zero capacity).
+        unsafe {
+            ffi::ghostty_render_state_row_cells_get(
+                self.cells.raw,
+                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
+                (buffer as *mut ffi::GhosttyBuffer).cast(),
+            )
+        }
+    }
+}
+
+/// Content kinds of a packed cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawContentTag {
+    Codepoint,
+    CodepointGrapheme,
+    BgPalette,
+    BgRgb,
+}
+
+/// Fields decoded from one packed cell of [`RowIter::cells_raw`]. Decoding is
+/// plain bit arithmetic, so a whole row costs one native call instead of
+/// several per cell. Callers must check [`raw_cell_layout_verified`] first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCell {
+    pub content_tag: RawContentTag,
+    /// First codepoint for the codepoint tags, 0 otherwise.
+    pub codepoint: u32,
+    /// Background color for the background-only tags.
+    pub bg: Option<CellColor>,
+    /// Page-local style id; 0 is the default style. Equal ids within one row
+    /// always resolve to the same style.
+    pub style_id: u16,
+    pub wide: CellWide,
+    pub has_hyperlink: bool,
+}
+
+// Bit positions of the vendored packed cell (`page.Cell`). Upstream does not
+// protect them by ABI, so `raw_cell_layout_verified` checks them against
+// `ghostty_cell_get` once per process before any caller decodes them.
+const RAW_TAG_SHIFT: u32 = 0;
+const RAW_CONTENT_SHIFT: u32 = 2;
+const RAW_STYLE_SHIFT: u32 = 26;
+const RAW_WIDE_SHIFT: u32 = 42;
+const RAW_PROTECTED_SHIFT: u32 = 44;
+const RAW_HYPERLINK_SHIFT: u32 = 45;
+const RAW_SEMANTIC_SHIFT: u32 = 46;
+const RAW_CODEPOINT_MASK: u64 = (1 << 21) - 1;
+
+impl RawCell {
+    #[inline]
+    pub fn decode(raw: ffi::GhosttyCell) -> Self {
+        let content = (raw >> RAW_CONTENT_SHIFT) & 0xFF_FFFF;
+        let (content_tag, codepoint, bg) = match (raw >> RAW_TAG_SHIFT) & 0b11 {
+            0 => (
+                RawContentTag::Codepoint,
+                (content & RAW_CODEPOINT_MASK) as u32,
+                None,
+            ),
+            1 => (
+                RawContentTag::CodepointGrapheme,
+                (content & RAW_CODEPOINT_MASK) as u32,
+                None,
+            ),
+            2 => (
+                RawContentTag::BgPalette,
+                0,
+                Some(CellColor::Palette((content & 0xFF) as u8)),
+            ),
+            _ => (
+                RawContentTag::BgRgb,
+                0,
+                Some(CellColor::Rgb(RgbColor {
+                    r: (content & 0xFF) as u8,
+                    g: ((content >> 8) & 0xFF) as u8,
+                    b: ((content >> 16) & 0xFF) as u8,
+                })),
+            ),
+        };
+        let wide = match (raw >> RAW_WIDE_SHIFT) & 0b11 {
+            0 => CellWide::Narrow,
+            1 => CellWide::Wide,
+            2 => CellWide::SpacerTail,
+            _ => CellWide::SpacerHead,
+        };
+        Self {
+            content_tag,
+            codepoint,
+            bg,
+            style_id: ((raw >> RAW_STYLE_SHIFT) & 0xFFFF) as u16,
+            wide,
+            has_hyperlink: (raw >> RAW_HYPERLINK_SHIFT) & 1 == 1,
+        }
+    }
+
+    /// Same contract as [`RowCellIter::is_default_blank`], from a raw value.
+    #[inline]
+    pub fn is_default_blank(raw: ffi::GhosttyCell) -> bool {
+        const PRESENTATION_BITS: u64 =
+            ((1 << RAW_PROTECTED_SHIFT) - 1) | (1 << RAW_HYPERLINK_SHIFT);
+        raw & PRESENTATION_BITS == 0
+    }
+
+    /// Composes a raw value with the assumed layout. Only verification and
+    /// tests build cells; terminal state always comes from native code.
+    fn compose(tag: u64, content: u64, style_id: u16, wide: u64, flags: u64) -> ffi::GhosttyCell {
+        (tag << RAW_TAG_SHIFT)
+            | ((content & 0xFF_FFFF) << RAW_CONTENT_SHIFT)
+            | (u64::from(style_id) << RAW_STYLE_SHIFT)
+            | ((wide & 0b11) << RAW_WIDE_SHIFT)
+            | flags
+    }
+}
+
+/// Whether [`RawCell::decode`] matches the linked library's own cell getters.
+/// Checked once per process on synthetic values covering every field and tag.
+pub fn raw_cell_layout_verified() -> bool {
+    static VERIFIED: OnceLock<bool> = OnceLock::new();
+    *VERIFIED.get_or_init(verify_raw_cell_layout)
+}
+
+fn verify_raw_cell_layout() -> bool {
+    let protected = 1u64 << RAW_PROTECTED_SHIFT;
+    let hyperlink = 1u64 << RAW_HYPERLINK_SHIFT;
+    let semantic = 0b10u64 << RAW_SEMANTIC_SHIFT;
+    let samples = [
+        0,
+        RawCell::compose(0, u64::from(b'A'), 0, 0, 0),
+        RawCell::compose(0, 0x1F_FFFF, 0xFFFF, 3, protected | hyperlink | semantic),
+        RawCell::compose(0, 0x6F22, 0x1234, 1, hyperlink),
+        RawCell::compose(1, 0x1F469, 0x8001, 1, 0),
+        RawCell::compose(1, 0x0065, 1, 0, semantic),
+        RawCell::compose(0, 0, 0, 2, protected),
+        RawCell::compose(2, 0xAB, 0, 0, 0),
+        RawCell::compose(2, 0x07, 0x00FF, 0, hyperlink),
+        RawCell::compose(3, 0x56_34_12, 0, 0, 0),
+        RawCell::compose(3, 0xFF_00_FF, 0x7FFF, 3, protected),
+    ];
+    samples
+        .into_iter()
+        .all(|raw| raw_cell_matches_native(raw).unwrap_or(false))
+}
+
+fn raw_cell_matches_native(raw: ffi::GhosttyCell) -> Result<bool, Error> {
+    fn get<T: Default>(raw: ffi::GhosttyCell, data: ffi::GhosttyCellData) -> Result<T, Error> {
+        let mut out = T::default();
+        // SAFETY: each call site pairs the data kind with its documented output type.
+        unsafe {
+            ffi::ghostty_cell_get(raw, data, (&mut out as *mut T).cast()).into_result()?;
+        }
+        Ok(out)
+    }
+    let decoded = RawCell::decode(raw);
+    let tag: ffi::GhosttyCellContentTag =
+        get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_CONTENT_TAG)?;
+    let expected_tag = match tag {
+        ffi::GhosttyCellContentTag_GHOSTTY_CELL_CONTENT_CODEPOINT => RawContentTag::Codepoint,
+        ffi::GhosttyCellContentTag_GHOSTTY_CELL_CONTENT_CODEPOINT_GRAPHEME => {
+            RawContentTag::CodepointGrapheme
+        }
+        ffi::GhosttyCellContentTag_GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE => {
+            RawContentTag::BgPalette
+        }
+        ffi::GhosttyCellContentTag_GHOSTTY_CELL_CONTENT_BG_COLOR_RGB => RawContentTag::BgRgb,
+        _ => return Ok(false),
+    };
+    let wide: ffi::GhosttyCellWide = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_WIDE)?;
+    let style_id: ffi::GhosttyStyleId = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_STYLE_ID)?;
+    let has_hyperlink: bool = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_HAS_HYPERLINK)?;
+    let content_matches = match expected_tag {
+        RawContentTag::Codepoint | RawContentTag::CodepointGrapheme => {
+            let codepoint: u32 = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT)?;
+            decoded.codepoint == codepoint && decoded.bg.is_none()
+        }
+        RawContentTag::BgPalette => {
+            let index: u8 = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_COLOR_PALETTE)?;
+            decoded.bg == Some(CellColor::Palette(index))
+        }
+        RawContentTag::BgRgb => {
+            let color: ffi::GhosttyColorRgb =
+                get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_COLOR_RGB)?;
+            decoded.bg == Some(CellColor::Rgb(color.into()))
+        }
+    };
+    let has_styling: bool = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_HAS_STYLING)?;
+    let has_text: bool = get(raw, ffi::GhosttyCellData_GHOSTTY_CELL_DATA_HAS_TEXT)?;
+    let decoded_has_text = matches!(
+        decoded.content_tag,
+        RawContentTag::Codepoint | RawContentTag::CodepointGrapheme
+    ) && decoded.codepoint != 0;
+    Ok(decoded.content_tag == expected_tag
+        && decoded.wide == CellWide::from_raw(wide)
+        && decoded.style_id == style_id
+        && (decoded.style_id != 0) == has_styling
+        && decoded_has_text == has_text
+        && decoded.has_hyperlink == has_hyperlink
+        && content_matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // Count only actual GRAPHEMES_UTF8 native calls on this test's thread. The
+    // reference and candidate share the native call boundary, not the algorithm.
+    thread_local! {
+        pub(super) static GRAPHEME_UTF8_NATIVE_READS: Cell<usize> = const { Cell::new(0) };
+        pub(super) static GRAPHEME_UTF8_OFFERED_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    // Frozen null-buffer/two-call algorithm from c7169f2. Only the native call
+    // boundary is factored so both paths increment the same per-thread counter.
+    fn grapheme_text_into_c716(
+        cells: &RowCellIter<'_>,
+        bytes: &mut Vec<u8>,
+        text: &mut String,
+    ) -> Result<(), Error> {
+        text.clear();
         bytes.clear();
 
         let mut buffer = ffi::GhosttyBuffer {
@@ -3626,16 +3925,10 @@ impl<'a> RowCellIter<'a> {
             cap: 0,
             len: 0,
         };
-        let result = unsafe {
-            ffi::ghostty_render_state_row_cells_get(
-                self.cells.raw,
-                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
-                (&mut buffer as *mut ffi::GhosttyBuffer).cast(),
-            )
-        };
+        let result = cells.read_graphemes_utf8_buffer(&mut buffer);
         match result {
             ffi::GhosttyResult_GHOSTTY_SUCCESS if buffer.len == 0 => {
-                return self.raw_cell_text_into(text);
+                return cells.raw_cell_text_into(text);
             }
             ffi::GhosttyResult_GHOSTTY_SUCCESS => {
                 return Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE));
@@ -3645,7 +3938,7 @@ impl<'a> RowCellIter<'a> {
         }
 
         if buffer.len == 0 {
-            return self.raw_cell_text_into(text);
+            return cells.raw_cell_text_into(text);
         }
         bytes.resize(buffer.len, 0);
         let mut buffer = ffi::GhosttyBuffer {
@@ -3653,14 +3946,9 @@ impl<'a> RowCellIter<'a> {
             cap: bytes.len(),
             len: 0,
         };
-        unsafe {
-            ffi::ghostty_render_state_row_cells_get(
-                self.cells.raw,
-                ffi::GhosttyRenderStateRowCellsData_GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
-                (&mut buffer as *mut ffi::GhosttyBuffer).cast(),
-            )
+        cells
+            .read_graphemes_utf8_buffer(&mut buffer)
             .into_result()?;
-        }
         if buffer.len > bytes.len() {
             return Err(Error(ffi::GhosttyResult_GHOSTTY_OUT_OF_SPACE));
         }
@@ -3671,12 +3959,154 @@ impl<'a> RowCellIter<'a> {
         }
         Ok(())
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
+    fn assert_grapheme_reads(
+        cells: &RowCellIter<'_>,
+        legacy_bytes: &mut Vec<u8>,
+        candidate_bytes: &mut Vec<u8>,
+        expected: &str,
+        legacy_reads: usize,
+        candidate_reads: usize,
+    ) {
+        let mut legacy_text = String::from("stale legacy text");
+        let mut candidate_text = String::from("stale candidate text");
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        grapheme_text_into_c716(cells, legacy_bytes, &mut legacy_text).unwrap();
+        assert_eq!(
+            GRAPHEME_UTF8_NATIVE_READS.with(Cell::get),
+            legacy_reads,
+            "reference native reads for {expected:?}"
+        );
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        cells
+            .grapheme_text_into(candidate_bytes, &mut candidate_text)
+            .unwrap();
+        assert_eq!(
+            GRAPHEME_UTF8_NATIVE_READS.with(Cell::get),
+            candidate_reads,
+            "candidate native reads for {expected:?}"
+        );
+        assert_eq!(legacy_text, expected);
+        assert_eq!(candidate_text, legacy_text);
+        assert_eq!(candidate_bytes, legacy_bytes);
+    }
+
+    #[test]
+    fn grapheme_scratch_warm_ascii_uses_one_real_native_read() {
+        let mut terminal = Terminal::new(8, 3, 0).unwrap();
+        terminal.write(b"A");
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        assert!(cells.next());
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::new();
+        let mut text = String::new();
+        grapheme_text_into_c716(&cells, &mut legacy, &mut text).unwrap();
+        cells.grapheme_text_into(&mut candidate, &mut text).unwrap();
+        assert_eq!(candidate.len(), 1);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+    }
+
+    #[test]
+    fn grapheme_scratch_reuses_initialized_bytes_across_real_native_reads() {
+        let mut terminal = Terminal::new(48, 3, 0).unwrap();
+        let long = format!("e{}", "\u{301}".repeat(20));
+        terminal.write(
+            format!("\x1b[1;1HA\x1b[1;3Hz\x1b[1;5He\u{301}\x1b[1;9H👩‍💻\x1b[1;15H{long}").as_bytes(),
+        );
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::new();
+
+        cells.select(0).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+        cells.select(2).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "z", 2, 1);
+        cells.select(4).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "e\u{301}", 2, 2);
+        cells.select(8).unwrap();
+        assert!(candidate.len() < "👩‍💻".len());
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "👩‍💻", 2, 2);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "👩‍💻", 2, 1);
+        cells.select(14).unwrap();
+        assert!(candidate.len() < long.len());
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, &long, 2, 2);
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, &long, 2, 1);
+        cells.select(0).unwrap();
+        let retained_capacity = candidate.capacity();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "A", 2, 1);
+        assert_eq!(candidate.len(), 1);
+        for _ in 0..512 {
+            let mut text = String::new();
+            GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+            GRAPHEME_UTF8_OFFERED_BYTES.with(|offered| offered.set(0));
+            cells.grapheme_text_into(&mut candidate, &mut text).unwrap();
+            assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+            assert_eq!(GRAPHEME_UTF8_OFFERED_BYTES.with(Cell::get), 1);
+            assert_eq!(candidate.len(), 1);
+            assert_eq!(candidate.capacity(), retained_capacity);
+            assert_eq!(text, "A");
+        }
+        cells.select(30).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "", 1, 1);
+        assert!(candidate.is_empty());
+        cells.select(2).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "z", 2, 1);
+
+        // Capacity without initialized elements must be made writable safely.
+        let mut reserved = Vec::with_capacity(64);
+        let mut reference = Vec::new();
+        assert_grapheme_reads(&cells, &mut reference, &mut reserved, "z", 2, 1);
+        assert_eq!(reserved.len(), 1);
+    }
+
+    #[test]
+    fn grapheme_scratch_cold_empty_and_invalid_native_position_match_c716() {
+        let terminal = Terminal::new(8, 3, 0).unwrap();
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        assert!(rows.next());
+        let mut row_cells = RowCells::new().unwrap();
+        let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+        let mut legacy = Vec::new();
+        let mut candidate = Vec::with_capacity(8);
+        let mut legacy_text = String::from("legacy");
+        let mut candidate_text = String::from("candidate");
+
+        // populate_cells leaves the native position at its sentinel until next
+        // or select. Both algorithms must propagate that native rejection.
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        let old_error = grapheme_text_into_c716(&cells, &mut legacy, &mut legacy_text);
+        assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+        GRAPHEME_UTF8_NATIVE_READS.with(|reads| reads.set(0));
+        let new_error = cells.grapheme_text_into(&mut candidate, &mut candidate_text);
+        assert_eq!(GRAPHEME_UTF8_NATIVE_READS.with(Cell::get), 1);
+        assert_eq!(
+            old_error,
+            Err(Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))
+        );
+        assert_eq!(new_error, old_error);
+        assert_eq!(candidate_text, legacy_text);
+        assert!(candidate.is_empty());
+
+        cells.select(0).unwrap();
+        assert_grapheme_reads(&cells, &mut legacy, &mut candidate, "", 1, 1);
+        let mut cold = Vec::new();
+        assert_grapheme_reads(&cells, &mut legacy, &mut cold, "", 1, 1);
+    }
 
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {
@@ -4552,6 +4982,93 @@ mod tests {
             terminal.read_text_viewport((0, 0), (6, 0), false).unwrap(),
             "primary"
         );
+    }
+
+    #[test]
+    fn raw_cell_layout_is_verified_for_the_vendored_library() {
+        assert!(raw_cell_layout_verified());
+    }
+
+    #[test]
+    fn raw_cell_decode_matches_per_cell_accessors_for_every_content_kind() {
+        let mut terminal = Terminal::new(12, 7, 0).unwrap();
+        terminal.write(
+            concat!(
+                "plain \x1b[1;31mbold\x1b[0m\r\n",
+                "\u{6f22}\u{5b57}e\u{301}\u{1f469}\u{200d}\u{1f4bb}\r\n",
+                "\x1b]8;;https://example.test/a\x1b\\link\x1b]8;;\x1b\\ x\r\n",
+                "\x1b[41m\x1b[K\x1b[0m\r\n",
+                "\x1b[48;2;1;2;3m\x1b[K\x1b[0m\r\n",
+                "abcdefghijk\u{6f22}\x1b[38;5;99;4mz\x1b[0m",
+            )
+            .as_bytes(),
+        );
+        let mut state = RenderState::new().unwrap();
+        state.update(&terminal).unwrap();
+        let mut row_iterator = RowIterator::new().unwrap();
+        let mut rows = state.populate_row_iterator(&mut row_iterator).unwrap();
+        let mut row_cells = RowCells::new().unwrap();
+        let mut seen_tags = Vec::new();
+        let mut seen_wide = Vec::new();
+        let mut seen_link = false;
+        let mut seen_style = false;
+        while rows.next() {
+            let raws = rows.cells_raw().unwrap();
+            assert_eq!(raws.len(), 12);
+            let mut cells = rows.populate_cells(&mut row_cells).unwrap();
+            for &raw in raws {
+                assert!(cells.next());
+                assert_eq!(cells.raw_cell().unwrap(), raw);
+                assert!(raw_cell_matches_native(raw).unwrap(), "raw {raw:#x}");
+                let decoded = RawCell::decode(raw);
+                assert_eq!(decoded.wide, cells.wide().unwrap());
+                assert_eq!(decoded.has_hyperlink, cells.has_hyperlink().unwrap());
+                assert_eq!(decoded.bg, cells.content_bg_color().unwrap());
+                assert_eq!(
+                    RawCell::is_default_blank(raw),
+                    cells.is_default_blank().unwrap()
+                );
+                let text = cells.grapheme_text().unwrap();
+                assert_eq!(
+                    text.chars().next().map(u32::from).unwrap_or(0),
+                    decoded.codepoint
+                );
+                assert_eq!(
+                    text.chars().count() > 1,
+                    decoded.content_tag == RawContentTag::CodepointGrapheme
+                );
+                if decoded.style_id == 0 {
+                    assert_eq!(cells.style().unwrap(), CellStyle::default());
+                } else {
+                    seen_style = true;
+                }
+                seen_link |= decoded.has_hyperlink;
+                if !seen_tags.contains(&decoded.content_tag) {
+                    seen_tags.push(decoded.content_tag);
+                }
+                if !seen_wide.contains(&decoded.wide) {
+                    seen_wide.push(decoded.wide);
+                }
+            }
+            assert!(!cells.next());
+        }
+        assert!(seen_link && seen_style);
+        for tag in [
+            RawContentTag::Codepoint,
+            RawContentTag::CodepointGrapheme,
+            RawContentTag::BgPalette,
+            RawContentTag::BgRgb,
+        ] {
+            assert!(seen_tags.contains(&tag), "{tag:?} not covered");
+        }
+        for wide in [
+            CellWide::Narrow,
+            CellWide::Wide,
+            CellWide::SpacerTail,
+            CellWide::SpacerHead,
+        ] {
+            assert!(seen_wide.contains(&wide), "{wide:?} not covered");
+        }
     }
 
     #[test]

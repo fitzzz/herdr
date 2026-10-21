@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
@@ -52,7 +52,10 @@ pub(crate) struct HandoffManifest {
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
-    pub fds: Vec<RawFd>,
+    pub fds: Vec<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    pub identities:
+        Option<std::collections::HashMap<u32, super::handoff_identity::AdmittedPaneIdentity>>,
     pub stream: UnixStream,
 }
 
@@ -227,12 +230,53 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
+    receive_inner(
+        socket_path,
+        token,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn receive_with_identity(
+    socket_path: &Path,
+    token: &str,
+    attempt: &super::handoff_identity::IdentityAttempt,
+) -> io::Result<ReceivedHandoff> {
+    let result = receive_inner(socket_path, token, Some(attempt));
+    if let Err(error) = &result {
+        attempt.record_error("receive", error);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn receive_inner(
+    socket_path: &Path,
+    token: &str,
+    #[cfg(target_os = "linux")] identity: Option<&super::handoff_identity::IdentityAttempt>,
+) -> io::Result<ReceivedHandoff> {
     let mut stream = UnixStream::connect(socket_path)?;
+    #[cfg(target_os = "linux")]
+    if let Some(attempt) = identity {
+        attempt.verify_peer(&stream)?;
+    }
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let manifest_line = read_line_unbuffered(&mut stream)?;
+    #[cfg(target_os = "linux")]
+    let manifest: HandoffManifest = if identity.is_some() {
+        serde_json::from_value(super::handoff_identity::parse_unique_json(
+            manifest_line.as_bytes(),
+        )?)
+        .map_err(io::Error::other)?
+    } else {
+        serde_json::from_str(&manifest_line).map_err(io::Error::other)?
+    };
+    #[cfg(not(target_os = "linux"))]
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
     if manifest.version != HANDOFF_VERSION {
@@ -262,12 +306,28 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             crate::build_info::version()
         )));
     }
+    #[cfg(target_os = "linux")]
+    let identities = identity
+        .map(|attempt| attempt.admit(&manifest, manifest_line.as_bytes()))
+        .transpose()?;
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
+    let fds: Vec<OwnedFd> = recv_fds(&stream, manifest.panes.len())?
+        .into_iter()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect();
+    #[cfg(target_os = "linux")]
+    if let Some(attempt) = identity {
+        for fd in &fds {
+            crate::platform::migration_validate_master_fd(fd.as_raw_fd())?;
+        }
+        attempt.verify_processes()?;
+    }
     Ok(ReceivedHandoff {
         manifest,
         fds,
+        #[cfg(target_os = "linux")]
+        identities,
         stream,
     })
 }
@@ -517,6 +577,15 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
     if out.is_empty() {
         return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
     }
+    // Received copies do not inherit their source descriptor's CLOEXEC bit.
+    // Seal the whole batch before restoration can start helper subprocesses,
+    // including copies not yet consumed by an individual PTY actor.
+    for fd in &out {
+        if let Err(error) = crate::pty::fd::set_cloexec(*fd) {
+            close_raw_fds(&out);
+            return Err(error);
+        }
+    }
     Ok(out)
 }
 
@@ -528,6 +597,20 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_handoff_descriptors_are_sealed_before_restore() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let source = std::fs::File::open("/dev/null").unwrap();
+        send_fds(&sender, &[source.as_raw_fd(), source.as_raw_fd()]).unwrap();
+        let received = recv_fds(&receiver, 2).unwrap();
+        assert_eq!(received.len(), 2);
+        for fd in &received {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        }
+        close_raw_fds(&received);
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

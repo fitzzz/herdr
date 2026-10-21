@@ -7,6 +7,11 @@ use super::{
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PANE_INFO_OBSERVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn resolve_new_terminal_cwd(
     policy: &NewTerminalCwdConfig,
     follow_cwd: Option<PathBuf>,
@@ -309,6 +314,9 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::PaneInfo> {
+        crate::render_prof::event("metadata.pane_info");
+        #[cfg(test)]
+        PANE_INFO_OBSERVATIONS.with(|count| count.set(count.get() + 1));
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;

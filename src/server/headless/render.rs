@@ -218,7 +218,10 @@ impl HeadlessServer {
         needs_full_render: bool,
         needs_graphics_render: bool,
     ) -> bool {
-        needs_full_render || needs_graphics_render || self.app.render_dirty.has_immediate_work()
+        needs_full_render
+            || needs_graphics_render
+            || self.has_ready_render_recoveries()
+            || self.app.render_dirty.has_immediate_work()
     }
 
     pub(super) fn sync_immediate_pty_sources(&self) {
@@ -324,7 +327,7 @@ impl HeadlessServer {
         })
     }
 
-    fn terminal_id_for_pane(
+    pub(super) fn terminal_id_for_pane(
         &self,
         pane_id: crate::layout::PaneId,
     ) -> Option<&crate::terminal::TerminalId> {
@@ -373,15 +376,38 @@ impl HeadlessServer {
     }
 
     pub(super) fn render_and_stream(&mut self) {
-        self.render_and_stream_with_graphics_limit(MAX_GRAPHICS_FRAME_SIZE);
+        #[cfg(test)]
+        let limit = self.test_render_frame_limit;
+        #[cfg(not(test))]
+        let limit = MAX_GRAPHICS_FRAME_SIZE;
+        self.render_and_stream_with_graphics_limit(limit, None);
+        self.retire_accepted_render_recoveries();
+    }
+
+    pub(super) fn render_and_stream_for_recipients(&mut self, recipients: &HashSet<u64>) {
+        #[cfg(test)]
+        {
+            self.render_recovery_attempts += 1;
+        }
+        #[cfg(test)]
+        let limit = self.test_render_frame_limit;
+        #[cfg(not(test))]
+        let limit = MAX_GRAPHICS_FRAME_SIZE;
+        self.render_and_stream_with_graphics_limit(limit, Some(recipients));
+        self.retire_accepted_render_recoveries();
     }
 
     #[cfg(all(test, unix))]
     pub(super) fn render_and_stream_with_test_graphics_limit(&mut self, max: usize) {
-        self.render_and_stream_with_graphics_limit(max);
+        self.render_and_stream_with_graphics_limit(max, None);
+        self.retire_accepted_render_recoveries();
     }
 
-    fn render_and_stream_with_graphics_limit(&mut self, graphics_frame_limit: usize) {
+    fn render_and_stream_with_graphics_limit(
+        &mut self,
+        graphics_frame_limit: usize,
+        recipients: Option<&HashSet<u64>>,
+    ) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
@@ -487,14 +513,44 @@ impl HeadlessServer {
             }
         }
 
+        // Lazily observe metadata only if this pass actually selects a shell recipient.
+        // Direct-only recovery must not pay for unrelated shell projections.
+        let mut shell_base_snapshot = None;
         let mut broken_clients: Vec<u64> = Vec::new();
         for (client_id, (cols, rows), cell_size, _is_foreground, mode) in render_targets {
+            if recipients.is_some_and(|recipients| !recipients.contains(&client_id)) {
+                continue;
+            }
+            let waiting_for_drain = self
+                .render_recoveries_waiting_for_drain
+                .contains(&client_id)
+                && self
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.deferred_render() != DeferredRender::None);
+            let waiting_for_change = self
+                .render_recoveries_waiting_for_change
+                .get(&client_id)
+                .is_some_and(|shape| {
+                    self.clients
+                        .get(&client_id)
+                        .is_some_and(|client| shape.matches(client))
+                });
+            let surface_blocked = waiting_for_drain || waiting_for_change;
+            // Semantic shell controls use the independent reliable lane even
+            // when this recipient cannot accept or represent a surface frame.
+            if surface_blocked
+                && (recipients.is_some() || !matches!(mode, ClientConnectionMode::ClientShell))
+            {
+                continue;
+            }
             #[cfg(unix)]
             if matches!(mode, ClientConnectionMode::TerminalObserve { .. })
                 && self
                     .clients
                     .get(&client_id)
                     .is_some_and(|client| client.deferred_render() != DeferredRender::None)
+                && !self.pending_render_recoveries.contains(&client_id)
             {
                 // The writer-drained event schedules recovery, even if pane output stops.
                 continue;
@@ -509,6 +565,7 @@ impl HeadlessServer {
                 .map(|client| client.shell_graphics_delivery.clone())
                 .unwrap_or_default();
             let shell_render = if matches!(mode, ClientConnectionMode::ClientShell)
+                && !surface_blocked
                 && self
                     .clients
                     .get(&client_id)
@@ -562,13 +619,16 @@ impl HeadlessServer {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     continue;
                 };
-                let (mut candidate, mut completions) = client_shell_snapshot(
-                    &self.app,
-                    &self.client_shell_boot_id,
-                    client.shell_projection_revision,
-                    None,
-                    location.as_ref(),
-                );
+                let base = shell_base_snapshot.get_or_insert_with(|| {
+                    client_shell_snapshot(&self.app, &self.client_shell_boot_id, 0, None, None)
+                });
+                let (mut candidate, mut completions) =
+                    crate::server::client_shell::snapshot_for_location(
+                        &self.app,
+                        base,
+                        client.shell_projection_revision,
+                        location.as_ref(),
+                    );
                 candidate.config_diagnostic = if client.shell_uses_endpoint_keybindings {
                     self.server_config_diagnostic.clone()
                 } else {
@@ -664,7 +724,11 @@ impl HeadlessServer {
                     continue;
                 }
             }
+            if surface_blocked {
+                continue;
+            }
             let mut surface_parts = None;
+            let mut row_revisions = None;
             let frame = match mode {
                 ClientConnectionMode::ClientShell => {
                     let crate::server::client_shell::RenderedPaneSurface {
@@ -709,18 +773,25 @@ impl HeadlessServer {
                         continue;
                     }
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        crate::server::render_stream::render_terminal_virtual(runtime, area);
-                    crate::render_prof::duration_since(
-                        "full_render.render_terminal_virtual",
-                        render_started,
-                    );
-                    let hyperlinks_started = crate::render_prof::timer();
-                    let hyperlinks = runtime.visible_hyperlinks(area);
-                    crate::render_prof::duration_since(
-                        "full_render.visible_hyperlinks",
-                        hyperlinks_started,
-                    );
+                    let screen_frame =
+                        crate::server::render_stream::render_terminal_frame(runtime, area);
+                    crate::render_prof::duration_since("full_render.screen_frame", render_started);
+                    let legacy = screen_frame.is_none().then(|| {
+                        let render_started = crate::render_prof::timer();
+                        let (buffer, cursor) =
+                            crate::server::render_stream::render_terminal_virtual(runtime, area);
+                        crate::render_prof::duration_since(
+                            "full_render.render_terminal_virtual",
+                            render_started,
+                        );
+                        let hyperlinks_started = crate::render_prof::timer();
+                        let hyperlinks = runtime.visible_hyperlinks(area);
+                        crate::render_prof::duration_since(
+                            "full_render.visible_hyperlinks",
+                            hyperlinks_started,
+                        );
+                        (buffer, cursor, hyperlinks)
+                    });
                     let (synchronized, after_epoch) = runtime.synchronized_output_state();
                     if synchronized || after_epoch != epoch {
                         if let Some(client) = self.clients.get_mut(&client_id) {
@@ -731,14 +802,26 @@ impl HeadlessServer {
                         }
                         continue;
                     }
-                    let frame_started = crate::render_prof::timer();
-                    let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
-                        &buffer,
-                        cursor,
-                        &hyperlinks,
-                    );
-                    crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    match (screen_frame, legacy) {
+                        (Some((frame, revisions)), _) => {
+                            row_revisions = revisions;
+                            frame
+                        }
+                        (None, Some((buffer, cursor, hyperlinks))) => {
+                            let frame_started = crate::render_prof::timer();
+                            let frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+                                &buffer,
+                                cursor,
+                                &hyperlinks,
+                            );
+                            crate::render_prof::duration_since(
+                                "full_render.frame_build",
+                                frame_started,
+                            );
+                            frame
+                        }
+                        (None, None) => continue,
+                    }
                 }
             };
 
@@ -788,7 +871,9 @@ impl HeadlessServer {
                         native_upload.is_some(),
                     )
                 } else {
-                    client.render_state.prepare_frame(frame)
+                    client
+                        .render_state
+                        .prepare_frame_with_revisions(frame, row_revisions)
                 };
             let Some(mut prepared) = prepared else {
                 client.clear_deferred_render();
@@ -798,7 +883,7 @@ impl HeadlessServer {
             let max = if has_graphics {
                 graphics_frame_limit
             } else {
-                crate::protocol::MAX_FRAME_SIZE
+                crate::protocol::MAX_FRAME_SIZE.min(graphics_frame_limit)
             };
             let mut shell_assets_deferred = false;
             let mut suppress_impossible_asset_retry = false;
@@ -834,6 +919,7 @@ impl HeadlessServer {
                             client.defer_full_render();
                         } else {
                             crate::render_prof::event("full_render.serialize_oversized");
+                            self.wait_for_render_recovery_change(client_id);
                         }
                         continue;
                     };
@@ -868,6 +954,7 @@ impl HeadlessServer {
                         claimed, max, "skipping oversized frame for client"
                     );
                     crate::render_prof::event("full_render.serialize_oversized");
+                    self.wait_for_render_recovery_change(client_id);
                     continue;
                 }
                 Err(err) => {
@@ -910,6 +997,9 @@ impl HeadlessServer {
                     client.render_state.commit_sent_frame(prepared);
                     if shell_graphics_pending || shell_assets_deferred {
                         client.defer_full_render();
+                        if self.pending_render_recoveries.contains(&client_id) {
+                            self.render_recoveries_waiting_for_drain.insert(client_id);
+                        }
                     } else {
                         client.clear_deferred_render();
                     }
@@ -917,6 +1007,9 @@ impl HeadlessServer {
                 }
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     client.defer_full_render();
+                    if self.pending_render_recoveries.contains(&client_id) {
+                        self.render_recoveries_waiting_for_drain.insert(client_id);
+                    }
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     broken_clients.push(client_id);

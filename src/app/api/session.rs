@@ -3,7 +3,20 @@ use crate::app::App;
 
 use super::responses::encode_success;
 
+#[cfg(test)]
+thread_local! {
+    static SESSION_SNAPSHOT_OBSERVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl App {
+    #[cfg(test)]
+    pub(crate) fn test_metadata_observation_counts(&self) -> (u64, u64) {
+        (
+            SESSION_SNAPSHOT_OBSERVATIONS.with(std::cell::Cell::get),
+            crate::app::creation::PANE_INFO_OBSERVATIONS.with(std::cell::Cell::get),
+        )
+    }
+
     pub(super) fn handle_session_snapshot(&mut self, id: String) -> String {
         encode_success(
             id,
@@ -14,6 +27,9 @@ impl App {
     }
 
     pub(crate) fn session_snapshot(&self) -> SessionSnapshot {
+        let started = crate::render_prof::timer();
+        #[cfg(test)]
+        SESSION_SNAPSHOT_OBSERVATIONS.with(|count| count.set(count.get() + 1));
         let focused_workspace_id = self
             .state
             .active
@@ -42,7 +58,14 @@ impl App {
             }
         }
 
-        SessionSnapshot {
+        // Observe each pane once so its agent projection shares the same live cwd,
+        // scroll and presentation observation instead of repeating runtime queries.
+        let panes = self.collect_panes_for_workspace(None).unwrap_or_default();
+        let agents = panes
+            .iter()
+            .filter_map(|pane| self.agent_info_from_pane(pane))
+            .collect();
+        let snapshot = SessionSnapshot {
             version: crate::build_info::version(),
             protocol: crate::protocol::PROTOCOL_VERSION,
             focused_workspace_id,
@@ -50,10 +73,12 @@ impl App {
             focused_pane_id,
             workspaces,
             tabs,
-            panes: self.collect_panes_for_workspace(None).unwrap_or_default(),
+            panes,
             layouts,
-            agents: self.collect_agent_infos(),
-        }
+            agents,
+        };
+        crate::render_prof::duration_since("metadata.session_snapshot", started);
+        snapshot
     }
 }
 
@@ -77,6 +102,37 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app
+    }
+
+    #[test]
+    fn metadata_session_agents_reuse_pane_observations_and_keep_authority() {
+        let mut app = app_with_two_tabs();
+        let first = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].terminal_id(first).unwrap().clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.agent_name = Some("metadata-agent".into());
+        terminal.last_agent_state_change_seq = Some(19);
+        terminal.last_agent_completion_seq = Some(17);
+        terminal.state_change_epoch = Some("metadata-epoch".into());
+        let expected = app.collect_agent_infos();
+        let before = app.test_metadata_observation_counts();
+        let snapshot = app.session_snapshot();
+        let after = app.test_metadata_observation_counts();
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, snapshot.panes.len() as u64);
+        assert_eq!(snapshot.agents, expected);
+        assert_eq!(snapshot.agents.len(), 1, "nonagent panes remain excluded");
+        assert_eq!(
+            snapshot.agents[0].state_change_epoch.as_deref(),
+            Some("metadata-epoch")
+        );
+        assert_eq!(snapshot.agents[0].completion_seq, Some(17));
+        assert_eq!(snapshot.agents[0].state_change_seq, 19);
+        assert_eq!(snapshot.agents[0].cwd, snapshot.panes[0].cwd);
+        assert_eq!(
+            snapshot.agents[0].foreground_cwd,
+            snapshot.panes[0].foreground_cwd
+        );
     }
 
     #[test]
