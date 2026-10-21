@@ -216,7 +216,7 @@ pub fn launch_options_from_agent_args(
     args: &[String],
 ) -> Option<AgentLaunchOptions> {
     let parsed = match agent {
-        crate::detect::Agent::Claude => parse_claude_args(args),
+        crate::detect::Agent::Claude => parse_claude_args(args).map(|launch| launch.options),
         crate::detect::Agent::Codex => parse_codex_args(args).map(|launch| launch.options),
         _ => return None,
     };
@@ -224,6 +224,25 @@ pub fn launch_options_from_agent_args(
         Ok(options) => AgentLaunchOptions::Known(options),
         Err(reason) => AgentLaunchOptions::Unavailable(reason),
     })
+}
+
+/// The conversation id a Claude or Codex process command line resumes
+/// (`claude --resume <id>`, `codex resume <id>`), when it names one.
+pub fn resumed_session_from_process_argv(
+    agent: crate::detect::Agent,
+    argv: &[String],
+) -> Option<String> {
+    let args = &argv[agent_args_start(argv)?..];
+    match agent {
+        crate::detect::Agent::Claude => parse_claude_args(args).ok()?.session_id,
+        crate::detect::Agent::Codex => {
+            parse_codex_args(args)
+                .ok()
+                .filter(|launch| launch.resume && !launch.last)?
+                .session_id
+        }
+        _ => None,
+    }
 }
 
 /// The restore plan for a saved session together with its launch options.
@@ -680,15 +699,28 @@ fn next_launch_arg(
 /// `--add-dir a b` takes every following argument up to the next one that
 /// starts with `-`, so a prompt typed after it is one of its values to Claude
 /// too, and is kept as such.
-fn parse_claude_args(args: &[String]) -> Result<Vec<String>, LaunchOptionsUnavailable> {
-    let mut options = Vec::new();
+#[derive(Debug, Default)]
+struct ClaudeLaunch {
+    options: Vec<String>,
+    /// The conversation `--resume <id>` or `--resume=<id>` names.
+    session_id: Option<String>,
+}
+
+fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, LaunchOptionsUnavailable> {
+    let mut launch = ClaudeLaunch::default();
     let mut operands = 0;
     let mut index = 0;
     while index < args.len() {
         match next_launch_arg(CLAUDE_OPTIONS, ParserStyle::Commander, &args[index..])? {
             LaunchArg::Option { spec, len } => {
                 if spec.keep {
-                    options.extend_from_slice(&args[index..index + len]);
+                    launch.options.extend_from_slice(&args[index..index + len]);
+                }
+                if spec.names[0] == "-r" {
+                    launch.session_id = match len {
+                        2 => Some(args[index + 1].clone()),
+                        _ => args[index].strip_prefix("--resume=").map(String::from),
+                    };
                 }
                 index += len;
             }
@@ -702,7 +734,7 @@ fn parse_claude_args(args: &[String]) -> Result<Vec<String>, LaunchOptionsUnavai
             LaunchArg::EndOfOptions => break,
         }
     }
-    Ok(options)
+    Ok(launch)
 }
 
 #[derive(Debug, Default)]
@@ -2012,6 +2044,68 @@ mod tests {
         }
         // After `--`, `exec` is the prompt.
         assert_eq!(codex_options(&["--", "exec"]), known(&[]));
+    }
+
+    #[test]
+    fn resumed_session_from_process_argv_reads_the_resumed_conversation() {
+        for (agent, parts, expected) in [
+            (
+                Agent::Claude,
+                &["claude", "--resume", "placeholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Claude,
+                &["claude", "--resume=placeholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Claude,
+                &["claude", "-r", "placeholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Claude,
+                &[
+                    "node",
+                    "/placeholder/cli.js",
+                    "--verbose",
+                    "--resume",
+                    "placeholder-id",
+                ][..],
+                Some("placeholder-id"),
+            ),
+            (Agent::Claude, &["claude", "--resume"][..], None),
+            (Agent::Claude, &["claude", "--verbose"][..], None),
+            (
+                Agent::Claude,
+                &["claude", "--no-such-option", "--resume", "placeholder-id"][..],
+                None,
+            ),
+            (
+                Agent::Codex,
+                &["codex", "resume", "placeholder-id"][..],
+                Some("placeholder-id"),
+            ),
+            (
+                Agent::Codex,
+                &["codex", "--search", "resume", "placeholder-id", "-m", "x"][..],
+                Some("placeholder-id"),
+            ),
+            (Agent::Codex, &["codex", "resume", "--last"][..], None),
+            (Agent::Codex, &["codex", "placeholder-prompt"][..], None),
+            (
+                Agent::Droid,
+                &["droid", "--resume", "placeholder-id"][..],
+                None,
+            ),
+        ] {
+            assert_eq!(
+                resumed_session_from_process_argv(agent, &argv(parts)).as_deref(),
+                expected,
+                "{parts:?}"
+            );
+        }
     }
 
     #[test]

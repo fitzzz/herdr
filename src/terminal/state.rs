@@ -294,12 +294,14 @@ impl TerminalState {
         }));
     }
 
-    /// Detection read the command line of a Claude or Codex process.
+    /// Detection read the command line of a Claude or Codex process;
+    /// `resumed_session` is the conversation id that command line resumes.
     pub fn observe_agent_launch(
         &mut self,
         agent: Agent,
         process_id: u32,
         options: crate::agent_resume::AgentLaunchOptions,
+        resumed_session: Option<&str>,
     ) {
         let unreadable = matches!(
             options,
@@ -328,20 +330,24 @@ impl TerminalState {
             // process command line (WSL), and when it was seeded by a restore
             // that fell back to the bare resume command, whose process shows
             // no options because Herdr typed it, or shows a command Herdr does
-            // not recognize (a wrapper named after the agent). Any other seed
-            // takes what the process shows, so a fresh bare agent never
-            // inherits options from a resumed one that already exited.
+            // not recognize (a wrapper named after the agent), or resumes the
+            // seeded conversation with options a wrapper added. Any other seed
+            // takes what the process shows, so a fresh agent never inherits
+            // options from a resumed one that already exited.
             Some(current)
                 if current.agent == agent
                     && current.process_id.is_none()
                     && (unreadable
                         || current.resumed_without_options
-                            && match &options {
+                            && (match &options {
                                 crate::agent_resume::AgentLaunchOptions::Known(observed) => {
                                     observed.is_empty()
                                 }
                                 crate::agent_resume::AgentLaunchOptions::Unavailable(_) => true,
-                            }) =>
+                            } || current.session.as_ref().is_some_and(|session| {
+                                session.kind == crate::agent_resume::AgentSessionRefKind::Id
+                                    && resumed_session == Some(session.value.as_str())
+                            }))) =>
             {
                 (current.options.clone(), current.resumed_without_options)
             }
@@ -2749,7 +2755,7 @@ mod tests {
     #[test]
     fn agent_launch_observation_replaces_records_for_new_processes() {
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
         let first_revision = terminal.agent_launch_revision();
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -2757,7 +2763,7 @@ mod tests {
         );
 
         // The same process observed again changes nothing.
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&[]), None);
         assert_eq!(terminal.agent_launch_revision(), first_revision);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -2765,7 +2771,7 @@ mod tests {
         );
 
         // A replacement Claude process in a new process group replaces them.
-        terminal.observe_agent_launch(Agent::Claude, 11, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 11, known_options(&[]), None);
         assert_ne!(terminal.agent_launch_revision(), first_revision);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -2773,7 +2779,7 @@ mod tests {
         );
 
         // A different agent replaces them too, and they never apply to Claude.
-        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--search"]));
+        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--search"]), None);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
@@ -2784,8 +2790,18 @@ mod tests {
     #[test]
     fn a_second_agent_process_replaces_the_launch_record() {
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&["--placeholder-a"]));
-        terminal.observe_agent_launch(Agent::Claude, 101, known_options(&["--placeholder-b"]));
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            100,
+            known_options(&["--placeholder-a"]),
+            None,
+        );
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            101,
+            known_options(&["--placeholder-b"]),
+            None,
+        );
         assert_eq!(terminal.agent_launch().unwrap().process_id, Some(101));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -2798,10 +2814,15 @@ mod tests {
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
         terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
-        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
-        terminal.observe_agent_launch(Agent::Claude, 101, known_options(&["--placeholder-b"]));
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            101,
+            known_options(&["--placeholder-b"]),
+            None,
+        );
         assert!(!terminal.resumed_without_launch_options());
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -2822,11 +2843,60 @@ mod tests {
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::UnrecognizedCommand,
             ),
+            None,
         );
         let record = terminal.agent_launch().unwrap();
         assert_eq!(record.process_id, Some(100));
         assert_eq!(record.options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
+    }
+
+    #[test]
+    fn fallback_seed_keeps_its_mark_for_a_wrapper_resuming_the_seeded_conversation() {
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        let seeded = || {
+            let mut terminal = test_terminal();
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("placeholder-session")
+                    .unwrap(),
+            });
+            terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
+            terminal
+        };
+
+        // A wrapper adds its own option to the restored resume command.
+        let mut terminal = seeded();
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            100,
+            known_options(&["--placeholder-wrapper"]),
+            Some("placeholder-session"),
+        );
+        let record = terminal.agent_launch().unwrap();
+        assert_eq!(record.process_id, Some(100));
+        assert_eq!(record.options, not_recorded);
+        assert!(terminal.resumed_without_launch_options());
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+
+        // A process resuming another conversation, or none, takes its own.
+        for resumed in [Some("placeholder-other"), None] {
+            let mut terminal = seeded();
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                100,
+                known_options(&["--placeholder-wrapper"]),
+                resumed,
+            );
+            assert!(!terminal.resumed_without_launch_options());
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(vec!["--placeholder-wrapper".to_string()])
+            );
+        }
     }
 
     #[test]
@@ -2837,16 +2907,16 @@ mod tests {
             )
         };
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
         assert_eq!(terminal.agent_launch().unwrap().options, unreadable());
-        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--placeholder"]));
+        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--placeholder"]), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder".to_string()])
         );
         // A readable record is never downgraded by a later unreadable read.
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable());
+        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder".to_string()])
@@ -2858,8 +2928,8 @@ mod tests {
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
         terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
-        terminal.observe_agent_launch(Agent::Claude, 40, unreadable());
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 40, unreadable(), None);
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
     }
@@ -2877,6 +2947,7 @@ mod tests {
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
             ),
+            None,
         );
         let launch = terminal.agent_launch().unwrap();
         assert_eq!(launch.process_id, Some(20));
@@ -2890,13 +2961,14 @@ mod tests {
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
             ),
+            None,
         );
         assert_eq!(terminal.launch_options_for_session("codex"), None);
 
         // A readable command line replaces seeded options.
         let mut terminal = test_terminal();
         terminal.seed_agent_launch(Agent::Codex, known_options(&["--seeded"]), false);
-        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]));
+        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--observed".to_string()])
@@ -2912,7 +2984,7 @@ mod tests {
             crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
         );
         terminal.seed_agent_launch(Agent::Claude, not_recorded.clone(), true);
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         let launch = terminal.agent_launch().unwrap();
         assert_eq!(launch.process_id, Some(40));
         assert_eq!(launch.options, not_recorded);
@@ -2925,7 +2997,7 @@ mod tests {
             known_options(&["--placeholder-a", "--placeholder-b"]),
             true,
         );
-        terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec![
@@ -2937,7 +3009,7 @@ mod tests {
         // Any options the process does show replace the seed.
         let mut terminal = test_terminal();
         terminal.seed_agent_launch(Agent::Claude, not_recorded, true);
-        terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]));
+        terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]), None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--other".to_string()])
@@ -2955,7 +3027,7 @@ mod tests {
             known_options(&["--placeholder-a", "--placeholder-b"]),
             false,
         );
-        terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]), None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(Vec::new())
@@ -2983,20 +3055,20 @@ mod tests {
         terminal.seed_agent_launch(Agent::Claude, not_recorded(), true);
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().process_id, Some(40));
         assert!(terminal.resumed_without_launch_options());
         assert!(terminal.resumed_without_launch_options_for_session("claude"));
         assert!(!terminal.resumed_without_launch_options_for_session("codex"));
 
         // Another process clears it.
-        terminal.observe_agent_launch(Agent::Claude, 41, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 41, known_options(&[]), None);
         assert!(!terminal.resumed_without_launch_options());
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
 
         // So does the agent exiting.
         let mut terminal = fallback();
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         terminal.set_detected_state_with_visible_blocker(
             Some(Agent::Claude),
             AgentState::Idle,
@@ -3011,14 +3083,14 @@ mod tests {
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         assert!(!terminal.resumed_without_launch_options());
         let mut terminal = fallback();
-        terminal.observe_agent_launch(Agent::Codex, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Codex, 40, known_options(&[]), None);
         assert!(!terminal.resumed_without_launch_options());
 
         // A kept restore or `herdr agent start` seed never sets it.
         let mut terminal = test_terminal();
         terminal.seed_agent_launch(Agent::Claude, known_options(&["--placeholder"]), false);
         assert!(!terminal.resumed_without_launch_options());
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]));
+        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         assert!(!terminal.resumed_without_launch_options());
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
     }
@@ -3027,7 +3099,7 @@ mod tests {
     fn agent_launch_is_cleared_when_the_agent_exits_or_changes() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
         terminal.set_detected_state_with_visible_blocker(
             Some(Agent::Claude),
             AgentState::Idle,
@@ -3039,7 +3111,7 @@ mod tests {
 
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]));
+        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
         let revision = terminal.agent_launch_revision();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         assert!(terminal.agent_launch().is_none());

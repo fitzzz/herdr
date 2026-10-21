@@ -1451,8 +1451,16 @@ impl AppState {
                 if let Some(options) =
                     crate::agent_resume::launch_options_from_process_argv(agent, argv.as_deref())
                 {
+                    let resumed_session = argv.as_deref().and_then(|argv| {
+                        crate::agent_resume::resumed_session_from_process_argv(agent, argv)
+                    });
                     self.update_terminal_state(pane_id, |terminal| {
-                        terminal.observe_agent_launch(agent, process_id, options);
+                        terminal.observe_agent_launch(
+                            agent,
+                            process_id,
+                            options,
+                            resumed_session.as_deref(),
+                        );
                         None
                     });
                 }
@@ -3318,6 +3326,7 @@ mod tests {
                 Agent::Claude,
                 10,
                 crate::agent_resume::AgentLaunchOptions::Known(vec!["--placeholder".into()]),
+                None,
             );
             None
         });
@@ -3329,6 +3338,7 @@ mod tests {
                 Agent::Claude,
                 10,
                 crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+                None,
             );
             None
         });

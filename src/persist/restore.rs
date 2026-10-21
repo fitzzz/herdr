@@ -2430,6 +2430,7 @@ mod tests {
             crate::detect::Agent::Claude,
             4242,
             crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+            None,
         );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
@@ -2472,6 +2473,7 @@ mod tests {
                 crate::detect::Agent::Claude,
                 4242,
                 crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+                None,
             );
             let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
             let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
@@ -2520,6 +2522,7 @@ mod tests {
             crate::detect::Agent::Claude,
             4242,
             crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+            None,
         );
         assert!(terminal.resumed_without_launch_options());
         assert_eq!(terminal.launch_options_for_session("claude"), None);
@@ -2561,6 +2564,7 @@ mod tests {
             crate::detect::Agent::Claude,
             4242,
             crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+            None,
         );
         let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
         let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);

@@ -1419,7 +1419,7 @@ mod tests {
             });
         }
         if let Some((agent, options)) = launch {
-            terminal.observe_agent_launch(agent, 4242, options);
+            terminal.observe_agent_launch(agent, 4242, options, None);
         }
         (state, root)
     }
