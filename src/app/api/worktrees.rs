@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::api::schema::{
@@ -45,6 +46,28 @@ struct WorktreeSource {
     repo_name: String,
 }
 
+#[derive(Default)]
+struct OpenWorkspacesByCheckout {
+    paths: HashMap<PathBuf, usize>,
+    git_checkout_keys: HashMap<String, usize>,
+}
+
+impl OpenWorkspacesByCheckout {
+    fn workspace_index(&self, canonical_checkout: &Path) -> Option<usize> {
+        // The existing matcher compares paths as paths, but cached Git keys as
+        // display strings. Keep both equality rules and the first workspace.
+        self.paths
+            .get(canonical_checkout)
+            .into_iter()
+            .chain(
+                self.git_checkout_keys
+                    .get(&canonical_checkout.display().to_string()),
+            )
+            .copied()
+            .min()
+    }
+}
+
 impl App {
     fn finish_worktree_list(
         &self,
@@ -52,9 +75,27 @@ impl App {
         source: WorktreeSource,
         entries: Vec<crate::worktree::ExistingWorktree>,
     ) -> String {
+        // Git discovery is off-thread; this projection runs on the app thread.
+        // Resolve workspace paths once per response, not for every Git entry.
+        let open_workspaces = self.open_workspaces_by_checkout();
+        let repo_root = crate::worktree::canonical_or_original(&source.source_repo_root);
         let worktrees = entries
             .into_iter()
-            .map(|entry| self.worktree_info_for_entry(&source, entry))
+            .map(|entry| {
+                let canonical_path = crate::worktree::canonical_or_original(&entry.path);
+                WorktreeInfo {
+                    path: entry.path.display().to_string(),
+                    branch: entry.branch,
+                    is_bare: entry.is_bare,
+                    is_detached: entry.is_detached,
+                    is_prunable: entry.is_prunable,
+                    is_linked_worktree: canonical_path != repo_root,
+                    open_workspace_id: open_workspaces
+                        .workspace_index(&canonical_path)
+                        .map(|idx| self.public_workspace_id(idx)),
+                    label: source.repo_name.clone(),
+                }
+            })
             .collect();
 
         encode_success(
@@ -436,6 +477,35 @@ impl App {
         })
     }
 
+    fn open_workspaces_by_checkout(&self) -> OpenWorkspacesByCheckout {
+        let mut open = OpenWorkspacesByCheckout::default();
+        for (index, workspace) in self.state.workspaces.iter().enumerate() {
+            if let Some(space) = workspace.worktree_space() {
+                open.paths
+                    .entry(crate::worktree::canonical_or_original(&space.checkout_path))
+                    .or_insert(index);
+                continue; // Explicit provenance overrides shell navigation.
+            }
+            let cwd = workspace
+                .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes);
+            let git_space = workspace.git_space().cloned().or_else(|| {
+                cwd.as_deref()
+                    .and_then(crate::workspace::git_space_metadata)
+            });
+            if let Some(space) = git_space {
+                open.git_checkout_keys
+                    .entry(space.checkout_key)
+                    .or_insert(index);
+            }
+            if let Some(cwd) = cwd {
+                open.paths
+                    .entry(crate::worktree::canonical_or_original(&cwd))
+                    .or_insert(index);
+            }
+        }
+        open
+    }
+
     pub(crate) fn worktree_info_for_workspace(&self, ws_idx: usize) -> Option<WorktreeInfo> {
         let membership = self.state.workspaces.get(ws_idx)?.worktree_space()?;
         Some(self.worktree_info_for_membership(membership, Some(self.public_workspace_id(ws_idx))))
@@ -553,6 +623,7 @@ fn worktree_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod list_lookup;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::api::schema::{

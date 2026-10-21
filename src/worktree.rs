@@ -148,7 +148,26 @@ pub(crate) fn expand_tilde_absolute_path(path: &str) -> PathBuf {
 }
 
 pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    canonicalization_calls::record();
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+pub(crate) mod canonicalization_calls {
+    std::thread_local! {
+        static COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        COUNT.with(|count| count.set(0));
+        let result = operation();
+        (result, COUNT.with(std::cell::Cell::get))
+    }
 }
 
 fn repository_git_command(repo_root: &Path, trust_repository: bool) -> std::process::Command {
