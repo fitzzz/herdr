@@ -93,8 +93,8 @@ Herdr が resume するのは、現行の公式 Herdr インテグレーショ�
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
-| Claude Code | `6` | `claude --resume <id>` |
-| Codex | `5` | `codex resume <id>` |
+| Claude Code | `6` | `claude <launch options> --resume <id>` |
+| Codex | `5` | `codex resume <id> <launch options>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
 | Grok CLI | `2` | `grok --resume <id>` |
 | GitHub Copilot CLI | `2` | `copilot --resume=<id>` |
@@ -108,6 +108,10 @@ Herdr が resume するのは、現行の公式 Herdr インテグレーショ�
 | Kilo Code CLI | `1` | `kilo --session <id>` |
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
+
+Claude Code と Codex は、起動時のオプション(権限モードや承認モード、サンドボックス、モデル、effort、追加ディレクトリ、許可するツール、`-c` による設定上書きなど)を付けたまま戻ります。Herdr は実行中のエージェントのコマンドラインからこれらを読み取り、指定されたとおりにセッションファイルへ保存します。`--resume`、`--continue`、`codex resume --last` のように会話を選んだり開始したりする部分、一度だけのプロンプト、出力して終了するモードは含めません。その代わりに保存済みのセッション ID を使います。
+
+Herdr がエージェントの起動オプションを把握していない場合は、`<launch options>` を除いた素の resume コマンドで会話を再開し、そのエージェントが終了するまでペインの上枠(上枠がないペインではペイン最上部の 1 行)に `launch options not kept` と表示します。必要なモードでエージェントを起動し直せるようにするためです。これは、古い Herdr が保存したセッションファイル、Herdr がエージェントのコマンドラインを読み取らない WSL 内、エージェントのコマンドラインに `--append-system-prompt ''` のような空の引数がある macOS、Herdr が認識しないオプション付きで起動された場合、そしてオプションが復元コマンドの上限(64 引数、8 KiB、アポストロフィなし)に収まらない場合や、入力する resume コマンドがペインのシェルが 1 行で受け取れる長さを超える場合(Windows のコマンドプロンプトでは 8,191 文字、bash・zsh・fish 以外のシェルでは Linux で 4,095 バイト、macOS で 1,023 バイト)に起こります。
 
 インストール済みインテグレーションのバージョンは `herdr integration status` で確認できます。古いインテグレーションは `herdr integration install <agent>` で再インストールしてください。
 

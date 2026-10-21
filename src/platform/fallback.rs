@@ -168,8 +168,22 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
     portable_pty::CommandBuilder::from_argv(raw_command_argv(command, "-c"))
 }
 
-pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> Option<String> {
-    None
+/// Agent start has no pane shell to read here, so this serves only restore,
+/// with POSIX quoting.
+pub(crate) fn interactive_shell_command(argv: &[String], _shell_name: &str) -> Option<String> {
+    let mut parts = argv.iter();
+    let mut command = shell_quote(parts.next()?);
+    for part in parts {
+        command.push(' ');
+        command.push_str(&shell_quote(part));
+    }
+    Some(command)
+}
+
+/// The terminal line limit of these platforms is not known here, so a typed
+/// line is taken as it is.
+pub(crate) fn interactive_shell_accepts_line(_command: &str, _shell_name: &str) -> bool {
+    true
 }
 
 /// Unsupported platform stub.

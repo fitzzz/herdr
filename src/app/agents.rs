@@ -162,6 +162,8 @@ impl App {
         }
         let persisted_agent_session =
             crate::agent_resume::persisted_session_from_launch_args(kind, &params.args);
+        let launch_options =
+            crate::agent_resume::launch_options_from_agent_args(kind, &params.args);
         let conflicts = self.agent_name_conflicts(&name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -221,6 +223,13 @@ impl App {
         }
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
+        }
+        if let Some(options) = launch_options {
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: kind,
+                options,
+                resumed_without_options: false,
+            });
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();

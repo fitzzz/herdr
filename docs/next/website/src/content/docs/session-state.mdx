@@ -92,8 +92,8 @@ Native session restore requires these Herdr integration versions or newer:
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
-| Claude Code | `6` | `claude --resume <id>` |
-| Codex | `5` | `codex resume <id>` |
+| Claude Code | `6` | `claude <launch options> --resume <id>` |
+| Codex | `5` | `codex resume <id> <launch options>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
 | Grok CLI | `2` | `grok --resume <id>` |
 | GitHub Copilot CLI | `2` | `copilot --resume=<id>` |
@@ -107,6 +107,10 @@ Native session restore requires these Herdr integration versions or newer:
 | Kilo Code CLI | `1` | `kilo --session <id>` |
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
+
+Claude Code and Codex come back with the options they were launched with, such as the permission or approval mode, sandbox, model, effort, extra directories, allowed tools and `-c` overrides. Herdr reads them from the running agent's command line and saves them as given in its session file. It leaves out the parts that pick or start a conversation, such as `--resume`, `--continue` or `codex resume --last`, as well as a one-time prompt and print-and-exit mode; the saved session id takes their place.
+
+When Herdr does not know an agent's launch options, it resumes the conversation with the bare command shown without `<launch options>` and shows `launch options not kept` in the pane's top border, or in a row at the top of the pane when it has no top border, until that agent exits, so you can relaunch it in the mode you need. This happens for session files saved by an older Herdr, inside WSL where Herdr does not read agent command lines, on macOS when the agent's command line has an empty argument such as `--append-system-prompt ''`, when the agent was launched with an option Herdr does not recognize, and when the options do not fit the restore command limits of 64 arguments and 8 KiB without apostrophes, or the typed resume command is longer than the pane's shell takes in one line: 8,191 characters in Windows Command Prompt, and in a shell other than bash, zsh or fish, 4,095 bytes on Linux and 1,023 bytes on macOS.
 
 Run `herdr integration status` to check installed integration versions. Reinstall outdated integrations with `herdr integration install <agent>`.
 

@@ -146,13 +146,8 @@ impl App {
         tab: &crate::workspace::Tab,
         terminal_area: Rect,
     ) -> Vec<crate::layout::PaneInfo> {
-        let mut pane_infos = derived_pending_agent_resume_pane_infos(
-            tab,
-            terminal_area,
-            self.state.pane_borders,
-            self.state.pane_gaps,
-            self.state.pane_outer_borders,
-        );
+        let mut pane_infos =
+            derived_pending_agent_resume_pane_infos(&self.state, tab, terminal_area);
 
         if self.state.active == Some(ws_idx)
             && self
@@ -238,7 +233,10 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        // The pane runs the configured shell, so the command is quoted for it.
+        let shell = crate::pane::pane_shell(&self.state.default_shell);
+        let Some(resume_command) = crate::platform::interactive_shell_command(&plan.argv, &shell)
+        else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -263,7 +261,13 @@ impl App {
             return true;
         }
 
-        let runtime = match crate::terminal::TerminalRuntime::spawn(
+        let launch_options_notice = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.agent_launch_restore)
+            .and_then(|outcome| launch_options_notice(&plan.agent, outcome));
+        let runtime = match crate::terminal::TerminalRuntime::spawn_with_initial_history(
             pane_id,
             rows,
             cols,
@@ -273,6 +277,7 @@ impl App {
             self.state.host_terminal_appearance,
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
             &launch_env,
+            launch_options_notice.as_deref(),
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -318,22 +323,49 @@ impl App {
     }
 }
 
+/// The line written into a restored pane whose agent resumed without the
+/// options it was launched with, so the user can relaunch it in the right mode.
+fn launch_options_notice(
+    agent: &str,
+    outcome: crate::agent_resume::LaunchOptionsRestore,
+) -> Option<String> {
+    use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+    let LaunchOptionsRestore::NotKept(reason) = outcome else {
+        return None;
+    };
+    let reason = match reason {
+        LaunchOptionsUnavailable::ExceedsResumeLimits => "they do not fit in the restore command",
+        // Restore falls back only when the options were not saved or do not
+        // fit; options Herdr could not read are never saved.
+        _ => "Herdr had not recorded them",
+    };
+    let agent = match crate::detect::parse_agent_label(agent) {
+        Some(crate::detect::Agent::Claude) => "Claude",
+        Some(crate::detect::Agent::Codex) => "Codex",
+        _ => agent,
+    };
+    Some(format!(
+        "\x1b[33mHerdr: this {agent} conversation was resumed without its launch options \
+         ({reason}). Relaunch it with the permission mode and options you need.\x1b[0m\r\n"
+    ))
+}
+
 fn derived_pending_agent_resume_pane_infos(
+    state: &crate::app::AppState,
     tab: &crate::workspace::Tab,
     terminal_area: Rect,
-    pane_borders: crate::config::PaneBordersConfig,
-    pane_gaps: bool,
-    pane_outer_borders: bool,
 ) -> Vec<crate::layout::PaneInfo> {
     crate::ui::apply_pane_chrome(
         tab.layout.panes(terminal_area),
-        pane_borders,
-        pane_gaps,
-        pane_outer_borders,
+        state.pane_borders,
+        state.pane_gaps,
+        state.pane_outer_borders,
     )
     .into_iter()
     .map(|mut info| {
-        let pane_inner = crate::ui::pane_inner_rect(info.rect, info.borders);
+        let pane_inner =
+            crate::ui::pane_content_rect(&state.terminals, tab, info.id, info.rect, info.borders);
         info.inner_rect = stable_terminal_inner_rect(pane_inner);
         info
     })
@@ -351,33 +383,6 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
         pane_inner.width.saturating_sub(1),
         pane_inner.height,
     )
-}
-
-fn shell_command_from_argv(argv: &[String]) -> Option<String> {
-    let mut parts = argv.iter();
-    let first = shell_quote(parts.next()?);
-    let mut command = first;
-    for part in parts {
-        command.push(' ');
-        command.push_str(&shell_quote(part));
-    }
-    Some(command)
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'='
-            )
-    }) {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -954,17 +959,115 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_from_argv_quotes_resume_arguments() {
-        let argv = vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            "session with ' quote".to_string(),
-        ];
+    fn launch_options_notice_explains_each_fallback_and_skips_kept_options() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
 
         assert_eq!(
-            shell_command_from_argv(&argv).as_deref(),
-            Some("claude --resume 'session with '\\'' quote'")
+            launch_options_notice("claude", LaunchOptionsRestore::Kept),
+            None
         );
-        assert_eq!(shell_command_from_argv(&[]), None);
+        let notice = launch_options_notice(
+            "claude",
+            LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::NotRecorded),
+        )
+        .unwrap();
+        assert!(notice.contains("Herdr: this Claude conversation was resumed without its launch options (Herdr had not recorded them)."));
+        assert!(notice.ends_with("\r\n"));
+        let notice = launch_options_notice(
+            "codex",
+            LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::ExceedsResumeLimits),
+        )
+        .unwrap();
+        assert!(notice.contains(
+            "this Codex conversation was resumed without its launch options (they do not fit in the restore command)."
+        ));
+        assert!(notice.contains("Relaunch it with the permission mode"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_agent_resume_writes_launch_options_notice_before_resume() {
+        for (outcome, expect_notice) in [
+            (
+                crate::agent_resume::LaunchOptionsRestore::NotKept(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                true,
+            ),
+            (crate::agent_resume::LaunchOptionsRestore::Kept, false),
+        ] {
+            let mut app = test_app();
+            let workspace = crate::workspace::Workspace::test_new("restored");
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+            app.state.view.pane_infos = workspace.tabs[0]
+                .layout
+                .panes(ratatui::layout::Rect::new(0, 0, 200, 30));
+            app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 200, 30);
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            });
+            terminal.agent_launch_restore = Some(outcome);
+
+            assert!(app.start_pending_agent_resumes(Instant::now(), true));
+            let text = app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .visible_text();
+            assert_eq!(
+                text.contains("resumed without its launch options"),
+                expect_notice,
+                "{outcome:?}: {text}"
+            );
+
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_launch_option_value_is_restored_quoted() {
+        let argv = [
+            "claude",
+            "--append-system-prompt",
+            "",
+            "--permission-mode",
+            "plan",
+        ]
+        .map(String::from);
+        let Some(crate::agent_resume::AgentLaunchOptions::Known(options)) =
+            crate::agent_resume::launch_options_from_process_argv(
+                crate::detect::Agent::Claude,
+                Some(&argv),
+            )
+        else {
+            panic!("an empty option value should parse");
+        };
+        assert_eq!(options, argv[1..].to_vec());
+        let session = crate::agent_resume::AgentSessionRef::id("claude-session").unwrap();
+        let (plan, outcome) = crate::agent_resume::plan_with_launch_options(
+            "herdr:claude",
+            "claude",
+            &session,
+            Some(&options),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
+        assert_eq!(
+            crate::platform::interactive_shell_command(&plan.argv, "bash").as_deref(),
+            Some("claude --append-system-prompt '' --permission-mode plan --resume claude-session")
+        );
     }
 }

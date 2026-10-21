@@ -29,6 +29,12 @@ mod config_file_tests;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+/// A shell that reads its line in the terminal's canonical mode gets at most
+/// this many bytes of a typed line: the n_tty line buffer is 4096 bytes
+/// (`N_TTY_BUF_SIZE` in the kernel's `include/linux/tty.h`) and its last byte
+/// is kept for the newline. A pty probe on Linux 7.2 confirmed it: 4095 bytes
+/// arrive whole, and a longer line is cut to its first 4095.
+pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 4095;
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -326,15 +332,7 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
 }
 
 fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
+    if super::is_plain_unix_word(value) {
         return value.to_string();
     }
 
@@ -689,16 +687,23 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
 }
 
 fn process_argv(pid: u32) -> Option<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmdline_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// Splits `/proc/<pid>/cmdline` into arguments. Every argument ends in a NUL,
+/// so only the empty part after the final one is dropped; empty arguments
+/// such as `--append-system-prompt ''` stay in place.
+fn cmdline_argv(bytes: &[u8]) -> Option<Vec<String>> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
     if bytes.is_empty() {
         return None;
     }
-    let parts: Vec<String> = bytes
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
+    Some(
+        bytes
+            .split(|&b| b == 0)
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
 }
 
 /// Get the current working directory of a process.
@@ -2156,6 +2161,33 @@ mod tests {
         let args = std::fs::read_to_string(&path).expect("args file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(args, "--app-name\nHerdr\n--\n-danger\nbody\n");
+    }
+
+    #[test]
+    fn cmdline_argv_keeps_empty_arguments() {
+        assert_eq!(
+            cmdline_argv(b"claude\0--append-system-prompt\0\0--permission-mode\0plan\0"),
+            Some(
+                [
+                    "claude",
+                    "--append-system-prompt",
+                    "",
+                    "--permission-mode",
+                    "plan"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        // A trailing empty argument stays; only the terminator is dropped.
+        assert_eq!(
+            cmdline_argv(b"codex\0\0"),
+            Some(vec!["codex".to_string(), String::new()])
+        );
+        // A rewritten title without the final terminator still reads.
+        assert_eq!(cmdline_argv(b"claude"), Some(vec!["claude".to_string()]));
+        assert_eq!(cmdline_argv(b""), None);
+        assert_eq!(cmdline_argv(b"\0"), None);
     }
 
     #[test]
