@@ -29,6 +29,12 @@ mod config_file_tests;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+/// A shell that reads its line in the terminal's canonical mode gets at most
+/// this many bytes of a typed line: the n_tty line buffer is 4096 bytes
+/// (`N_TTY_BUF_SIZE` in the kernel's `include/linux/tty.h`) and its last byte
+/// is kept for the newline. A pty probe on Linux 7.2 confirmed it: 4095 bytes
+/// arrive whole, and a longer line is cut to its first 4095.
+pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 4095;
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;

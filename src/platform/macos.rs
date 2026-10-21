@@ -29,6 +29,11 @@ pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_proce
 #[cfg(test)]
 mod config_file_tests;
 
+/// A shell that reads its line in the terminal's canonical mode gets at most
+/// this many bytes of a typed line: `sys/syslimits.h` defines `MAX_CANON` as
+/// 1024 bytes per canonical input line, and one of them is the newline.
+pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 1023;
+
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(path)?.nlink())

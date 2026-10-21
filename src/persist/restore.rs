@@ -1592,6 +1592,34 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_falls_back_when_a_canonical_shell_cannot_take_the_line() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let session = launch_options_session(
+            "claude",
+            Some(vec![
+                "--append-system-prompt".into(),
+                "placeholder ".repeat(400),
+            ]),
+        );
+        let (plan, outcome) = restore_plan_for_snapshot(&session, true, "placeholder-shell")
+            .expect("restore should plan the bare command");
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert!(!plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+
+        let (plan, outcome) = restore_plan_for_snapshot(&session, true, "bash")
+            .expect("restore should plan the command with its options");
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        assert!(plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+    }
+
     #[test]
     fn pane_restore_startup_reported_resume_ignores_saved_launch_options() {
         let session = launch_options_session("claude", Some(placeholder_launch_options()));

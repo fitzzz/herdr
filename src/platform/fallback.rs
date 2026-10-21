@@ -180,6 +180,12 @@ pub(crate) fn interactive_shell_command(argv: &[String], _shell_name: &str) -> O
     Some(command)
 }
 
+/// The terminal line limit of these platforms is not known here, so a typed
+/// line is taken as it is.
+pub(crate) fn interactive_shell_accepts_line(_command: &str, _shell_name: &str) -> bool {
+    true
+}
+
 /// Unsupported platform stub.
 pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
