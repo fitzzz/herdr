@@ -3380,6 +3380,15 @@ mod tests {
         });
     }
 
+    fn observe_claude_argv(state: &mut AppState, pane_id: PaneId, process_id: u32, argv: &[&str]) {
+        state.handle_app_event(AppEvent::AgentLaunchObserved {
+            pane_id,
+            agent: Agent::Claude,
+            process_id,
+            argv: Some(argv.iter().map(|arg| arg.to_string()).collect()),
+        });
+    }
+
     /// The saved conversation and the restore command built from it.
     fn saved_claude_restore(state: &AppState, pane_id: PaneId) -> (String, Vec<String>) {
         let snapshot = crate::persist::capture(
@@ -3440,6 +3449,101 @@ mod tests {
                 claude_resume(&["--permission-mode", "bypassPermissions"], "session-b")
             )
         );
+    }
+
+    #[test]
+    fn a_launcher_exec_does_not_pair_a_new_process_with_the_previous_conversation() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+
+        // Process B is a launcher that execs Claude in its own process.
+        let b = std::process::id();
+        observe_claude_argv(
+            &mut state,
+            pane_id,
+            b,
+            &[
+                "/usr/bin/python3",
+                "/home/placeholder/bin/claude",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        );
+        observe_claude_argv(
+            &mut state,
+            pane_id,
+            b,
+            &[
+                "/home/placeholder/claude/latest/claude",
+                "--permission-mode",
+                "bypassPermissions",
+            ],
+        );
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            ("session-a".into(), claude_resume(&[], "session-a"))
+        );
+    }
+
+    #[test]
+    fn a_third_process_does_not_pair_with_the_conversation_an_earlier_process_owned() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        report_claude_session(&mut state, pane_id, 1, "session-a");
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+        // B is left unpaired, then C replaces it before either reports.
+        observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID - 1, "acceptEdits");
+        observe_claude_process(&mut state, pane_id, std::process::id(), "bypassPermissions");
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            ("session-a".into(), claude_resume(&[], "session-a"))
+        );
+    }
+
+    #[test]
+    fn a_new_process_resuming_the_current_conversation_owns_it() {
+        let resumed = claude_resume(&["--permission-mode", "bypassPermissions"], "session-a");
+        let resumed = resumed.iter().map(String::as_str).collect::<Vec<_>>();
+        let launcher = ["/usr/bin/python3", "/home/placeholder/bin/claude"]
+            .into_iter()
+            .chain(resumed[1..].iter().copied())
+            .collect::<Vec<_>>();
+        let setup = || {
+            let mut state = app_with_workspaces(&["one"]);
+            state.ensure_test_terminals();
+            let pane_id = state.workspaces[0].tabs[0].root_pane;
+            report_claude_session(&mut state, pane_id, 1, "session-a");
+            observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+            (state, pane_id)
+        };
+        let expected = (
+            "session-a".to_string(),
+            claude_resume(&["--permission-mode", "bypassPermissions"], "session-a"),
+        );
+        let b = std::process::id();
+
+        // Observation before B's report of the same conversation.
+        let (mut state, pane_id) = setup();
+        observe_claude_argv(&mut state, pane_id, b, &resumed);
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
+        report_claude_session(&mut state, pane_id, 2, "session-a");
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
+
+        // B's report of the same conversation before the observation.
+        let (mut state, pane_id) = setup();
+        report_claude_session(&mut state, pane_id, 2, "session-a");
+        observe_claude_argv(&mut state, pane_id, b, &resumed);
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
+
+        // A launcher first, then the agent it execs in the same process.
+        let (mut state, pane_id) = setup();
+        observe_claude_argv(&mut state, pane_id, b, &launcher);
+        observe_claude_argv(&mut state, pane_id, b, &resumed);
+        assert_eq!(saved_claude_restore(&state, pane_id), expected);
     }
 
     #[test]

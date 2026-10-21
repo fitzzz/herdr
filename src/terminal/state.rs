@@ -115,6 +115,82 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// Whether a record seeded by restore or `herdr agent start` keeps its options,
+/// and its mark that the agent was resumed without them, for the first process
+/// detection reads: when this platform cannot read the command line (WSL), and
+/// when a restore fell back to the bare resume command, whose process shows no
+/// options because Herdr typed it, shows a command Herdr does not recognize (a
+/// wrapper named after the agent), or resumes the seeded conversation with
+/// options a wrapper added. Any other seed takes what the process shows, so a
+/// fresh agent never inherits options from a resumed one that already exited.
+fn seed_keeps_record(
+    seed: &ObservedAgentLaunch,
+    observed: &crate::agent_resume::AgentLaunchOptions,
+    resumed_session: Option<&str>,
+) -> bool {
+    use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
+    if seed.process_id.is_some() {
+        return false;
+    }
+    if matches!(
+        observed,
+        AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::CommandLineUnreadable)
+    ) {
+        return true;
+    }
+    seed.resumed_without_options
+        && (match observed {
+            AgentLaunchOptions::Known(observed) => observed.is_empty(),
+            AgentLaunchOptions::Unavailable(_) => true,
+        } || resumes(resumed_session, seed.session.as_ref()))
+}
+
+/// Whether a command line that resumes `resumed_session` resumes `session`.
+fn resumes(
+    resumed_session: Option<&str>,
+    session: Option<&crate::agent_resume::AgentSessionRef>,
+) -> bool {
+    session.is_some_and(|session| {
+        session.kind == crate::agent_resume::AgentSessionRefKind::Id
+            && resumed_session == Some(session.value.as_str())
+    })
+}
+
+/// The conversation the launch record of `process_id` owns, given the record
+/// it replaces and the pane's current conversation.
+fn session_for_process(
+    previous: Option<&ObservedAgentLaunch>,
+    agent: Agent,
+    current_session: Option<&crate::agent_resume::AgentSessionRef>,
+    process_id: u32,
+    resumed_session: Option<&str>,
+) -> Option<crate::agent_resume::AgentSessionRef> {
+    // A command line that resumes the current conversation proves it runs it.
+    if resumes(resumed_session, current_session) {
+        return current_session.cloned();
+    }
+    match previous.filter(|previous| previous.agent == agent) {
+        // Another reading of the same process keeps the pairing it had.
+        Some(previous) if previous.process_id == Some(process_id) => previous.session.clone(),
+        // A seed binds to the process it started: the same launch.
+        Some(previous) if previous.process_id.is_none() => current_session.cloned(),
+        // A new process owns the current conversation only when no earlier
+        // process ran it; that one stays unpaired until the new process
+        // reports its own.
+        _ => {
+            let earlier = previous.and_then(|previous| {
+                previous
+                    .session
+                    .as_ref()
+                    .or(previous.earlier_session.as_ref())
+            });
+            current_session
+                .filter(|session| earlier != Some(*session))
+                .cloned()
+        }
+    }
+}
+
 /// The launch options of the Claude or Codex process running in a pane, kept
 /// so restore can repeat them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +210,9 @@ pub struct ObservedAgentLaunch {
     /// The pane's conversation when this record last looked, so only a
     /// conversation reported since then is paired with it.
     seen_session: Option<crate::agent_resume::AgentSessionRef>,
+    /// The last conversation an earlier process owned, carried while this
+    /// record is unpaired, so a later process is never paired with it.
+    earlier_session: Option<crate::agent_resume::AgentSessionRef>,
 }
 
 impl ObservedAgentLaunch {
@@ -291,6 +370,7 @@ impl TerminalState {
             resumed_without_options,
             seen_session: session.clone(),
             session,
+            earlier_session: None,
         }));
     }
 
@@ -315,64 +395,44 @@ impl TerminalState {
                 _ => 2,
             }
         }
-        let unreadable = reading_rank(&options) == 0;
-        let (options, resumed_without_options) = match self.agent_launch.as_ref() {
-            // The same process is observed again when its command line became
-            // readable, or when a launcher script exec'd the agent in its own
-            // process; that replaces a record that could not read or place it.
-            Some(current)
-                if current.agent == agent
-                    && current.process_id == Some(process_id)
-                    && reading_rank(&options) <= reading_rank(&current.options) =>
-            {
-                return;
-            }
-            // A seeded record keeps its options, and its mark that the agent
-            // was resumed without them, when this platform cannot read the
-            // process command line (WSL), and when it was seeded by a restore
-            // that fell back to the bare resume command, whose process shows
-            // no options because Herdr typed it, or shows a command Herdr does
-            // not recognize (a wrapper named after the agent), or resumes the
-            // seeded conversation with options a wrapper added. Any other seed
-            // takes what the process shows, so a fresh agent never inherits
-            // options from a resumed one that already exited.
-            Some(current)
-                if current.agent == agent
-                    && current.process_id.is_none()
-                    && (unreadable
-                        || current.resumed_without_options
-                            && (match &options {
-                                crate::agent_resume::AgentLaunchOptions::Known(observed) => {
-                                    observed.is_empty()
-                                }
-                                crate::agent_resume::AgentLaunchOptions::Unavailable(_) => true,
-                            } || current.session.as_ref().is_some_and(|session| {
-                                session.kind == crate::agent_resume::AgentSessionRefKind::Id
-                                    && resumed_session == Some(session.value.as_str())
-                            }))) =>
-            {
+        let current = self
+            .agent_launch
+            .as_ref()
+            .filter(|current| current.agent == agent);
+        // The same process is observed again when its command line became
+        // readable, or when a launcher script exec'd the agent in its own
+        // process; that replaces a record that could not read or place it.
+        if current.is_some_and(|current| {
+            current.process_id == Some(process_id)
+                && reading_rank(&options) <= reading_rank(&current.options)
+        }) {
+            return;
+        }
+        let (options, resumed_without_options) = match current {
+            Some(current) if seed_keeps_record(current, &options, resumed_session) => {
                 (current.options.clone(), current.resumed_without_options)
             }
             _ => (options, false),
         };
         let current_session = self.current_session_ref();
-        let session = match self.agent_launch.as_ref() {
-            // A readable read of the same process, or a seed binding to the
-            // process it started: the same launch keeps its conversation.
-            Some(current)
-                if current.agent == agent
-                    && current.process_id.is_none_or(|pid| pid == process_id) =>
-            {
-                current_session.cloned()
+        let session = session_for_process(
+            self.agent_launch.as_ref(),
+            agent,
+            current_session,
+            process_id,
+            resumed_session,
+        );
+        let earlier_session = match self.agent_launch.as_ref() {
+            Some(launch) if launch.agent == agent && launch.process_id == Some(process_id) => {
+                launch.earlier_session.clone()
             }
-            // A new process owns a conversation only when it is not the one the
-            // previous process ran; that one stays unpaired until the new
-            // process reports its own.
-            current => current_session
-                .filter(|session| {
-                    current.and_then(|current| current.session.as_ref()) != Some(*session)
-                })
-                .cloned(),
+            Some(launch) if launch.agent == agent && launch.process_id.is_none() => None,
+            launch => launch.and_then(|launch| {
+                launch
+                    .session
+                    .clone()
+                    .or_else(|| launch.earlier_session.clone())
+            }),
         };
         let seen_session = current_session.cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
@@ -382,6 +442,7 @@ impl TerminalState {
             resumed_without_options,
             session,
             seen_session,
+            earlier_session,
         }));
     }
 
@@ -2902,6 +2963,213 @@ mod tests {
             assert_eq!(
                 terminal.launch_options_for_session("claude"),
                 Some(vec!["--placeholder-wrapper".to_string()])
+            );
+        }
+    }
+
+    fn launch_record(
+        agent: Agent,
+        process_id: Option<u32>,
+        resumed_without_options: bool,
+        session: Option<&str>,
+        earlier_session: Option<&str>,
+    ) -> ObservedAgentLaunch {
+        let id = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
+        ObservedAgentLaunch {
+            agent,
+            process_id,
+            options: known_options(&["--placeholder-seeded"]),
+            resumed_without_options,
+            session: session.map(id),
+            seen_session: None,
+            earlier_session: earlier_session.map(id),
+        }
+    }
+
+    #[test]
+    fn seed_keeps_record_decides_every_case() {
+        use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
+        let unavailable = AgentLaunchOptions::Unavailable;
+        let unreadable = unavailable(LaunchOptionsUnavailable::CommandLineUnreadable);
+        let unrecognized = unavailable(LaunchOptionsUnavailable::UnrecognizedCommand);
+        let empty = known_options(&[]);
+        let wrapper = known_options(&["--placeholder-wrapper"]);
+        let kept = launch_record(Agent::Claude, None, false, Some("seeded"), None);
+        let fallback = launch_record(Agent::Claude, None, true, Some("seeded"), None);
+        let bound = launch_record(Agent::Claude, Some(10), true, Some("seeded"), None);
+        for (case, seed, observed, resumed, keeps) in [
+            ("bound record is no seed", &bound, &unreadable, None, false),
+            ("kept seed, unreadable", &kept, &unreadable, None, true),
+            ("kept seed, unrecognized", &kept, &unrecognized, None, false),
+            ("kept seed, no options", &kept, &empty, None, false),
+            (
+                "kept seed, resumes seeded",
+                &kept,
+                &wrapper,
+                Some("seeded"),
+                false,
+            ),
+            (
+                "fallback seed, unreadable",
+                &fallback,
+                &unreadable,
+                None,
+                true,
+            ),
+            (
+                "fallback seed, unrecognized",
+                &fallback,
+                &unrecognized,
+                None,
+                true,
+            ),
+            ("fallback seed, no options", &fallback, &empty, None, true),
+            (
+                "fallback seed, resumes seeded",
+                &fallback,
+                &wrapper,
+                Some("seeded"),
+                true,
+            ),
+            (
+                "fallback seed, resumes another",
+                &fallback,
+                &wrapper,
+                Some("other"),
+                false,
+            ),
+            (
+                "fallback seed, own options",
+                &fallback,
+                &wrapper,
+                None,
+                false,
+            ),
+        ] {
+            assert_eq!(seed_keeps_record(seed, observed, resumed), keeps, "{case}");
+        }
+    }
+
+    #[test]
+    fn session_for_process_decides_every_case() {
+        let id = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
+        let current = id("current");
+        let seed = launch_record(Agent::Claude, None, false, Some("current"), None);
+        let owner = launch_record(Agent::Claude, Some(10), false, Some("current"), None);
+        let unpaired = launch_record(Agent::Claude, Some(10), false, None, None);
+        let unpaired_after_owner =
+            launch_record(Agent::Claude, Some(10), false, None, Some("current"));
+        let owner_of_other = launch_record(Agent::Claude, Some(10), false, Some("other"), None);
+        let codex_owner = launch_record(Agent::Codex, Some(10), false, Some("current"), None);
+        for (case, previous, current_session, process_id, resumed, expected) in [
+            (
+                "first process",
+                None,
+                Some(&current),
+                10,
+                None,
+                Some("current"),
+            ),
+            ("no conversation yet", None, None, 10, None, None),
+            (
+                "seed binds its process",
+                Some(&seed),
+                Some(&current),
+                10,
+                None,
+                Some("current"),
+            ),
+            (
+                "same process keeps its pairing",
+                Some(&owner),
+                Some(&current),
+                10,
+                None,
+                Some("current"),
+            ),
+            (
+                "same unpaired process stays unpaired",
+                Some(&unpaired),
+                Some(&current),
+                10,
+                None,
+                None,
+            ),
+            (
+                "same process resuming the current one",
+                Some(&unpaired),
+                Some(&current),
+                10,
+                Some("current"),
+                Some("current"),
+            ),
+            (
+                "new process after the owner",
+                Some(&owner),
+                Some(&current),
+                11,
+                None,
+                None,
+            ),
+            (
+                "new process after an unpaired one",
+                Some(&unpaired_after_owner),
+                Some(&current),
+                11,
+                None,
+                None,
+            ),
+            (
+                "new process after an unpaired first one",
+                Some(&unpaired),
+                Some(&current),
+                11,
+                None,
+                Some("current"),
+            ),
+            (
+                "new process after another owner",
+                Some(&owner_of_other),
+                Some(&current),
+                11,
+                None,
+                Some("current"),
+            ),
+            (
+                "new process resuming the current one",
+                Some(&owner),
+                Some(&current),
+                11,
+                Some("current"),
+                Some("current"),
+            ),
+            (
+                "new process resuming another one",
+                Some(&owner),
+                Some(&current),
+                11,
+                Some("other"),
+                None,
+            ),
+            (
+                "other agent's record",
+                Some(&codex_owner),
+                Some(&current),
+                11,
+                None,
+                None,
+            ),
+        ] {
+            assert_eq!(
+                session_for_process(
+                    previous,
+                    Agent::Claude,
+                    current_session,
+                    process_id,
+                    resumed
+                ),
+                expected.map(id),
+                "{case}"
             );
         }
     }
