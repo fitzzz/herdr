@@ -26,6 +26,8 @@ use super::{
 struct AgentRestoreState<'a> {
     enabled: bool,
     resumed_sessions: &'a mut HashSet<String>,
+    /// The shell restored panes start, which the resume command is typed into.
+    shell: String,
 }
 
 struct PaneRestoreStartup<'a> {
@@ -551,6 +553,7 @@ fn restore_tab(
             let mut agent_restore = AgentRestoreState {
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
+                shell: crate::pane::pane_shell(runtime_context.shell_config.default_shell),
             };
             pane_restore_startup(
                 saved_agent_session,
@@ -852,7 +855,9 @@ fn pane_restore_startup<'a>(
     } else if let Some(resume) = reported_resume {
         (Some(reported_resume_from_snapshot(resume).plan(cwd)), None)
     } else {
-        match session.and_then(|session| restore_plan_for_snapshot(session, true)) {
+        match session
+            .and_then(|session| restore_plan_for_snapshot(session, true, &agent_restore.shell))
+        {
             Some((plan, outcome)) => (Some(plan), outcome),
             None => (None, None),
         }
@@ -911,6 +916,7 @@ fn reported_resume_from_snapshot(
 fn restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    shell: &str,
 ) -> Option<(
     crate::agent_resume::AgentResumePlan,
     Option<crate::agent_resume::LaunchOptionsRestore>,
@@ -919,12 +925,31 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan_with_launch_options(
+    let planned = crate::agent_resume::plan_with_launch_options(
         &session.source,
         &session.agent,
         &persisted.session_ref,
         session.launch_options.as_deref(),
-    )
+    )?;
+    // The pane's shell must take the typed command in one line; otherwise the
+    // options cannot be repeated and restore falls back to the bare command.
+    let fits = crate::platform::interactive_shell_command(&planned.0.argv, shell)
+        .is_some_and(|command| crate::platform::interactive_shell_accepts_line(&command, shell));
+    if planned.1 != Some(crate::agent_resume::LaunchOptionsRestore::Kept) || fits {
+        return Some(planned);
+    }
+    let (bare, _) = crate::agent_resume::plan_with_launch_options(
+        &session.source,
+        &session.agent,
+        &persisted.session_ref,
+        None,
+    )?;
+    Some((
+        bare,
+        Some(crate::agent_resume::LaunchOptionsRestore::NotKept(
+            crate::agent_resume::LaunchOptionsUnavailable::ExceedsResumeLimits,
+        )),
+    ))
 }
 
 /// The launch options a restored terminal starts with, so a save before
@@ -1020,7 +1045,7 @@ fn take_restore_plan_for_snapshot(
     resume_agents_on_restore: bool,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore)
+    restore_plan_for_snapshot(session, resume_agents_on_restore, "sh")
         .map(|(plan, _)| plan)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
@@ -1223,9 +1248,12 @@ mod tests {
             resumed_without_launch_options: false,
         };
 
-        assert!(restore_plan_for_snapshot(&session, false).is_none());
+        assert!(restore_plan_for_snapshot(&session, false, "sh").is_none());
         assert_eq!(
-            restore_plan_for_snapshot(&session, true).unwrap().0.argv,
+            restore_plan_for_snapshot(&session, true, "sh")
+                .unwrap()
+                .0
+                .argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
 
@@ -1237,7 +1265,7 @@ mod tests {
             launch_options: None,
             resumed_without_launch_options: false,
         };
-        assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+        assert!(restore_plan_for_snapshot(&unsupported_path, true, "sh").is_none());
     }
 
     #[test]
@@ -1283,6 +1311,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let startup = pane_restore_startup(
@@ -1316,6 +1345,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let first = pane_restore_startup(
@@ -1366,6 +1396,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled,
             resumed_sessions: resumed,
+            shell: "sh".into(),
         };
         pane_restore_startup(
             Some(session),
@@ -1573,6 +1604,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
         let startup = pane_restore_startup(
             Some(&session),
@@ -1616,6 +1648,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let project_a = std::path::Path::new("/project-a");
@@ -1651,6 +1684,7 @@ mod tests {
         let mut disabled = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
         let startup = pane_restore_startup(
             None,
@@ -1681,6 +1715,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let startup = pane_restore_startup(

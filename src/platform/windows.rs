@@ -958,6 +958,17 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     }
 }
 
+/// cmd.exe reads at most 8191 characters from one typed line.
+const CMD_MAX_LINE_CHARS: usize = 8191;
+
+/// Whether the pane's shell can take `command` as one typed line.
+pub(crate) fn interactive_shell_accepts_line(command: &str, shell_name: &str) -> bool {
+    let shell_name = shell_name.to_ascii_lowercase();
+    shell_name.contains("powershell")
+        || shell_name.contains("pwsh")
+        || command.encode_utf16().count() <= CMD_MAX_LINE_CHARS
+}
+
 fn powershell_agent_script(argv: &[String]) -> Option<String> {
     let (program, args) = argv.split_first()?;
     if args.is_empty() {
@@ -3270,6 +3281,41 @@ mod tests {
             String::from_utf16(&utf16).unwrap(),
             "if((Get-Command pi -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& pi '' 'two words' '100%' 'wow!' 'a''b' '--model'}else{Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b --model' -NoNewWindow -Wait}"
         );
+    }
+
+    #[test]
+    fn cmd_restore_line_must_fit_the_cmd_line_limit() {
+        assert!(super::interactive_shell_accepts_line(
+            &"a".repeat(8191),
+            "cmd.exe"
+        ));
+        assert!(!super::interactive_shell_accepts_line(
+            &"a".repeat(8192),
+            "cmd.exe"
+        ));
+        assert!(!super::interactive_shell_accepts_line(
+            &"a".repeat(8192),
+            r"C:\Windows\System32\cmd.exe"
+        ));
+        for shell in [
+            "powershell.exe",
+            "pwsh",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        ] {
+            assert!(super::interactive_shell_accepts_line(
+                &"a".repeat(20_000),
+                shell
+            ));
+        }
+        // About 1.7 KB of options already overflows cmd once encoded.
+        let argv = std::iter::once("claude".to_string())
+            .chain(["--append-system-prompt".into(), "p".repeat(1700)])
+            .chain(["--resume".into(), "placeholder-session".into()])
+            .collect::<Vec<_>>();
+        let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
+        assert!(!super::interactive_shell_accepts_line(&command, "cmd.exe"));
+        let command = super::interactive_shell_command(&argv, "pwsh").unwrap();
+        assert!(super::interactive_shell_accepts_line(&command, "pwsh"));
     }
 
     #[test]

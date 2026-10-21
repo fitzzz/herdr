@@ -443,6 +443,12 @@ pub(crate) fn is_plain_unix_word(value: &str) -> bool {
         })
 }
 
+/// Unix shells read a typed line without a length limit of their own.
+#[cfg(not(windows))]
+pub(crate) fn interactive_shell_accepts_line(_command: &str, _shell_name: &str) -> bool {
+    true
+}
+
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
     if !value.is_empty()
         && !value.starts_with('-')
