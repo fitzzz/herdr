@@ -162,6 +162,12 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
+    TerminalInputStream {
+        stream: super::TerminalInputStreamInfo,
+    },
+    TerminalInputWritten {
+        write: super::TerminalInputWriteAck,
+    },
     PaneSelection {
         pane_id: String,
         text: String,

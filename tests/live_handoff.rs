@@ -981,6 +981,242 @@ fn live_handoff_preserves_installed_plugins() {
     cleanup_test_base(&base);
 }
 
+fn terminal_input(
+    socket_path: &Path,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    request(
+        socket_path,
+        serde_json::json!({"id": format!("test:{method}"), "method": method, "params": params}),
+    )
+}
+
+fn terminal_input_write(
+    socket_path: &Path,
+    stream: &serde_json::Value,
+    seq: u64,
+    text: &str,
+) -> serde_json::Value {
+    terminal_input(
+        socket_path,
+        "terminal.input.write",
+        serde_json::json!({
+            "terminal_id": stream["terminal_id"],
+            "incarnation": stream["incarnation"],
+            "stream_id": stream["stream_id"],
+            "seq": seq,
+            "text": text,
+            "keys": ["Enter"],
+        }),
+    )
+}
+
+fn terminal_input_reconcile(socket_path: &Path, stream: &serde_json::Value) -> serde_json::Value {
+    terminal_input(
+        socket_path,
+        "terminal.input.reconcile",
+        serde_json::json!({
+            "terminal_id": stream["terminal_id"],
+            "incarnation": stream["incarnation"],
+            "stream_id": stream["stream_id"],
+        }),
+    )
+}
+
+/// Starts a line echo loop in a fresh workspace and opens an input stream on
+/// its terminal. Returns the pane id and the stream record.
+fn start_terminal_input_echo(
+    api_socket: &Path,
+    received: &Path,
+    ready: &Path,
+) -> (String, serde_json::Value) {
+    let ping = request(
+        api_socket,
+        serde_json::json!({"id":"test:ping","method":"ping","params":{}}),
+    );
+    assert_eq!(ping["result"]["capabilities"]["terminal_input_ack"], true);
+    let created = request(
+        api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let terminal_id = created["result"]["root_pane"]["terminal_id"].clone();
+    let command = format!(
+        "sh -c 'echo READY $$ > {}; while read line; do echo got:$line; echo got:$line >> {}; done'",
+        ready.display(),
+        received.display()
+    );
+    assert_ok(request(
+        api_socket,
+        serde_json::json!({
+            "id": "test:pane:run",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": command, "keys": ["Enter"]}
+        }),
+    ));
+    wait_for_pid_marker(ready, Duration::from_secs(5));
+    let opened = terminal_input(
+        api_socket,
+        "terminal.input.open",
+        serde_json::json!({"terminal_id": terminal_id}),
+    );
+    assert_eq!(
+        opened["result"]["type"], "terminal_input_stream",
+        "{opened}"
+    );
+    let stream = opened["result"]["stream"].clone();
+    assert_eq!(stream["last_written_seq"], 0);
+    (pane_id, stream)
+}
+
+fn received_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn terminal_input_writes_reach_a_real_pty_once() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let received = base.join("received");
+    let ready = base.join("ready");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let (pane_id, stream) = start_terminal_input_echo(&api_socket, &received, &ready);
+
+    for (seq, text) in [(1, "first"), (2, "zweite-ü"), (3, "third🙂")] {
+        let ack = terminal_input_write(&api_socket, &stream, seq, text);
+        assert_eq!(ack["result"]["write"]["seq"], seq, "{ack}");
+        assert_eq!(ack["result"]["write"]["duplicate"], false, "{ack}");
+    }
+    // A resend after a lost reply: same sequence, same payload.
+    let duplicate = terminal_input_write(&api_socket, &stream, 2, "zweite-ü");
+    assert_eq!(
+        duplicate["result"]["write"]["duplicate"], true,
+        "{duplicate}"
+    );
+    let mismatch = terminal_input_write(&api_socket, &stream, 3, "other");
+    assert_eq!(mismatch["error"]["code"], "payload_mismatch", "{mismatch}");
+    let gap = terminal_input_write(&api_socket, &stream, 5, "later");
+    assert_eq!(gap["error"]["code"], "sequence_gap", "{gap}");
+    let position = terminal_input_reconcile(&api_socket, &stream);
+    assert_eq!(
+        position["result"]["stream"]["last_written_seq"], 3,
+        "{position}"
+    );
+
+    wait_for_file_contains(&received, "got:third🙂", Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, "got:third");
+    assert_eq!(
+        received_lines(&received),
+        ["got:first", "got:zweite-ü", "got:third🙂"]
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:close","method":"pane.close","params":{"pane_id": pane_id}}),
+    ));
+    let gone = terminal_input_write(&api_socket, &stream, 4, "after-close");
+    assert_eq!(gone["error"]["code"], "terminal_not_found", "{gone}");
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_keeps_terminal_input_stream_state() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let received = base.join("received");
+    let ready = base.join("ready");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let (pane_id, stream) = start_terminal_input_echo(&api_socket, &received, &ready);
+
+    let ack = terminal_input_write(&api_socket, &stream, 1, "before-handoff");
+    assert_eq!(ack["result"]["write"]["duplicate"], false, "{ack}");
+    wait_for_file_contains(&received, "got:before-handoff", Duration::from_secs(5));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    thread::sleep(Duration::from_millis(300));
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    // An ordinary handoff allocates new terminal ids; the pane id, the process
+    // and the input incarnation stay. The client finds its terminal again
+    // through the pane and proves it is the same one with the incarnation.
+    let stale_locator = terminal_input_reconcile(&api_socket, &stream);
+    assert_eq!(
+        stale_locator["error"]["code"], "terminal_not_found",
+        "{stale_locator}"
+    );
+    let pane = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:get","method":"pane.get","params":{"pane_id": pane_id}}),
+    );
+    let mut stream = stream;
+    stream["terminal_id"] = pane["result"]["pane"]["terminal_id"].clone();
+    let position = terminal_input_reconcile(&api_socket, &stream);
+    assert_eq!(
+        position["result"]["stream"]["incarnation"], stream["incarnation"],
+        "{position}"
+    );
+    assert_eq!(
+        position["result"]["stream"]["last_written_seq"], 1,
+        "{position}"
+    );
+    let duplicate = terminal_input_write(&api_socket, &stream, 1, "before-handoff");
+    assert_eq!(
+        duplicate["result"]["write"]["duplicate"], true,
+        "{duplicate}"
+    );
+    let mismatch = terminal_input_write(&api_socket, &stream, 1, "changed");
+    assert_eq!(mismatch["error"]["code"], "payload_mismatch", "{mismatch}");
+    let next = terminal_input_write(&api_socket, &stream, 2, "after-handoff");
+    assert_eq!(next["result"]["write"]["duplicate"], false, "{next}");
+
+    wait_for_file_contains(&received, "got:after-handoff", Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, "got:after-handoff");
+    assert_eq!(
+        received_lines(&received),
+        ["got:before-handoff", "got:after-handoff"]
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();

@@ -104,6 +104,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Terminal input | `terminal.input.open`, `terminal.input.write`, `terminal.input.reconcile` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -173,6 +174,57 @@ pane.
 ```
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
+
+### Acknowledged terminal input
+
+`pane.send_input` cannot tell a client whether a write whose reply was lost
+reached the terminal. The `terminal.input.*` methods can, so a client can resume
+typing after a reconnect without losing keys or typing anything twice. A server
+that supports them reports `capabilities.terminal_input_ack: true` from `ping`.
+
+1. `terminal.input.open` with a `terminal_id` (from `PaneInfo`) returns an
+   `incarnation` and a server-issued `stream_id`. The incarnation names one live
+   terminal process; if the terminal is recreated, requests with the old one
+   fail with `stale_target` instead of reaching the new process.
+2. `terminal.input.write` takes `terminal_id`, `incarnation`, `stream_id`, a
+   `seq` that starts at 1 and grows by 1, and `text`/`keys` with the same
+   meaning and live-mode encoding as `pane.send_input`. The reply arrives after
+   every byte was written to the terminal's PTY, after all earlier writes to
+   that terminal. It does not mean the program in the terminal has read them.
+3. Resending a sequence with the same payload returns `duplicate: true` and
+   writes nothing. The same sequence with a different payload fails with
+   `payload_mismatch`; a skipped sequence fails with `sequence_gap`.
+4. After a lost connection, `terminal.input.reconcile` returns
+   `last_written_seq`. Resend everything after it, in order.
+
+```json
+{"id":"o","method":"terminal.input.open","params":{"terminal_id":"term_1"}}
+{"id":"w","method":"terminal.input.write","params":{"terminal_id":"term_1","incarnation":"inc_…","stream_id":"tis_…","seq":1,"text":"make test","keys":["Enter"]}}
+{"id":"r","method":"terminal.input.reconcile","params":{"terminal_id":"term_1","incarnation":"inc_…","stream_id":"tis_…"}}
+```
+
+Each terminal keeps up to 32 streams and the payload digests of the last 128
+sequences per stream; a digest is dropped only once its write has completed. A
+stream idle for 24 hours expires; opening a 33rd stream evicts the one idle
+longest. A forgotten stream answers `stream_not_found` and is never recreated
+by a write. Stream state ends when the terminal exits and is not kept across a
+cold server restart.
+
+A live handoff keeps the incarnation and every stream's sequence numbers. It
+first writes everything still queued, so `last_written_seq` equals
+`last_admitted_seq` afterwards, and it carries only the digests of the last 32
+sequences per stream; resending an older one answers `sequence_not_retained`
+and writes nothing. Whether the `terminal_id` survives depends on the handoff:
+
+- `herdr update --handoff` and remote attach handoffs give every terminal a new
+  `terminal_id`. The old id answers `terminal_not_found`; look the pane up
+  again and call `terminal.input.reconcile` with the new `terminal_id` and your
+  existing `incarnation` and `stream_id`.
+- A Linux migration that carries terminal identity keeps the `terminal_id`, so
+  `terminal.input.reconcile` works unchanged.
+
+Either way, a server that does not have this feature on one side of the
+handoff drops the stream state, and the terminal answers `stale_target`.
 
 ### Pane graphics
 

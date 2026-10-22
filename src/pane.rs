@@ -1372,6 +1372,7 @@ pub struct PaneRuntime {
     self_reported_agent_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+    input_streams: crate::terminal::input_streams::TerminalInputStreams,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
@@ -1554,8 +1555,24 @@ impl PaneRuntimeIo {
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 let _ = deadline;
+                if sender.capacity() == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "pty input queue is full",
+                    ));
+                }
                 let sender = sender.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                if delay.is_zero() {
+                    // Like the PTY actor, zero-delay submissions complete in
+                    // queue order.
+                    let result = sender
+                        .try_send(text)
+                        .and_then(|()| sender.try_send(enter))
+                        .map_err(std::io::Error::other);
+                    let _ = reply_tx.send(result);
+                    return Ok(reply_rx);
+                }
                 std::thread::spawn(move || {
                     let result = sender
                         .try_send(text)
@@ -2191,6 +2208,7 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            input_streams: Some(Box::new(self.input_streams.lock().export_for_handoff())),
         }
     }
 
@@ -2404,7 +2422,19 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            input_streams,
         } = state;
+        let input_streams = crate::terminal::input_streams::TerminalInputStreams::from_table(
+            input_streams.map_or_else(
+                crate::terminal::input_streams::InputStreamTable::new,
+                |state| {
+                    crate::terminal::input_streams::InputStreamTable::from_handoff(
+                        *state,
+                        std::time::Instant::now(),
+                    )
+                },
+            ),
+        );
         let pane_id = PaneId::from_raw(pane_id);
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
@@ -2553,6 +2583,7 @@ impl PaneRuntime {
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
+            input_streams,
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(detect_handle),
@@ -3156,6 +3187,7 @@ impl PaneRuntime {
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
+            input_streams: crate::terminal::input_streams::TerminalInputStreams::new(),
             preserve_processes_on_drop: false,
             compression,
             detect_handle,
@@ -3554,6 +3586,10 @@ impl PaneRuntime {
         self.io.try_send_bytes(bytes)
     }
 
+    pub(crate) fn input_streams(&self) -> &crate::terminal::input_streams::TerminalInputStreams {
+        &self.input_streams
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,
@@ -3894,6 +3930,7 @@ impl PaneRuntime {
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
+                input_streams: crate::terminal::input_streams::TerminalInputStreams::new(),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 compression,
@@ -5266,6 +5303,7 @@ mod tests {
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
+            input_streams: crate::terminal::input_streams::TerminalInputStreams::new(),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,
@@ -5306,6 +5344,7 @@ mod tests {
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
+            input_streams: crate::terminal::input_streams::TerminalInputStreams::new(),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             compression,

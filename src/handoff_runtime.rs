@@ -29,6 +29,10 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// Acknowledged input stream state. Exported only after the PTY writer
+    /// quiesced, so every admitted write is already on the PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_streams: Option<Box<crate::terminal::input_streams::HandoffInputStreams>>,
 }
 
 #[cfg(unix)]

@@ -755,6 +755,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_input_ack: false,
             }),
         },
     };
