@@ -3283,6 +3283,7 @@ impl HeadlessServer {
         if matches!(
             &msg.request.method,
             api::schema::Method::TerminalInputWrite(_)
+                | api::schema::Method::TerminalInputWriteLiteral(_)
         ) {
             self.app
                 .handle_deferred_terminal_input_request(msg.request, msg.respond_to);

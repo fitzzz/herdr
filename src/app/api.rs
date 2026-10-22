@@ -1179,11 +1179,11 @@ impl App {
             Method::TerminalInputReconcile(params) => {
                 return self.handle_terminal_input_reconcile(request.id, params);
             }
-            Method::TerminalInputWrite(_) => {
+            Method::TerminalInputWrite(_) | Method::TerminalInputWriteLiteral(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
-                    "terminal.input.write is handled asynchronously by the app runtime",
+                    "acknowledged terminal writes are handled asynchronously by the app runtime",
                 );
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),

@@ -26,6 +26,18 @@ pub struct TerminalInputWriteParams {
     pub keys: Vec<String>,
 }
 
+/// Literal UTF-8 input, without paste or key encoding. Its stream and sequence
+/// are shared with `terminal.input.write`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalInputWriteLiteralParams {
+    pub terminal_id: String,
+    pub incarnation: String,
+    pub stream_id: String,
+    pub seq: u64,
+    pub literal: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TerminalInputReconcileParams {
     pub terminal_id: String,

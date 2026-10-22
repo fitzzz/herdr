@@ -104,7 +104,7 @@ Raw socket method names use dot notation:
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Terminal input | `terminal.input.open`, `terminal.input.write`, `terminal.input.reconcile` |
+| Terminal input | `terminal.input.open`, `terminal.input.write`, `terminal.input.write_literal`, `terminal.input.reconcile` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -181,6 +181,18 @@ Clients can treat `offset_from_bottom == 0` as at-bottom state.
 reached the terminal. The `terminal.input.*` methods can, so a client can resume
 typing after a reconnect without losing keys or typing anything twice. A server
 that supports them reports `capabilities.terminal_input_ack: true` from `ping`.
+
+Servers advertising `capabilities.terminal_input_literal: true` also support
+`terminal.input.write_literal`. It takes the same `terminal_id`, `incarnation`,
+`stream_id` and `seq`, plus a required nonempty `literal` string. Its exact UTF-8
+bytes reach the PTY without paste wrapping or key encoding, like `pane.send_text`.
+It does not accept `text` or `keys`. Use the same stream and sequence counter
+across encoded and literal writes; acknowledgment, ordering, de-duplication and
+reconciliation are shared. Check the capability before sending the new method.
+The original `terminal.input.write` request and payload digest stay unchanged.
+Literal digests use SHA-256 over `herdr.terminal.input.literal.v1` followed by a
+zero byte, the UTF-8 byte length as a little-endian u64, and the exact UTF-8 bytes.
+Switching payload kinds at an existing sequence fails with `payload_mismatch`.
 
 1. `terminal.input.open` with a `terminal_id` (from `PaneInfo`) returns an
    `incarnation` and a server-issued `stream_id`. The incarnation names one live

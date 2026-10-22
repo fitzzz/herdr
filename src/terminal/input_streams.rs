@@ -638,6 +638,20 @@ pub(crate) fn input_digest(text: &str, keys: &[String]) -> InputDigest {
         hasher.update((key.len() as u64).to_le_bytes());
         hasher.update(key.as_bytes());
     }
+    finish_input_digest(hasher)
+}
+
+/// Separate domain preserves the published encoded-input digest and prevents
+/// a sequence from changing between encoded and literal writes on replay.
+pub(crate) fn literal_input_digest(literal: &str) -> InputDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"herdr.terminal.input.literal.v1\0");
+    hasher.update((literal.len() as u64).to_le_bytes());
+    hasher.update(literal.as_bytes());
+    finish_input_digest(hasher)
+}
+
+fn finish_input_digest(hasher: Sha256) -> InputDigest {
     let full = hasher.finalize();
     let mut key = DigestKey::default();
     key.copy_from_slice(&full[..DIGEST_KEY_LEN]);
