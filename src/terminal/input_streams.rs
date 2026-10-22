@@ -6,19 +6,36 @@
 //! lock across admission, de-duplication and queueing the bytes for the PTY,
 //! and report the PTY write outcome back through [`InputStreamTable::complete_write`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_STREAMS_PER_TERMINAL: usize = 32;
 pub(crate) const RETAINED_SEQUENCES_PER_STREAM: usize = 128;
+/// A live handoff carries only the newest digests of each stream: after the
+/// writer drained, every admitted write is written, so reconcile needs none of
+/// them and only blind resends of recent requests can use one.
+pub(crate) const HANDOFF_RETAINED_SEQUENCES_PER_STREAM: usize = 32;
 pub(crate) const STREAM_IDLE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Called once with the PTY write outcome of one admitted sequence.
 pub(crate) type WriteWaiter = Box<dyn FnOnce(Result<(), String>) + Send>;
+
+/// The first 16 bytes of an [`InputDigest`]: enough to tell a resend from a
+/// different payload, and half the size to retain and hand off.
+pub(crate) type DigestKey = [u8; 16];
+
+const DIGEST_KEY_LEN: usize = std::mem::size_of::<DigestKey>();
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputDigest {
+    /// Full SHA-256 in lowercase hex, as reported to the client.
+    pub hex: String,
+    pub key: DigestKey,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputStreamError {
@@ -95,7 +112,7 @@ enum SequenceOutcome {
 
 struct RetainedSequence {
     seq: u64,
-    digest: String,
+    digest: DigestKey,
     outcome: SequenceOutcome,
 }
 
@@ -126,6 +143,19 @@ impl StreamState {
         let first = self.retained.front()?.seq;
         let index = usize::try_from(seq.checked_sub(first)?).ok()?;
         self.retained.get_mut(index)
+    }
+
+    /// Drops the oldest digests past the window. A pending write keeps its
+    /// digest, and every later one, until it completes.
+    fn trim(&mut self) {
+        while self.retained.len() > RETAINED_SEQUENCES_PER_STREAM
+            && self
+                .retained
+                .front()
+                .is_some_and(|entry| !matches!(entry.outcome, SequenceOutcome::Pending(_)))
+        {
+            self.retained.pop_front();
+        }
     }
 
     fn position(&self, stream_id: &str) -> StreamPosition {
@@ -210,7 +240,7 @@ impl InputStreamTable {
         &mut self,
         stream_id: &str,
         seq: u64,
-        digest: &str,
+        digest: &DigestKey,
         now: Instant,
     ) -> Result<WriteClass, InputStreamError> {
         self.expire_idle(now);
@@ -230,7 +260,7 @@ impl InputStreamTable {
         let entry = stream
             .retained_mut(seq)
             .ok_or(InputStreamError::SequenceNotRetained)?;
-        if entry.digest != digest {
+        if &entry.digest != digest {
             return Err(InputStreamError::PayloadMismatch);
         }
         match &entry.outcome {
@@ -245,7 +275,7 @@ impl InputStreamTable {
         &mut self,
         stream_id: &str,
         seq: u64,
-        digest: String,
+        digest: DigestKey,
         waiter: WriteWaiter,
     ) {
         let Some(stream) = self.streams.get_mut(stream_id) else {
@@ -259,14 +289,7 @@ impl InputStreamTable {
             digest,
             outcome: SequenceOutcome::Pending(vec![waiter]),
         });
-        while stream.retained.len() > RETAINED_SEQUENCES_PER_STREAM
-            && stream
-                .retained
-                .front()
-                .is_some_and(|entry| !matches!(entry.outcome, SequenceOutcome::Pending(_)))
-        {
-            stream.retained.pop_front();
-        }
+        stream.trim();
     }
 
     /// Adds a waiter to a sequence `classify_write` reported as pending.
@@ -329,6 +352,7 @@ impl InputStreamTable {
                 }
             }
         }
+        stream.trim();
         notify
     }
 
@@ -341,95 +365,79 @@ impl InputStreamTable {
 
     /// Captures state for a live handoff. Call only after the terminal's PTY
     /// writer quiesced: quiesce drains every queued write, so sequences still
-    /// marked pending here were written and are exported as written.
+    /// marked pending here were written and are exported as written. Only the
+    /// newest [`HANDOFF_RETAINED_SEQUENCES_PER_STREAM`] digests are carried.
     #[cfg(unix)]
     pub(crate) fn export_for_handoff(&self) -> HandoffInputStreams {
+        use base64::Engine;
+
         HandoffInputStreams {
             incarnation: self.incarnation.clone(),
             streams: self
                 .streams
                 .iter()
                 .map(|(stream_id, stream)| {
-                    let mut last_written_seq = stream.last_written_seq;
-                    let retained = stream
+                    let last_written_seq = stream
                         .retained
                         .iter()
-                        .map(|entry| {
-                            let written = !matches!(entry.outcome, SequenceOutcome::Failed(_));
-                            if written {
-                                last_written_seq = last_written_seq.max(entry.seq);
-                            }
-                            HandoffInputSequence {
-                                seq: entry.seq,
-                                digest: entry.digest.clone(),
-                                written,
-                            }
-                        })
-                        .collect();
+                        .filter(|entry| !matches!(entry.outcome, SequenceOutcome::Failed(_)))
+                        .map(|entry| entry.seq)
+                        .fold(stream.last_written_seq, u64::max);
+                    let skip = stream
+                        .retained
+                        .len()
+                        .saturating_sub(HANDOFF_RETAINED_SEQUENCES_PER_STREAM);
+                    let tail = stream.retained.iter().skip(skip);
+                    let digests: Vec<u8> = tail.clone().flat_map(|entry| entry.digest).collect();
                     HandoffInputStream {
                         stream_id: stream_id.clone(),
                         last_admitted_seq: stream.last_admitted_seq,
                         last_written_seq,
-                        retained,
+                        digests: base64::engine::general_purpose::STANDARD_NO_PAD.encode(digests),
+                        failed: tail
+                            .filter(|entry| matches!(entry.outcome, SequenceOutcome::Failed(_)))
+                            .map(|entry| entry.seq)
+                            .collect(),
                     }
                 })
                 .collect(),
         }
     }
 
-    /// Restores exported state; malformed state yields a fresh incarnation so a
-    /// client can never resume against sequence numbers it cannot trust.
+    /// Restores exported state. A malformed stream is dropped on its own, so
+    /// its client gets `stream_not_found` and can never resume against
+    /// sequence numbers the server cannot trust; the terminal keeps its
+    /// incarnation and its other streams. Only state with no usable
+    /// incarnation yields a fresh one.
     #[cfg(unix)]
     pub(crate) fn from_handoff(state: HandoffInputStreams, now: Instant) -> Self {
-        let mut streams = HashMap::new();
-        let valid = !state.incarnation.is_empty()
-            && state.streams.len() <= MAX_STREAMS_PER_TERMINAL
-            && state.streams.into_iter().all(|stream| {
-                let contiguous = stream
-                    .retained
-                    .iter()
-                    .zip(stream.retained.iter().skip(1))
-                    .all(|(a, b)| a.seq + 1 == b.seq);
-                let ends_at_admitted = stream
-                    .retained
-                    .last()
-                    .is_none_or(|entry| entry.seq == stream.last_admitted_seq);
-                let ok = !stream.stream_id.is_empty()
-                    && stream.last_written_seq <= stream.last_admitted_seq
-                    && stream.retained.len() <= RETAINED_SEQUENCES_PER_STREAM
-                    && contiguous
-                    && ends_at_admitted
-                    && !streams.contains_key(&stream.stream_id);
-                if ok {
-                    streams.insert(
-                        stream.stream_id,
-                        StreamState {
-                            last_admitted_seq: stream.last_admitted_seq,
-                            last_written_seq: stream.last_written_seq,
-                            last_used: now,
-                            retained: stream
-                                .retained
-                                .into_iter()
-                                .map(|entry| RetainedSequence {
-                                    seq: entry.seq,
-                                    digest: entry.digest,
-                                    outcome: if entry.written {
-                                        SequenceOutcome::Written
-                                    } else {
-                                        SequenceOutcome::Failed(
-                                            "write failed before live handoff".into(),
-                                        )
-                                    },
-                                })
-                                .collect(),
-                        },
-                    );
-                }
-                ok
-            });
-        if !valid {
-            tracing::warn!("discarding malformed terminal input stream handoff state");
+        if state.incarnation.is_empty() {
+            tracing::warn!("discarding terminal input stream handoff state without incarnation");
             return Self::new();
+        }
+        let mut seen = HashSet::new();
+        let duplicated: HashSet<String> = state
+            .streams
+            .iter()
+            .filter(|stream| !seen.insert(stream.stream_id.as_str()))
+            .map(|stream| stream.stream_id.clone())
+            .collect();
+        let mut streams = HashMap::new();
+        for stream in state.streams {
+            if streams.len() == MAX_STREAMS_PER_TERMINAL {
+                tracing::warn!("dropping terminal input streams past the per-terminal limit");
+                break;
+            }
+            if duplicated.contains(&stream.stream_id) {
+                tracing::warn!("dropping duplicated terminal input stream from handoff state");
+                continue;
+            }
+            match imported_stream(&stream, now) {
+                Some(imported) => {
+                    streams.insert(stream.stream_id, imported);
+                }
+                None => tracing::warn!("dropping malformed terminal input stream handoff state"),
+            }
         }
         Self {
             incarnation: state.incarnation,
@@ -438,10 +446,69 @@ impl InputStreamTable {
     }
 }
 
-/// Shared handle: the API thread admits writes and PTY completion threads
-/// report outcomes through the same lock.
+#[cfg(unix)]
+fn imported_stream(stream: &HandoffInputStream, now: Instant) -> Option<StreamState> {
+    use base64::Engine;
+
+    let digests = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(&stream.digests)
+        .ok()?;
+    if stream.stream_id.is_empty()
+        || stream.last_written_seq > stream.last_admitted_seq
+        || digests.len() % DIGEST_KEY_LEN != 0
+    {
+        return None;
+    }
+    let count = digests.len() / DIGEST_KEY_LEN;
+    if count > RETAINED_SEQUENCES_PER_STREAM || count as u64 > stream.last_admitted_seq {
+        return None;
+    }
+    let first_seq = stream.last_admitted_seq - count as u64 + 1;
+    let failed: HashSet<u64> = stream.failed.iter().copied().collect();
+    if failed
+        .iter()
+        .any(|seq| *seq < first_seq || *seq > stream.last_admitted_seq)
+    {
+        return None;
+    }
+    let retained = digests
+        .chunks_exact(DIGEST_KEY_LEN)
+        .zip(first_seq..)
+        .map(|(digest, seq)| RetainedSequence {
+            seq,
+            digest: digest.try_into().unwrap_or_default(),
+            outcome: if failed.contains(&seq) {
+                SequenceOutcome::Failed("write failed before live handoff".into())
+            } else {
+                SequenceOutcome::Written
+            },
+        })
+        .collect();
+    Some(StreamState {
+        last_admitted_seq: stream.last_admitted_seq,
+        last_written_seq: stream.last_written_seq,
+        last_used: now,
+        retained,
+    })
+}
+
+/// One queued PTY submission whose outcome the completion worker reports.
+pub(crate) struct PendingCompletion {
+    pub stream_id: String,
+    pub seq: u64,
+    pub completion: mpsc::Receiver<std::io::Result<()>>,
+}
+
+/// Shared handle: the API thread admits writes and one completion worker per
+/// terminal reports their outcomes through the same lock. Writes on a terminal
+/// complete in admission order, so the worker waits for them one at a time.
 #[derive(Clone)]
-pub(crate) struct TerminalInputStreams(Arc<Mutex<InputStreamTable>>);
+pub(crate) struct TerminalInputStreams {
+    table: Arc<Mutex<InputStreamTable>>,
+    /// The worker holds only `table`, so it stops once every handle is gone
+    /// and it has reported the writes already handed to it.
+    completions: Arc<Mutex<Option<mpsc::Sender<PendingCompletion>>>>,
+}
 
 impl TerminalInputStreams {
     pub(crate) fn new() -> Self {
@@ -449,21 +516,90 @@ impl TerminalInputStreams {
     }
 
     pub(crate) fn from_table(table: InputStreamTable) -> Self {
-        Self(Arc::new(Mutex::new(table)))
+        Self {
+            table: Arc::new(Mutex::new(table)),
+            completions: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, InputStreamTable> {
-        self.0
+        lock_table(&self.table)
+    }
+
+    /// The channel to this terminal's completion worker, started on first use.
+    /// Call before queueing bytes: when the worker cannot start, nothing has
+    /// been written and the request can be refused.
+    pub(crate) fn completion_sender(&self) -> std::io::Result<mpsc::Sender<PendingCompletion>> {
+        let mut completions = self
+            .completions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = completions.as_ref() {
+            return Ok(sender.clone());
+        }
+        let (sender, receiver) = mpsc::channel();
+        let table = Arc::clone(&self.table);
+        std::thread::Builder::new()
+            .name("herdr-input-ack".into())
+            .spawn(move || run_completions(&table, receiver))?;
+        *completions = Some(sender.clone());
+        Ok(sender)
+    }
+
+    /// Hands an admitted write to the completion worker. If the worker has
+    /// stopped, the write is reported as failed: its bytes were queued, so its
+    /// outcome is unknown.
+    pub(crate) fn track(
+        &self,
+        sender: &mpsc::Sender<PendingCompletion>,
+        pending: PendingCompletion,
+    ) {
+        if let Err(mpsc::SendError(pending)) = sender.send(pending) {
+            tracing::warn!("terminal input completion worker stopped");
+            self.completions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            self.complete_write(
+                &pending.stream_id,
+                pending.seq,
+                Err("input acknowledgement worker stopped".into()),
+            );
+        }
     }
 
     /// Applies a write outcome and notifies waiters outside the lock.
     pub(crate) fn complete_write(&self, stream_id: &str, seq: u64, result: Result<(), String>) {
-        let notify = self.lock().complete_write(stream_id, seq, result);
-        for (waiter, result) in notify {
-            waiter(result);
-        }
+        complete_and_notify(&self.table, stream_id, seq, result);
+    }
+}
+
+fn lock_table(table: &Mutex<InputStreamTable>) -> MutexGuard<'_, InputStreamTable> {
+    table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn complete_and_notify(
+    table: &Mutex<InputStreamTable>,
+    stream_id: &str,
+    seq: u64,
+    result: Result<(), String>,
+) {
+    let notify = lock_table(table).complete_write(stream_id, seq, result);
+    for (waiter, result) in notify {
+        waiter(result);
+    }
+}
+
+fn run_completions(table: &Mutex<InputStreamTable>, receiver: mpsc::Receiver<PendingCompletion>) {
+    for pending in receiver {
+        let result = match pending.completion.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("terminal input writer closed before the write".into()),
+        };
+        complete_and_notify(table, &pending.stream_id, pending.seq, result);
     }
 }
 
@@ -481,21 +617,18 @@ pub(crate) struct HandoffInputStream {
     pub stream_id: String,
     pub last_admitted_seq: u64,
     pub last_written_seq: u64,
+    /// Unpadded base64 of the retained digest keys, oldest first; the last one
+    /// belongs to `last_admitted_seq`.
     #[serde(default)]
-    pub retained: Vec<HandoffInputSequence>,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HandoffInputSequence {
-    pub seq: u64,
-    pub digest: String,
-    pub written: bool,
+    pub digests: String,
+    /// Retained sequences whose write failed; every other one was written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<u64>,
 }
 
 /// SHA-256 over the request's text and key strings exactly as sent, with
 /// length prefixes so no two payloads share an encoding.
-pub(crate) fn input_digest(text: &str, keys: &[String]) -> String {
+pub(crate) fn input_digest(text: &str, keys: &[String]) -> InputDigest {
     let mut hasher = Sha256::new();
     hasher.update(b"herdr.terminal.input.v1\0");
     hasher.update((text.len() as u64).to_le_bytes());
@@ -505,7 +638,13 @@ pub(crate) fn input_digest(text: &str, keys: &[String]) -> String {
         hasher.update((key.len() as u64).to_le_bytes());
         hasher.update(key.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    let full = hasher.finalize();
+    let mut key = DigestKey::default();
+    key.copy_from_slice(&full[..DIGEST_KEY_LEN]);
+    InputDigest {
+        hex: format!("{full:x}"),
+        key,
+    }
 }
 
 /// Unpredictable, never-repeating identifier. The standard library seeds each
@@ -540,6 +679,10 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn d(payload: &str) -> DigestKey {
+        input_digest(payload, &[]).key
+    }
+
     fn recorder() -> (WriteWaiter, mpsc::Receiver<Result<(), String>>) {
         let (tx, rx) = mpsc::channel();
         (
@@ -558,11 +701,11 @@ mod tests {
         now: Instant,
     ) -> mpsc::Receiver<Result<(), String>> {
         assert_eq!(
-            table.classify_write(stream, seq, digest, now),
+            table.classify_write(stream, seq, &d(digest), now),
             Ok(WriteClass::Next)
         );
         let (waiter, rx) = recorder();
-        table.record_admitted(stream, seq, digest.into(), waiter);
+        table.record_admitted(stream, seq, d(digest), waiter);
         rx
     }
 
@@ -619,26 +762,26 @@ mod tests {
         let mut table = InputStreamTable::new();
         let stream = table.open(now).unwrap().stream_id;
         assert_eq!(
-            table.classify_write(&stream, 2, "d", now),
+            table.classify_write(&stream, 2, &d("d"), now),
             Err(InputStreamError::SequenceGap {
                 last_admitted_seq: 0
             })
         );
         assert_eq!(
-            table.classify_write(&stream, 0, "d", now),
+            table.classify_write(&stream, 0, &d("d"), now),
             Err(InputStreamError::SequenceGap {
                 last_admitted_seq: 0
             })
         );
         let _ = admit(&mut table, &stream, 1, "d1", now);
         assert_eq!(
-            table.classify_write(&stream, 3, "d3", now),
+            table.classify_write(&stream, 3, &d("d3"), now),
             Err(InputStreamError::SequenceGap {
                 last_admitted_seq: 1
             })
         );
         assert_eq!(
-            table.classify_write("tis_unknown", 1, "d", now),
+            table.classify_write("tis_unknown", 1, &d("d"), now),
             Err(InputStreamError::StreamNotFound)
         );
     }
@@ -650,17 +793,17 @@ mod tests {
         let stream = table.open(now).unwrap().stream_id;
         let rx = admit(&mut table, &stream, 1, "enter", now);
         assert_eq!(
-            table.classify_write(&stream, 1, "enter", now),
+            table.classify_write(&stream, 1, &d("enter"), now),
             Ok(WriteClass::DuplicatePending)
         );
         notify(table.complete_write(&stream, 1, Ok(())));
         assert_eq!(rx.try_recv(), Ok(Ok(())));
         assert_eq!(
-            table.classify_write(&stream, 1, "enter", now),
+            table.classify_write(&stream, 1, &d("enter"), now),
             Ok(WriteClass::DuplicateWritten)
         );
         assert_eq!(
-            table.classify_write(&stream, 1, "other", now),
+            table.classify_write(&stream, 1, &d("other"), now),
             Err(InputStreamError::PayloadMismatch)
         );
         let position = table.position(&stream, now).unwrap();
@@ -714,7 +857,7 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(Err("pty closed".into())));
         assert_eq!(table.position(&stream, now).unwrap().last_written_seq, 0);
         assert_eq!(
-            table.classify_write(&stream, 1, "d", now),
+            table.classify_write(&stream, 1, &d("d"), now),
             Err(InputStreamError::WriteFailed("pty closed".into()))
         );
     }
@@ -730,27 +873,97 @@ mod tests {
             notify(table.complete_write(&stream, seq, Ok(())));
         }
         assert_eq!(
-            table.classify_write(&stream, 5, "d5", now),
+            table.classify_write(&stream, 5, &d("d5"), now),
             Err(InputStreamError::SequenceNotRetained)
         );
         assert_eq!(
-            table.classify_write(&stream, 6, "d6", now),
+            table.classify_write(&stream, 6, &d("d6"), now),
             Ok(WriteClass::DuplicateWritten)
         );
+    }
+
+    /// Writes queued while the program is not reading pile up past the
+    /// window; their digests stay until they complete, then the window is
+    /// back to its limit without another write.
+    fn backlog_past_the_window(table: &mut InputStreamTable, now: Instant) -> (String, u64) {
+        let stream = table.open(now).unwrap().stream_id;
+        let total = RETAINED_SEQUENCES_PER_STREAM as u64 + 72;
+        for seq in 1..=total {
+            let _ = admit(table, &stream, seq, &format!("d{seq}"), now);
+        }
+        (stream, total)
     }
 
     #[test]
     fn pending_sequences_are_never_dropped_from_the_window() {
         let now = Instant::now();
         let mut table = InputStreamTable::new();
-        let stream = table.open(now).unwrap().stream_id;
-        let total = RETAINED_SEQUENCES_PER_STREAM as u64 + 3;
-        for seq in 1..=total {
-            let _ = admit(&mut table, &stream, seq, &format!("d{seq}"), now);
-        }
+        let (stream, _) = backlog_past_the_window(&mut table, now);
         assert_eq!(
-            table.classify_write(&stream, 1, "d1", now),
+            table.classify_write(&stream, 1, &d("d1"), now),
             Ok(WriteClass::DuplicatePending)
+        );
+    }
+
+    #[test]
+    fn completing_a_backlog_trims_the_window_to_its_limit() {
+        let now = Instant::now();
+        let mut table = InputStreamTable::new();
+        let (stream, total) = backlog_past_the_window(&mut table, now);
+        notify(table.complete_write(&stream, total, Ok(())));
+        let first_kept = total - RETAINED_SEQUENCES_PER_STREAM as u64 + 1;
+        assert_eq!(
+            table.classify_write(
+                &stream,
+                first_kept - 1,
+                &d(&format!("d{}", first_kept - 1)),
+                now
+            ),
+            Err(InputStreamError::SequenceNotRetained)
+        );
+        assert_eq!(
+            table.classify_write(&stream, first_kept, &d(&format!("d{first_kept}")), now),
+            Ok(WriteClass::DuplicateWritten)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_drained_backlog_survives_handoff_with_its_identity() {
+        let now = Instant::now();
+        let mut table = InputStreamTable::new();
+        let (stream, total) = backlog_past_the_window(&mut table, now);
+        let quiet = table.open(now).unwrap().stream_id;
+
+        // The handoff drains the writer without reporting completions first.
+        let exported = table.export_for_handoff();
+        let json = serde_json::to_string(&exported).unwrap();
+        let mut imported =
+            InputStreamTable::from_handoff(serde_json::from_str(&json).unwrap(), now);
+
+        assert_eq!(imported.incarnation(), table.incarnation());
+        let position = imported.position(&stream, now).unwrap();
+        assert_eq!(
+            (position.last_admitted_seq, position.last_written_seq),
+            (total, total)
+        );
+        assert!(imported.position(&quiet, now).is_ok());
+        let first_kept = total - HANDOFF_RETAINED_SEQUENCES_PER_STREAM as u64 + 1;
+        assert_eq!(
+            imported.classify_write(&stream, total, &d(&format!("d{total}")), now),
+            Ok(WriteClass::DuplicateWritten)
+        );
+        assert_eq!(
+            imported.classify_write(&stream, first_kept, &d(&format!("d{first_kept}")), now),
+            Ok(WriteClass::DuplicateWritten)
+        );
+        assert_eq!(
+            imported.classify_write(&stream, first_kept - 1, &d("anything"), now),
+            Err(InputStreamError::SequenceNotRetained)
+        );
+        assert_eq!(
+            imported.classify_write(&stream, total + 1, &d("next"), now),
+            Ok(WriteClass::Next)
         );
     }
 
@@ -768,7 +981,7 @@ mod tests {
         );
         assert!(table.position(&busy, later).is_ok());
         assert_eq!(
-            table.classify_write(&idle, 1, "d", later),
+            table.classify_write(&idle, 1, &d("d"), later),
             Err(InputStreamError::StreamNotFound)
         );
     }
@@ -843,33 +1056,154 @@ mod tests {
             (2, 2)
         );
         assert_eq!(
-            imported.classify_write(&stream, 2, "b", now),
+            imported.classify_write(&stream, 2, &d("b"), now),
             Ok(WriteClass::DuplicateWritten)
         );
         assert_eq!(
-            imported.classify_write(&stream, 2, "x", now),
+            imported.classify_write(&stream, 2, &d("x"), now),
             Err(InputStreamError::PayloadMismatch)
         );
         assert_eq!(
-            imported.classify_write(&stream, 3, "c", now),
+            imported.classify_write(&stream, 3, &d("c"), now),
             Ok(WriteClass::Next)
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn malformed_handoff_state_mints_a_new_incarnation() {
+    fn a_malformed_stream_is_dropped_alone() {
         let now = Instant::now();
-        let state = HandoffInputStreams {
-            incarnation: "inc_old".into(),
-            streams: vec![HandoffInputStream {
-                stream_id: "tis_a".into(),
+        let mut table = InputStreamTable::new();
+        let good = table.open(now).unwrap().stream_id;
+        let _ = admit(&mut table, &good, 1, "a", now);
+        let mut state = table.export_for_handoff();
+        let valid = state.streams[0].clone();
+        let malformed = [
+            HandoffInputStream {
+                stream_id: "tis_written_past_admitted".into(),
                 last_admitted_seq: 2,
                 last_written_seq: 3,
-                retained: Vec::new(),
-            }],
+                digests: String::new(),
+                failed: Vec::new(),
+            },
+            HandoffInputStream {
+                stream_id: "tis_more_digests_than_sequences".into(),
+                ..valid.clone()
+            }
+            .with_digests(2),
+            HandoffInputStream {
+                stream_id: "tis_failed_outside_window".into(),
+                failed: vec![7],
+                ..valid.clone()
+            },
+            HandoffInputStream {
+                stream_id: "tis_not_base64".into(),
+                digests: "!!".into(),
+                ..valid.clone()
+            },
+            HandoffInputStream {
+                stream_id: "tis_twice".into(),
+                ..valid.clone()
+            },
+            HandoffInputStream {
+                stream_id: "tis_twice".into(),
+                ..valid.clone()
+            },
+        ];
+        state.streams.extend(malformed);
+
+        let mut imported = InputStreamTable::from_handoff(state, now);
+        assert_eq!(imported.incarnation(), table.incarnation());
+        assert_eq!(imported.streams.len(), 1);
+        assert_eq!(
+            imported.classify_write(&good, 1, &d("a"), now),
+            Ok(WriteClass::DuplicateWritten)
+        );
+    }
+
+    #[cfg(unix)]
+    impl HandoffInputStream {
+        fn with_digests(mut self, count: usize) -> Self {
+            use base64::Engine;
+            self.digests = base64::engine::general_purpose::STANDARD_NO_PAD
+                .encode(vec![0u8; count * DIGEST_KEY_LEN]);
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_state_without_incarnation_mints_a_new_one() {
+        let state = HandoffInputStreams {
+            incarnation: String::new(),
+            streams: Vec::new(),
         };
-        let table = InputStreamTable::from_handoff(state, now);
-        assert_ne!(table.incarnation(), "inc_old");
+        assert!(InputStreamTable::from_handoff(state, Instant::now())
+            .incarnation()
+            .starts_with("inc_"));
+    }
+
+    /// Every terminal at its limits: the most streams, each with a full
+    /// window. The handoff line is capped at 16 MiB and also carries each
+    /// pane's history, so stream state must stay a small part of it.
+    #[cfg(unix)]
+    #[test]
+    fn handoff_state_stays_small_at_the_limits() {
+        let now = Instant::now();
+        let mut table = InputStreamTable::new();
+        for _ in 0..MAX_STREAMS_PER_TERMINAL {
+            let stream = table.open(now).unwrap().stream_id;
+            for seq in 1..=RETAINED_SEQUENCES_PER_STREAM as u64 + 1000 {
+                let _ = admit(&mut table, &stream, seq, &format!("{seq}"), now);
+                notify(table.complete_write(&stream, seq, Ok(())));
+            }
+        }
+        let terminals = 256;
+        let per_terminal = serde_json::to_string(&table.export_for_handoff())
+            .unwrap()
+            .len();
+        assert!(
+            per_terminal < 32 * 1024,
+            "{per_terminal} bytes per terminal"
+        );
+        assert!(
+            per_terminal * terminals < 16 * 1024 * 1024 / 2,
+            "{} bytes for {terminals} terminals",
+            per_terminal * terminals
+        );
+    }
+
+    #[test]
+    fn the_completion_worker_is_shared_and_stops_with_its_terminal() {
+        let streams = TerminalInputStreams::new();
+        let stream = streams.lock().open(Instant::now()).unwrap().stream_id;
+        let mut replies = Vec::new();
+        for seq in 1..=3 {
+            let sender = streams.completion_sender().unwrap();
+            let (waiter, rx) = recorder();
+            streams.lock().record_admitted(&stream, seq, d("x"), waiter);
+            let (done_tx, completion) = mpsc::channel();
+            done_tx.send(Ok(())).unwrap();
+            streams.track(
+                &sender,
+                PendingCompletion {
+                    stream_id: stream.clone(),
+                    seq,
+                    completion,
+                },
+            );
+            replies.push(rx);
+        }
+        for rx in replies {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(())));
+        }
+
+        let table = Arc::downgrade(&streams.table);
+        drop(streams);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while table.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "completion worker kept running");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

@@ -204,13 +204,27 @@ that supports them reports `capabilities.terminal_input_ack: true` from `ping`.
 ```
 
 Each terminal keeps up to 32 streams and the payload digests of the last 128
-sequences per stream. A stream idle for 24 hours expires; opening a 33rd stream
-evicts the one idle longest. A forgotten stream answers `stream_not_found` and
-is never recreated by a write. Stream state ends when the terminal exits and is
-not kept across a cold server restart. A live handoff keeps it, but gives the
-terminal a new `terminal_id`: look the pane up again and call
-`terminal.input.reconcile` with the new `terminal_id` and your existing
-`incarnation` and `stream_id`.
+sequences per stream; a digest is dropped only once its write has completed. A
+stream idle for 24 hours expires; opening a 33rd stream evicts the one idle
+longest. A forgotten stream answers `stream_not_found` and is never recreated
+by a write. Stream state ends when the terminal exits and is not kept across a
+cold server restart.
+
+A live handoff keeps the incarnation and every stream's sequence numbers. It
+first writes everything still queued, so `last_written_seq` equals
+`last_admitted_seq` afterwards, and it carries only the digests of the last 32
+sequences per stream; resending an older one answers `sequence_not_retained`
+and writes nothing. Whether the `terminal_id` survives depends on the handoff:
+
+- `herdr update --handoff` and remote attach handoffs give every terminal a new
+  `terminal_id`. The old id answers `terminal_not_found`; look the pane up
+  again and call `terminal.input.reconcile` with the new `terminal_id` and your
+  existing `incarnation` and `stream_id`.
+- A Linux migration that carries terminal identity keeps the `terminal_id`, so
+  `terminal.input.reconcile` works unchanged.
+
+Either way, a server that does not have this feature on one side of the
+handoff drops the stream state, and the terminal answers `stale_target`.
 
 ### Pane graphics
 

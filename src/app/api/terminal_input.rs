@@ -8,7 +8,7 @@ use crate::api::schema::{
 };
 use crate::app::App;
 use crate::terminal::input_streams::{
-    input_digest, InputStreamError, StreamPosition, WriteClass, WriteWaiter,
+    input_digest, InputStreamError, PendingCompletion, StreamPosition, WriteClass, WriteWaiter,
 };
 
 use super::responses::{encode_error, encode_success};
@@ -140,7 +140,7 @@ impl App {
                 incarnation: params.incarnation.clone(),
                 stream_id: params.stream_id.clone(),
                 seq: params.seq,
-                digest: digest.clone(),
+                digest: digest.hex.clone(),
                 duplicate,
             };
             Box::new(move |result: Result<(), String>| {
@@ -157,7 +157,7 @@ impl App {
             })
         };
 
-        match table.classify_write(&params.stream_id, params.seq, &digest, Instant::now()) {
+        match table.classify_write(&params.stream_id, params.seq, &digest.key, Instant::now()) {
             Err(err) => {
                 let _ = respond_to.send(stream_error(id, &err));
             }
@@ -181,6 +181,17 @@ impl App {
                         return true;
                     }
                 };
+                let completions = match streams.completion_sender() {
+                    Ok(completions) => completions,
+                    Err(err) => {
+                        let _ = respond_to.send(encode_error(
+                            id,
+                            "terminal_unavailable",
+                            format!("cannot track terminal input: {err}"),
+                        ));
+                        return true;
+                    }
+                };
                 // The submission path replies only after its bytes were
                 // written to the PTY; an empty Enter part adds nothing.
                 let completion = match runtime.queue_user_input_submission(
@@ -200,18 +211,16 @@ impl App {
                         return true;
                     }
                 };
-                table.record_admitted(&params.stream_id, params.seq, digest.clone(), waiter(false));
+                table.record_admitted(&params.stream_id, params.seq, digest.key, waiter(false));
                 drop(table);
-                let stream_id = params.stream_id;
-                let seq = params.seq;
-                std::thread::spawn(move || {
-                    let result = match completion.recv() {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(err.to_string()),
-                        Err(_) => Err("terminal input writer closed before the write".into()),
-                    };
-                    streams.complete_write(&stream_id, seq, result);
-                });
+                streams.track(
+                    &completions,
+                    PendingCompletion {
+                        stream_id: params.stream_id,
+                        seq: params.seq,
+                        completion,
+                    },
+                );
             }
         }
         true
