@@ -205,6 +205,8 @@ pub enum Method {
     TerminalInputOpen(TerminalInputOpenParams),
     #[serde(rename = "terminal.input.write")]
     TerminalInputWrite(TerminalInputWriteParams),
+    #[serde(rename = "terminal.input.write_literal")]
+    TerminalInputWriteLiteral(TerminalInputWriteLiteralParams),
     #[serde(rename = "terminal.input.reconcile")]
     TerminalInputReconcile(TerminalInputReconcileParams),
     #[serde(rename = "pane.read")]

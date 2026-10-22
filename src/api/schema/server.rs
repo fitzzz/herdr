@@ -40,4 +40,8 @@ pub struct ServerCapabilities {
     /// `terminal.input.reconcile`.
     #[serde(default)]
     pub terminal_input_ack: bool,
+    /// Supports byte-preserving UTF-8 `terminal.input.write_literal` on the
+    /// same acknowledged streams as `terminal.input.write`.
+    #[serde(default)]
+    pub terminal_input_literal: bool,
 }

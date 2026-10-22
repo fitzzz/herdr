@@ -4394,6 +4394,37 @@
           ],
           "type": "object"
         },
+        "TerminalInputWriteLiteralParams": {
+          "additionalProperties": false,
+          "description": "Literal UTF-8 input, without paste or key encoding. Its stream and sequence\nare shared with `terminal.input.write`.",
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "literal": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq",
+            "literal"
+          ],
+          "type": "object"
+        },
         "TerminalInputWriteParams": {
           "properties": {
             "incarnation": {
@@ -6009,6 +6040,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/TerminalInputWriteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.write_literal",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputWriteLiteralParams"
             }
           },
           "required": [
@@ -10613,6 +10660,11 @@
             "terminal_input_ack": {
               "default": false,
               "description": "Supports `terminal.input.open`, `terminal.input.write` and\n`terminal.input.reconcile`.",
+              "type": "boolean"
+            },
+            "terminal_input_literal": {
+              "default": false,
+              "description": "Supports byte-preserving UTF-8 `terminal.input.write_literal` on the\nsame acknowledged streams as `terminal.input.write`.",
               "type": "boolean"
             }
           },

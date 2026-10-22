@@ -77,6 +77,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         terminal_input_ack: true,
+        terminal_input_literal: true,
     })
 }
 
@@ -646,6 +647,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendInput(_) => "pane.send_input",
         Method::TerminalInputOpen(_) => "terminal.input.open",
         Method::TerminalInputWrite(_) => "terminal.input.write",
+        Method::TerminalInputWriteLiteral(_) => "terminal.input.write_literal",
         Method::TerminalInputReconcile(_) => "terminal.input.reconcile",
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
@@ -1492,6 +1494,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 terminal_input_ack: false,
+                terminal_input_literal: false,
             }),
             None,
             None,

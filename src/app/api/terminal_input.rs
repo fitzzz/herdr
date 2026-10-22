@@ -4,11 +4,12 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     Method, ResponseResult, TerminalInputOpenParams, TerminalInputReconcileParams,
-    TerminalInputStreamInfo, TerminalInputWriteAck,
+    TerminalInputStreamInfo, TerminalInputWriteAck, TerminalInputWriteParams,
 };
 use crate::app::App;
 use crate::terminal::input_streams::{
-    input_digest, InputStreamError, PendingCompletion, StreamPosition, WriteClass, WriteWaiter,
+    input_digest, literal_input_digest, InputStreamError, PendingCompletion, StreamPosition,
+    WriteClass, WriteWaiter,
 };
 
 use super::responses::{encode_error, encode_success};
@@ -88,7 +89,7 @@ impl App {
         }
     }
 
-    /// Handles `terminal.input.write`, replying through `respond_to` once the
+    /// Handles acknowledged encoded or literal writes, replying once the
     /// write reached the PTY. Returns false for any other method.
     ///
     /// Admission, de-duplication and queueing happen under the terminal's
@@ -100,15 +101,32 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let Method::TerminalInputWrite(params) = request.method else {
-            return false;
+        // Both payload forms use one admission and completion path. Keep the
+        // published encoded request unchanged and normalize only internally.
+        let (params, literal) = match request.method {
+            Method::TerminalInputWrite(params) => (params, None),
+            Method::TerminalInputWriteLiteral(params) => (
+                TerminalInputWriteParams {
+                    terminal_id: params.terminal_id,
+                    incarnation: params.incarnation,
+                    stream_id: params.stream_id,
+                    seq: params.seq,
+                    text: String::new(),
+                    keys: Vec::new(),
+                },
+                Some(params.literal),
+            ),
+            _ => return false,
         };
         let id = request.id;
-        if params.text.is_empty() && params.keys.is_empty() {
+        if literal.as_ref().map_or_else(
+            || params.text.is_empty() && params.keys.is_empty(),
+            String::is_empty,
+        ) {
             let _ = respond_to.send(encode_error(
                 id,
                 "invalid_params",
-                "terminal input write needs text or keys",
+                "terminal input write needs a nonempty payload",
             ));
             return true;
         }
@@ -125,7 +143,10 @@ impl App {
             return true;
         };
 
-        let digest = input_digest(&params.text, &params.keys);
+        let digest = match &literal {
+            Some(value) => literal_input_digest(value),
+            None => input_digest(&params.text, &params.keys),
+        };
         let streams = runtime.input_streams().clone();
         let mut table = streams.lock();
         if let Err(err) = table.check_incarnation(Some(&params.incarnation)) {
@@ -166,11 +187,15 @@ impl App {
                 table.wait_for(&params.stream_id, params.seq, waiter(true));
             }
             Ok(WriteClass::Next) => {
-                let bytes = match crate::app::api_helpers::encode_api_input(
-                    runtime,
-                    &params.text,
-                    &params.keys,
-                ) {
+                let encoded = match &literal {
+                    Some(value) => Ok(value.as_bytes().to_vec()),
+                    None => crate::app::api_helpers::encode_api_input(
+                        runtime,
+                        &params.text,
+                        &params.keys,
+                    ),
+                };
+                let bytes = match encoded {
                     Ok(bytes) => bytes,
                     Err(key) => {
                         let _ = respond_to.send(encode_error(
@@ -234,7 +259,7 @@ mod tests {
     use crate::api::schema::{
         ErrorResponse, Method, Request, ResponseResult, SuccessResponse, TerminalInputOpenParams,
         TerminalInputReconcileParams, TerminalInputStreamInfo, TerminalInputWriteAck,
-        TerminalInputWriteParams,
+        TerminalInputWriteLiteralParams, TerminalInputWriteParams,
     };
     use crate::app::App;
     use crate::config::Config;
@@ -364,6 +389,48 @@ mod tests {
 
         /// Bytes written so far to one terminal, without the empty Enter
         /// part the test channel records for every submission.
+        fn send_literal(
+            &mut self,
+            stream: &TerminalInputStreamInfo,
+            seq: u64,
+            literal: &str,
+        ) -> mpsc::Receiver<String> {
+            let (tx, rx) = mpsc::channel();
+            assert!(self.app.handle_deferred_terminal_input_request(
+                Request {
+                    id: format!("literal-{seq}"),
+                    method: Method::TerminalInputWriteLiteral(TerminalInputWriteLiteralParams {
+                        terminal_id: stream.terminal_id.clone(),
+                        incarnation: stream.incarnation.clone(),
+                        stream_id: stream.stream_id.clone(),
+                        seq,
+                        literal: literal.to_owned(),
+                    }),
+                },
+                tx,
+            ));
+            rx
+        }
+
+        fn write_literal(
+            &mut self,
+            stream: &TerminalInputStreamInfo,
+            seq: u64,
+            literal: &str,
+        ) -> Result<TerminalInputWriteAck, ErrorResponse> {
+            let response = self
+                .send_literal(stream, seq, literal)
+                .recv_timeout(WAIT)
+                .unwrap();
+            match serde_json::from_str(&response) {
+                Ok(SuccessResponse {
+                    result: ResponseResult::TerminalInputWritten { write },
+                    ..
+                }) => Ok(write),
+                _ => Err(serde_json::from_str(&response).unwrap()),
+            }
+        }
+
         fn written(&mut self, index: usize) -> Vec<u8> {
             let mut bytes = Vec::new();
             while let Ok(chunk) = self.rxs[index].try_recv() {
@@ -500,6 +567,94 @@ mod tests {
             h.written(0),
             b"one\ntwo\x1b[200~three\nfour\x1b[201~\r".to_vec()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn literal_writes_preserve_navigation_graphemes_and_controls_in_paste_mode() {
+        let mut h = Harness::new(1);
+        let stream = h.open(0, None).unwrap();
+        h.runtime(0).test_process_pty_bytes(b"\x1b[?2004h");
+        let literal = "\x1b[H\x1b[F\x1b[2~\x1b[3~\x1b[5~\x1b[6~e\u{301}👩‍💻\x7f\0";
+        h.write_literal(&stream, 1, literal).unwrap();
+        assert_eq!(h.written(0), literal.as_bytes());
+        h.write(&stream, 2, "paste", &["Enter"]).unwrap();
+        assert_eq!(h.written(0), b"\x1b[200~paste\x1b[201~\r");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn literal_and_encoded_writes_share_order_and_reject_cross_kind_replays() {
+        let mut h = Harness::new(1);
+        let stream = h.open(0, None).unwrap();
+        h.write(&stream, 1, "before", &[]).unwrap();
+        let ack = h.write_literal(&stream, 2, "\x1b[H").unwrap();
+        h.write(&stream, 3, "after", &["Enter"]).unwrap();
+        assert_eq!(h.written(0), b"before\x1b[Hafter\r");
+        assert_eq!(h.reconcile(&stream).unwrap().last_written_seq, 3);
+        let replay = h.write_literal(&stream, 2, "\x1b[H").unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.digest, ack.digest);
+        assert_eq!(code(h.write(&stream, 2, "\x1b[H", &[])), "payload_mismatch");
+        assert_eq!(
+            code(h.write_literal(&stream, 1, "before")),
+            "payload_mismatch"
+        );
+        assert_eq!(
+            code(h.write_literal(&stream, 2, "\x1b[F")),
+            "payload_mismatch"
+        );
+        assert_eq!(h.written(0), b"");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn literal_lost_reply_reconciles_without_retyping() {
+        let mut h = Harness::new(1);
+        let stream = h.open(0, None).unwrap();
+        drop(h.send_literal(&stream, 1, "e\u{301}\r"));
+        // Wait for the same completion a reconnect would observe, then resend
+        // its original sequence rather than allocating another one.
+        let ack = h.write_literal(&stream, 1, "e\u{301}\r").unwrap();
+        assert!(ack.duplicate);
+        assert_eq!(h.reconcile(&stream).unwrap().last_written_seq, 1);
+        assert_eq!(h.written(0), "e\u{301}\r".as_bytes());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_literal_writes_leave_the_stream_and_terminal_unchanged() {
+        let mut h = Harness::new(2);
+        let stream = h.open(0, None).unwrap();
+        assert_eq!(code(h.write_literal(&stream, 1, "")), "invalid_params");
+        assert_eq!(code(h.write_literal(&stream, 0, "x")), "invalid_params");
+        assert_eq!(code(h.write_literal(&stream, 2, "x")), "sequence_gap");
+        let other = h.open(1, None).unwrap();
+        let crossed = TerminalInputStreamInfo {
+            terminal_id: other.terminal_id,
+            ..stream.clone()
+        };
+        assert_eq!(code(h.write_literal(&crossed, 1, "x")), "stale_target");
+        assert_eq!(h.reconcile(&stream).unwrap().last_admitted_seq, 0);
+        assert_eq!(h.written(0), b"");
+        assert_eq!(h.written(1), b"");
+        assert!(!h.write_literal(&stream, 1, "x").unwrap().duplicate);
+    }
+
+    #[test]
+    fn literal_method_rejects_missing_or_mixed_payload_fields() {
+        let request = serde_json::json!({"id":"literal", "method":"terminal.input.write_literal", "params":{
+            "terminal_id":"term", "incarnation":"inc", "stream_id":"stream", "seq":1, "literal":"x"
+        }});
+        assert!(serde_json::from_value::<Request>(request.clone()).is_ok());
+        for field in ["text", "keys"] {
+            let mut mixed = request.clone();
+            mixed["params"][field] = if field == "keys" {
+                serde_json::json!([])
+            } else {
+                serde_json::json!("")
+            };
+            assert!(serde_json::from_value::<Request>(mixed).is_err());
+        }
+        let mut missing = request;
+        missing["params"].as_object_mut().unwrap().remove("literal");
+        assert!(serde_json::from_value::<Request>(missing).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
