@@ -67,7 +67,7 @@ fn observe(pane: &GhosttyPaneTerminal, area: Rect, reference: bool) -> Observati
         match pane.screen_snapshot() {
             Some(screen) => {
                 assert!(!synchronized, "screen snapshot during synchronized output");
-                screen.frame_data(area, None)
+                screen.frame_data(area, 0, None)
             }
             None => {
                 // The snapshot is withheld only while synchronized output is

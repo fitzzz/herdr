@@ -611,6 +611,10 @@ impl TerminalRuntime {
         self.0.current_size()
     }
 
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        self.0.crop_rows_above(view_rows)
+    }
+
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }

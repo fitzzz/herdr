@@ -66,6 +66,34 @@ pub struct ScrollMetrics {
     pub viewport_rows: usize,
 }
 
+/// Terminal viewport rows hidden above a view `view_rows` tall. Nonzero only
+/// when another client holds the PTY taller than this view. A live view
+/// follows the cursor, or keeps the bottom when the cursor is outside the
+/// viewport. A scrolled-back view depends only on the viewport's position in
+/// history, so new output does not move it, and it reaches the oldest row.
+pub(crate) fn crop_rows_above(
+    screen_rows: u16,
+    view_rows: u16,
+    cursor_row: Option<u16>,
+    scroll: Option<ScrollMetrics>,
+) -> u16 {
+    // A view shorter than Herdr's minimum PTY got that grid from Herdr
+    // itself and keeps drawing its top rows.
+    if screen_rows <= view_rows.max(super::MIN_PTY_ROWS) {
+        return 0;
+    }
+    let max = screen_rows - view_rows;
+    if let Some(scroll) = scroll.filter(|scroll| scroll.offset_from_bottom > 0) {
+        let viewport_top = scroll
+            .max_offset_from_bottom
+            .saturating_sub(scroll.offset_from_bottom);
+        return u16::try_from(viewport_top).unwrap_or(u16::MAX).min(max);
+    }
+    cursor_row.map_or(max, |row| {
+        row.saturating_add(1).saturating_sub(view_rows).min(max)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TerminalTextPoint {
     pub row: u32,
@@ -234,6 +262,10 @@ pub(crate) struct GhosttyPaneCore {
     screen: Option<Arc<TerminalScreen>>,
     screen_used_at: Instant,
     patch_baseline: Option<screen_extract::PatchBaseline>,
+    /// Some view drew this grid from below its top row since the last dirty
+    /// patch. Row patches address grid rows from the top, so the next patch
+    /// consumer must take a full frame instead.
+    cropped_view_drawn: bool,
 }
 
 pub(crate) struct PaneTerminal {
@@ -557,6 +589,10 @@ impl PaneTerminal {
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
         self.ghostty.render(frame, area, show_cursor);
+    }
+
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        self.ghostty.crop_rows_above(view_rows)
     }
 
     pub fn collect_dirty_patch(
@@ -1228,6 +1264,7 @@ impl GhosttyPaneTerminal {
                 screen: None,
                 screen_used_at: Instant::now(),
                 patch_baseline: None,
+                cropped_view_drawn: false,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1838,17 +1875,23 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
-        let Ok(core) = self.core.lock() else {
-            return None;
+        let core = self.core.lock().ok()?;
+        ghostty_scroll_metrics(&core.terminal)
+    }
+
+    /// Viewport rows hidden above a view `view_rows` tall; see `crop_rows_above`.
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        let Ok(mut core) = self.core.lock() else {
+            return 0;
         };
-        let scrollbar = core.terminal.scrollbar().ok()?;
-        Some(ScrollMetrics {
-            offset_from_bottom: scrollbar
-                .total
-                .saturating_sub(scrollbar.offset + scrollbar.len),
-            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
-            viewport_rows: scrollbar.len,
-        })
+        let Ok(rows) = core.terminal.rows() else {
+            return 0;
+        };
+        if rows <= view_rows {
+            return 0;
+        }
+        let cursor_row = current_cursor_state(&mut core).map(|cursor| cursor.y);
+        ghostty_crop_rows_above(&mut core, rows, view_rows, cursor_row)
     }
 
     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
@@ -2358,8 +2401,14 @@ impl GhosttyPaneTerminal {
         };
         if screen_extract::screen_snapshot_enabled() {
             if let Ok(screen) = screen_extract::refresh_screen(&mut core) {
+                let rows_above = ghostty_crop_rows_above(
+                    &mut core,
+                    screen.rows,
+                    area.height,
+                    screen.cursor.map(|cursor| cursor.y),
+                );
                 drop(core);
-                return screen.visible_hyperlinks(area);
+                return screen.visible_hyperlinks(area, rows_above);
             }
         }
         ghostty_visible_hyperlinks(&mut core, area).unwrap_or_default()
@@ -2433,7 +2482,7 @@ impl GhosttyPaneTerminal {
             return self.render_legacy(frame, area, show_cursor);
         }
         let lock_started = crate::render_prof::timer();
-        let (screen, cursor) = {
+        let (screen, cursor, rows_above) = {
             let Ok(mut core) = self.core.lock() else {
                 return;
             };
@@ -2452,15 +2501,23 @@ impl GhosttyPaneTerminal {
             let cursor = show_cursor
                 .then(|| effective_cursor_state(&mut core, screen.cursor))
                 .flatten();
-            (screen, cursor)
+            let rows_above = ghostty_crop_rows_above(
+                &mut core,
+                screen.rows,
+                area.height,
+                screen.cursor.map(|cursor| cursor.y),
+            );
+            (screen, cursor, rows_above)
         };
         // The core lock is released; writing cells only reads the snapshot.
         let write_started = crate::render_prof::timer();
-        screen.write_to_buffer(frame.buffer_mut(), area);
+        screen.write_to_buffer(frame.buffer_mut(), area, rows_above);
         crate::render_prof::duration_since("full_viewport.conversion", write_started);
         if let Some(cursor) = cursor.filter(|cursor| cursor.visible) {
-            if cursor.x < area.width && cursor.y < area.height {
-                frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+            if let Some(y) = cursor.y.checked_sub(rows_above) {
+                if cursor.x < area.width && y < area.height {
+                    frame.set_cursor_position((area.x + cursor.x, area.y + y));
+                }
             }
         }
     }
@@ -2487,6 +2544,7 @@ impl GhosttyPaneTerminal {
             terminal,
             render_state,
             decscusr_tracker,
+            cropped_view_drawn,
             ..
         } = &mut *core;
         if render_state.update(terminal).is_err() {
@@ -2503,6 +2561,18 @@ impl GhosttyPaneTerminal {
             .zip(terminal.default_palette().ok())
             .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
         let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+
+        let rows_above = match render_state.rows() {
+            Ok(rows) if rows > area.height => crop_rows_above(
+                rows,
+                area.height,
+                cursor_state_from_render_state(render_state, decscusr_tracker)
+                    .map(|cursor| cursor.y),
+                ghostty_scroll_metrics(terminal),
+            ),
+            _ => 0,
+        };
+        *cropped_view_drawn |= rows_above > 0;
 
         if let Some(profile) = profile.as_mut() {
             profile.conversion_started = Some(Instant::now());
@@ -2523,6 +2593,11 @@ impl GhosttyPaneTerminal {
             };
             let mut grapheme_bytes = Vec::new();
             let mut symbol_scratch = String::new();
+            for _ in 0..rows_above {
+                if !rows.next() {
+                    break;
+                }
+            }
             let mut y = 0u16;
             while y < area.height && rows.next() {
                 let mut cells = match rows.populate_cells(&mut row_cells) {
@@ -2594,15 +2669,17 @@ impl GhosttyPaneTerminal {
             profile.conversion_elapsed =
                 profile.conversion_started.map(|started| started.elapsed());
         }
-        ghostty_clear_render_dirty(render_state, area.height);
+        ghostty_clear_render_dirty(render_state, area.height.saturating_add(rows_above));
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
         if show_cursor {
             if let Some(cursor) =
                 effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
             {
-                if cursor.x < area.width && cursor.y < area.height {
-                    frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+                if let Some(y) = cursor.y.checked_sub(rows_above) {
+                    if cursor.x < area.width && y < area.height {
+                        frame.set_cursor_position((area.x + cursor.x, area.y + y));
+                    }
                 }
             }
         }
@@ -2627,6 +2704,11 @@ impl GhosttyPaneTerminal {
                 #[cfg(test)]
                 if let Some(hook) = core.dirty_collection_hook.take() {
                     hook();
+                }
+                if std::mem::take(&mut core.cropped_view_drawn) {
+                    crate::render_prof::event("dirty_fallback.cropped_view_drawn");
+                    core.patch_baseline = None;
+                    return TerminalDirtyPatchOutcome::Fallback;
                 }
                 if screen_extract::screen_snapshot_enabled() {
                     screen_extract::screen_dirty_patch(&mut core, area_width, area_height)
@@ -2727,6 +2809,38 @@ fn render_delay_after_pty_write(
             .flatten();
         cursor_delay.max(has_kitty_graphics_sequence.then_some(KITTY_GRAPHICS_REDRAW_SETTLE))
     }
+}
+
+fn ghostty_scroll_metrics(terminal: &crate::ghostty::Terminal) -> Option<ScrollMetrics> {
+    let scrollbar = terminal.scrollbar().ok()?;
+    Some(ScrollMetrics {
+        offset_from_bottom: scrollbar
+            .total
+            .saturating_sub(scrollbar.offset + scrollbar.len),
+        max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+        viewport_rows: scrollbar.len,
+    })
+}
+
+/// `crop_rows_above` with the scroll position read under the held core lock.
+/// Reads the scrollbar only when the grid is taller than the view.
+fn ghostty_crop_rows_above(
+    core: &mut GhosttyPaneCore,
+    screen_rows: u16,
+    view_rows: u16,
+    cursor_row: Option<u16>,
+) -> u16 {
+    if screen_rows <= view_rows {
+        return 0;
+    }
+    let rows_above = crop_rows_above(
+        screen_rows,
+        view_rows,
+        cursor_row,
+        ghostty_scroll_metrics(&core.terminal),
+    );
+    core.cropped_view_drawn |= rows_above > 0;
+    rows_above
 }
 
 fn current_cursor_state(core: &mut GhosttyPaneCore) -> Option<TerminalCursorState> {
@@ -2952,12 +3066,31 @@ fn ghostty_visible_hyperlinks(
     let GhosttyPaneCore {
         terminal,
         render_state,
+        decscusr_tracker,
+        cropped_view_drawn,
         ..
     } = core;
     render_state.update(terminal)?;
+    let screen_rows = render_state.rows()?;
+    let rows_above = if screen_rows > area.height {
+        crop_rows_above(
+            screen_rows,
+            area.height,
+            cursor_state_from_render_state(render_state, decscusr_tracker).map(|cursor| cursor.y),
+            ghostty_scroll_metrics(terminal),
+        )
+    } else {
+        0
+    };
+    *cropped_view_drawn |= rows_above > 0;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
+    for _ in 0..rows_above {
+        if !rows.next() {
+            break;
+        }
+    }
     let mut links = Vec::new();
     let mut y = 0u16;
     while y < area.height && rows.next() {
@@ -2965,7 +3098,7 @@ fn ghostty_visible_hyperlinks(
         let mut x = 0u16;
         while x < area.width && cells.next() {
             if cells.has_hyperlink()? {
-                if let Some(uri) = terminal.viewport_hyperlink_uri(x, y.into())? {
+                if let Some(uri) = terminal.viewport_hyperlink_uri(x, (y + rows_above).into())? {
                     links.push(((area.x + x, area.y + y), ghostty_cell_symbol(&cells)?, uri));
                 }
             }
@@ -3814,6 +3947,48 @@ mod tests {
     use super::*;
     use ratatui::{layout::Rect, style::Color};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn crop_rows_above_follows_the_cursor_of_a_live_view_taller_than_it() {
+        let live = Some(ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 200,
+            viewport_rows: 109,
+        });
+        // The grid fits: nothing is hidden, wherever the cursor is.
+        assert_eq!(crop_rows_above(60, 60, Some(59), live), 0);
+        assert_eq!(crop_rows_above(40, 60, Some(39), live), 0);
+        // A one-row pane always gets Herdr's two-row minimum PTY.
+        assert_eq!(
+            crop_rows_above(crate::pane::MIN_PTY_ROWS, 1, Some(1), live),
+            0
+        );
+        assert_eq!(crop_rows_above(3, 1, Some(2), live), 2);
+        // A 109-row grid in a 60-row view.
+        assert_eq!(crop_rows_above(109, 60, Some(108), live), 49);
+        assert_eq!(crop_rows_above(109, 60, Some(70), live), 11);
+        assert_eq!(crop_rows_above(109, 60, Some(30), live), 0);
+        // No cursor in the viewport keeps the bottom.
+        assert_eq!(crop_rows_above(109, 60, None, live), 49);
+        assert_eq!(crop_rows_above(109, 60, None, None), 49);
+    }
+
+    #[test]
+    fn crop_rows_above_of_a_scrolled_back_view_tracks_the_viewport_position_only() {
+        let scrolled = |offset_from_bottom| {
+            Some(ScrollMetrics {
+                offset_from_bottom,
+                max_offset_from_bottom: 200,
+                viewport_rows: 109,
+            })
+        };
+        // The cursor does not matter once scrolled back.
+        assert_eq!(crop_rows_above(109, 60, Some(20), scrolled(5)), 49);
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(5)), 49);
+        // Near the oldest row the hidden rows shrink to reach it.
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(190)), 10);
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(200)), 0);
+    }
 
     #[test]
     fn plain_page_keys_host_scroll_for_shell_like_decckm_with_bracketed_paste() {

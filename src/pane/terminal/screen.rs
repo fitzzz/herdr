@@ -210,12 +210,13 @@ impl TerminalScreen {
         ScreenCell::blank(self.default_fg, self.default_bg)
     }
 
-    /// Writes the same cells as the legacy per-cell renderer into `area`.
-    pub(crate) fn write_to_buffer(&self, buf: &mut Buffer, area: Rect) {
+    /// Writes the same cells as the legacy per-cell renderer into `area`,
+    /// starting `rows_above` rows down the grid.
+    pub(crate) fn write_to_buffer(&self, buf: &mut Buffer, area: Rect, rows_above: u16) {
         let mut scratch = [0u8; 4];
         let blank = self.blank();
         for y in 0..area.height {
-            let row = self.row(y);
+            let row = self.row(y.saturating_add(rows_above));
             for x in 0..area.width {
                 let (cell, symbol) =
                     match row.and_then(|row| Some((row, row.cells.get(usize::from(x))?))) {
@@ -233,13 +234,19 @@ impl TerminalScreen {
         }
     }
 
-    /// OSC 8 cells inside `area`: position, OSC 8 symbol, URI.
-    pub(crate) fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
+    /// OSC 8 cells inside `area`, starting `rows_above` rows down the grid:
+    /// position, OSC 8 symbol, URI.
+    pub(crate) fn visible_hyperlinks(
+        &self,
+        area: Rect,
+        rows_above: u16,
+    ) -> Vec<((u16, u16), String, String)> {
         let mut links = Vec::new();
         let mut scratch = [0u8; 4];
         for (y, row) in self
             .rows_data
             .iter()
+            .skip(usize::from(rows_above))
             .take(usize::from(area.height))
             .enumerate()
         {
@@ -319,17 +326,25 @@ impl TerminalScreen {
     /// against an empty buffer), then OSC 8 attachment where the hyperlink
     /// symbol equals the backend symbol.
     #[cfg(test)]
-    pub(crate) fn frame_data(&self, area: Rect, cursor: Option<CursorState>) -> FrameData {
-        self.frame_data_with_row_revisions(area, cursor).0
+    pub(crate) fn frame_data(
+        &self,
+        area: Rect,
+        rows_above: u16,
+        cursor: Option<CursorState>,
+    ) -> FrameData {
+        self.frame_data_with_row_revisions(area, rows_above, cursor)
+            .0
     }
 
-    /// `frame_data` plus the identity of each frame row. The revisions are
-    /// `None` when ratatui's diff state carries from one row into the next
-    /// (a wide cell at the right edge), because such a row also depends on
-    /// the row above it.
+    /// `frame_data` plus the identity of each frame row. The frame starts
+    /// `rows_above` rows down the grid. The revisions are `None` when
+    /// ratatui's diff state carries from one row into the next (a wide cell
+    /// at the right edge), because such a row also depends on the row above
+    /// it.
     pub(crate) fn frame_data_with_row_revisions(
         &self,
         area: Rect,
+        rows_above: u16,
         cursor: Option<CursorState>,
     ) -> (FrameData, Option<FrameRowRevisions>) {
         let width = area.width;
@@ -346,7 +361,7 @@ impl TerminalScreen {
         let mut diff = DiffState::default();
         let mut row_revisions = Some(Vec::with_capacity(usize::from(height)));
         for y in 0..height {
-            let row = self.row(y);
+            let row = self.row(y.saturating_add(rows_above));
             if diff.carries() {
                 row_revisions = None;
             }
@@ -405,7 +420,7 @@ impl TerminalScreen {
         };
         let revisions = row_revisions.map(|rows| {
             let mut key = std::hash::DefaultHasher::new();
-            (area.width, area.height, self.cols, self.rows).hash(&mut key);
+            (area.width, area.height, rows_above, self.cols, self.rows).hash(&mut key);
             (self.default_fg, self.default_bg).hash(&mut key);
             FrameRowRevisions {
                 key: key.finish(),
