@@ -67,6 +67,8 @@ const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::
 const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = crate::ghostty::TERM;
+/// Herdr never sizes a PTY below this many rows, whatever the pane's height.
+pub(crate) const MIN_PTY_ROWS: u16 = 2;
 const PANE_COLORTERM: &str = "truecolor";
 
 fn terminal_compression_permits() -> Arc<tokio::sync::Semaphore> {
@@ -3236,9 +3238,19 @@ impl PaneRuntime {
         self.content_seq.load(Ordering::Acquire)
     }
 
+    /// Grid rows a view `view_rows` tall hides above what it draws. Another
+    /// client can hold the PTY taller than this view; see
+    /// `crate::pane::terminal::crop_rows_above`.
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        if self.current_size().0 <= view_rows {
+            return 0;
+        }
+        self.terminal.crop_rows_above(view_rows)
+    }
+
     /// Resize if the dimensions actually changed.
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
-        let rows = rows.max(2);
+        let rows = rows.max(MIN_PTY_ROWS);
         let cols = cols.max(4);
         let size = (rows, cols, cell_width_px, cell_height_px);
         if self.current_size.get() == size {
@@ -3398,12 +3410,13 @@ impl PaneRuntime {
             return None;
         }
         let cursor = self.terminal.cursor_state()?;
-        if cursor.x >= area.width || cursor.y >= area.height {
+        let y = cursor.y.checked_sub(self.crop_rows_above(area.height))?;
+        if cursor.x >= area.width || y >= area.height {
             return None;
         }
         Some(TerminalCursorState {
             x: area.x + cursor.x,
-            y: area.y + cursor.y,
+            y: area.y + y,
             visible: cursor.visible,
             shape: cursor.shape,
         })

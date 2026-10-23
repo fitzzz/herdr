@@ -272,7 +272,7 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
             .terminal_runtimes
             .get(&id)
             .unwrap()
-            .test_process_pty_bytes(b"\x1b[2;3HMULTI\x1b[80;250HDEEP");
+            .test_process_pty_bytes(b"\x1b[2;3HMULTI\x1b[80;250HDEEP\x1b[H");
         assert!(server.render_retained_pane_surface_and_stream(&HashSet::from([pane_id])));
         let large = replay_terminal_frame(&controller, &large_displays);
         let small = replay_terminal_frame(&observer, &small_displays);
@@ -291,6 +291,11 @@ fn direct_controller_and_smaller_observer_share_one_dirty_collection() {
             // reveals the following row's unchanged first cell.
             (b"\x1b[4;80Hx".as_slice(), false),
             (b"\x1b[6;4HAFTER_EDGE".as_slice(), true),
+            // The cursor below the observer's 24 rows moves its view down the
+            // grid; row patches cannot express that, in either direction.
+            (b"\x1b[80;1HLOW".as_slice(), false),
+            (b"\x1b[H".as_slice(), false),
+            (b"\x1b[7;4HTOP_AGAIN".as_slice(), true),
         ] {
             server
                 .app

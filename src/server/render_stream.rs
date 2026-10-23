@@ -746,7 +746,8 @@ pub(crate) fn render_terminal_frame(
         visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
         shape: cursor.shape,
     });
-    let (frame, revisions) = screen.frame_data_with_row_revisions(area, cursor);
+    let rows_above = runtime.crop_rows_above(area.height);
+    let (frame, revisions) = screen.frame_data_with_row_revisions(area, rows_above, cursor);
     let revisions = revisions.map(|revisions| RowRevisions {
         key: revisions.key,
         rows: revisions.rows,

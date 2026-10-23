@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
+use super::scrollbar::{pane_view_scroll_metrics, render_pane_scrollbar, should_show_scrollbar};
 #[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
@@ -196,8 +196,7 @@ fn stable_scrollbar_gutter(
         1,
         pane_inner.height,
     );
-    let scrollbar_rect = rt
-        .scroll_metrics()
+    let scrollbar_rect = pane_view_scroll_metrics(rt, inner_rect.height)
         .filter(|metrics| should_show_scrollbar(*metrics))
         .map(|_| gutter);
 
@@ -1317,9 +1316,11 @@ mod tests {
         let mut workspace = Workspace::test_new("test");
         let focused_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
         workspace.zoomed = true;
+        // Sized to the bordered pane: a taller grid would be a cropped view,
+        // which shows the scrollbar.
         workspace.tabs[0].runtimes.insert(
             focused_pane,
-            TerminalRuntime::test_with_scrollback_bytes(40, 8, 1024, b"ready\n"),
+            TerminalRuntime::test_with_scrollback_bytes(37, 6, 1024, b"ready\n"),
         );
         app.workspaces = vec![workspace];
         app.active = Some(0);
