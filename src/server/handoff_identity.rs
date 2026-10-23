@@ -242,6 +242,7 @@ pub(crate) fn admit_manifest(
     receipt: &IdentityReceipt,
     manifest: &HandoffManifest,
 ) -> io::Result<HashMap<u32, AdmittedPaneIdentity>> {
+    super::handoff::validate_manifest_format(manifest)?;
     if receipt.version != 1
         || receipt.operation_id.is_empty()
         || receipt.observation_epoch != receipt.operation_id
@@ -249,7 +250,7 @@ pub(crate) fn admit_manifest(
         || manifest.source_protocol != receipt.source_protocol
         || manifest.expected_version.as_deref() != Some(receipt.candidate_version.as_str())
         || manifest.expected_protocol != Some(receipt.candidate_protocol)
-        || manifest.snapshot.version != 3
+        || !matches!(manifest.snapshot.version, 3 | 4)
     {
         return Err(mismatch(
             "migration source/candidate/snapshot version differs",

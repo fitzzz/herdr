@@ -767,3 +767,30 @@ herdr agent wait w1:p1 --until blocked
 クライアント描画の Herdr UI は、ローカルサーバーと SSH サーバーに安定したエンドポイント世代を使います。クライアントとサーバーのビルドが一致する必要はありません。接続時にコアのスナップショット、画面、入力、blob コーデックを合意し、サーバーが対応 API メソッドと任意の能力を通知します。保存済み SSH マシンには、選択中のマシンだけがペイン画面を送信するための `surface_interest` と、通信のない接続の障害を検知する `health_check` が必要です。未対応のサーバーは明示的に更新するまで Attention になります。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。メソッドがない場合は、そのサーバー上の該当アクションだけを無効にしてクライアント側通知を表示します。拒否やタイムアウトも接続を終了せず通知します。エンドポイント世代 1 より前のサーバーだけは最後の 1 回の更新が必要です。
 
 番号付きバイナリプロトコルは、直接ターミナル接続やライブハンドオフなど、同一インストール内の内部操作に残ります。異なるビルド間でそれらを使う前に `ping` または `herdr status` を確認してください。JSON API クライアントは未知のフィールドを無視し、未対応メソッドを通常のエラーとして扱う必要があります。
+
+### 外部エージェントランチャー
+
+対象サーバーの `ping` 応答で `result.capabilities.agent_launcher` が `true`、
+`result.capabilities.methods` に `agent.start_with_launcher` が含まれることを確認します。
+ローカル CLI のスキーマだけではサーバーの対応を確認できません。
+未対応の場合はこの操作だけを無効にし、接続の切断やネイティブ起動への切り替えは行いません。
+
+`agent.start_with_launcher` は `name`、ネイティブの `kind`、`pane_id`、`args`、
+任意の `timeout_ms` と必須の `launcher: {executable, prefix_args, env}` を受け取ります。
+`executable` は実行可能ファイルの絶対パスです。環境変数は子プロセスだけに適用され、
+実行引数は `executable + prefix_args + args` です。アカウントの選択は Herdr の役割ではありません。
+
+新しい結果 `agent_started_with_launcher` は `agent`、適用した `launcher`、実際の `argv` を返します。
+これは送信の確認であり、認証成功の証明ではありません。既存の `agent.start` と `agent_started` は変更されません。
+
+応答が不確かな場合は、対応を確認した `agent.launcher_info` に `{target}` を渡します。
+結果 `agent_launcher_info` は `agent`、null を許す `binding`、`confirmed` を返します。
+binding は `kind`、null を許す `session: {kind, value}`、`launcher`、`argv`、
+`argv_origin`（`admission` または `canonical_resume`）を含みます。
+確認には現在のネイティブ報告とプロバイダープロセスの一致が必要です。保存情報だけでは確認されません。
+ペイン、ターミナル、プロバイダー、会話 ID、ランチャー全体を照合し、不明な結果で再起動や置き換えをしないでください。
+
+同じ会話の復元には既存の標準再開引数とランチャーを使います。置き換えが確認された場合のみ紐付けを消去します。
+ランチャーが不明または無効な場合は復元を拒否します。ランチャー付き保存 JSON は version 4、
+ハンドオフは version 2 を使い、通常は 3/1 のままです。古いバイナリは新しい形式を拒否します。
+ダウングレード前に元の保存データをバックアップし、バージョン番号やランチャー情報を削除して読み込みを強制しないでください。

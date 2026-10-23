@@ -1687,6 +1687,166 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 }
 
 #[test]
+fn live_handoff_preserves_agent_launcher_and_requires_fresh_native_observation() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let receipt = base.join("launcher.json");
+    let received = base.join("received");
+    let ready = base.join("shell-ready");
+    let fake_provider = base.join("fake-provider.py");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &fake_provider,
+        r#"import json, os, sys
+with open(sys.argv[1], 'w') as out:
+    json.dump([os.getpid(), sys.argv[4:], os.environ['FIXTURE_ACCOUNT'], os.environ['FIXTURE_REQUIRED'], sys.argv[3]], out)
+for line in sys.stdin:
+    with open(sys.argv[2], 'a') as out:
+        out.write(line)
+    print('got:' + line.strip(), flush=True)
+"#,
+    )
+    .unwrap();
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({"id":"create", "method":"workspace.create", "params":{"cwd":base,"focus":false}}),
+    );
+    assert_ok(created.clone());
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"ready", "method":"pane.send_input", "params":{
+            "pane_id":pane,"text":format!("printf ready > {}", ready.display()),"keys":["Enter"]}}),
+    ));
+    support::wait_for_file(&ready, Duration::from_secs(5));
+    let uuid = "00000000-0000-4000-8000-000000000123";
+    let args = ["resume", uuid, "--model", "fixture model", "literal' $()"];
+    let launcher = serde_json::json!({
+        "executable":"/usr/bin/python3",
+        "prefix_args":["-u",fake_provider,receipt,received,"fixture prefix"],
+        "env":{"HERDR_AGENT":"codex","FIXTURE_ACCOUNT":"selected-account","FIXTURE_REQUIRED":"1"}
+    });
+    let started = request(
+        &api_socket,
+        serde_json::json!({"id":"start", "method":"agent.start_with_launcher", "params":{
+            "name":"launcher-handoff", "kind":"codex", "pane_id":pane, "args":args,"launcher":launcher}}),
+    );
+    assert_eq!(
+        started["result"]["type"], "agent_started_with_launcher",
+        "{started}"
+    );
+    assert_eq!(started["result"]["launcher"], launcher);
+    wait_for_file_contains(&receipt, "selected-account", Duration::from_secs(5));
+    let receipt_before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(receipt_before[1], serde_json::json!(args));
+    assert_eq!(receipt_before[2], "selected-account");
+    assert_eq!(receipt_before[3], "1");
+    assert_eq!(receipt_before[4], "fixture prefix");
+    let provider_pid = receipt_before[0].as_u64().unwrap() as libc::pid_t;
+    let lookup = || {
+        request(
+            &api_socket,
+            serde_json::json!({
+        "id":"lookup", "method":"agent.launcher_info", "params":{"target":pane}}),
+        )
+    };
+    let report = |seq| {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"session", "method":"pane.report_agent_session", "params":{
+            "pane_id":pane,"source":"herdr:codex","agent":"codex","seq":seq,
+            "agent_session_id":uuid,"session_start_source":"resume"}}),
+        ));
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = lookup();
+        if observed["result"]["agent"]["agent"] == "codex" {
+            assert_eq!(observed["result"]["confirmed"], false);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake provider was not detected: {observed}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    report(1);
+    let before = lookup();
+    assert_eq!(before["result"]["confirmed"], true, "{before}");
+    assert_eq!(before["result"]["binding"]["launcher"], launcher);
+    assert_eq!(
+        before["result"]["binding"]["argv"],
+        started["result"]["argv"]
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"input-before", "method":"pane.send_input", "params":{
+        "pane_id":pane,"text":"before-handoff","keys":["Enter"]}}),
+    ));
+    wait_for_file_contains(&received, "before-handoff", Duration::from_secs(5));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"handoff", "method":"server.live_handoff", "params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let after = lookup();
+    assert_eq!(
+        after["result"]["confirmed"], false,
+        "persisted metadata alone cannot confirm: {after}"
+    );
+    assert_eq!(after["result"]["binding"], before["result"]["binding"]);
+    assert_eq!(after["result"]["agent"]["agent_session"]["value"], uuid);
+    assert_eq!(after["result"]["binding"]["argv_origin"], "admission");
+    assert_eq!(
+        unsafe { libc::kill(provider_pid, 0) },
+        0,
+        "the provider PID must survive handoff"
+    );
+    report(2);
+    let confirmed = lookup();
+    assert_eq!(confirmed["result"]["confirmed"], true, "{confirmed}");
+    assert_eq!(confirmed["result"]["binding"], before["result"]["binding"]);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"input-after", "method":"pane.send_input", "params":{
+        "pane_id":pane,"text":"after-handoff","keys":["Enter"]}}),
+    ));
+    wait_for_file_contains(&received, "after-handoff", Duration::from_secs(5));
+    assert_eq!(
+        received_lines(&received),
+        ["before-handoff", "after-handoff"]
+    );
+    let receipt_after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        receipt_after, receipt_before,
+        "handoff must not launch another provider"
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"stop", "method":"server.stop", "params":{}}),
+    ));
+    let snapshot_path = config_home.join("herdr-dev/session.json");
+    wait_for_file_contains(&snapshot_path, "agent_launcher", Duration::from_secs(5));
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(snapshot_path).unwrap()).unwrap();
+    assert_eq!(snapshot["version"], 4);
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     use std::os::unix::fs::PermissionsExt;
 

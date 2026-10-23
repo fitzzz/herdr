@@ -436,6 +436,47 @@ pub(crate) fn interactive_unix_shell_command(
     Some(command)
 }
 
+pub(crate) fn launcher_executable_available(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn unix_agent_launcher_command(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    shell: &str,
+    quote: fn(&str) -> String,
+) -> Option<String> {
+    if argv.is_empty() {
+        return None;
+    }
+    let command_argv: Vec<String> = ["/usr/bin/env".into(), "--".into()]
+        .into_iter()
+        .chain(env.iter().map(|(key, value)| format!("{key}={value}")))
+        .chain(argv.iter().cloned())
+        .collect();
+    let command = interactive_unix_shell_command(&command_argv, shell, quote)?;
+    Some(if is_powershell_process_name(shell) {
+        format!("& {command}")
+    } else {
+        command
+    })
+}
+
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
     if !value.is_empty()
         && !value.starts_with('-')

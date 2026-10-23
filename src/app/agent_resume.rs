@@ -238,7 +238,41 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        let resume_command = if let Some(binding) = &plan.launcher {
+            let session = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.persisted_agent_session.as_ref());
+            let identity_matches = binding.agent == plan.agent
+                && binding.session.as_ref().is_none_or(|expected| {
+                    session.is_some_and(|session| {
+                        session.agent == binding.agent && &session.session_ref == expected
+                    })
+                });
+            let command = if identity_matches {
+                binding.launcher.command(
+                    plan.argv.get(1..).unwrap_or_default(),
+                    &self.state.default_shell,
+                )
+            } else {
+                Err("Saved launcher does not match the native conversation identity".into())
+            };
+            match command {
+                Ok(command) => Some(command),
+                Err(error) => {
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.pending_agent_resume_plan = None;
+                        terminal.restore_error = Some(error);
+                        terminal.revision = terminal.revision.saturating_add(1);
+                    }
+                    return true;
+                }
+            }
+        } else {
+            shell_command_from_argv(&plan.argv)
+        };
+        let Some(resume_command) = resume_command else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -311,6 +345,14 @@ impl App {
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            if let Some(mut binding) = plan.launcher {
+                binding.observed = false;
+                binding.argv = binding
+                    .launcher
+                    .argv(plan.argv.get(1..).unwrap_or_default());
+                binding.argv_origin = crate::agent_launcher::LauncherArgvOrigin::CanonicalResume;
+                terminal.agent_launcher = Some(binding);
+            }
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
         }
@@ -385,6 +427,195 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_survives_snapshot_and_actual_deferred_restore() {
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let receipt = temp.path().join("receipt.json");
+        let mut original = test_app();
+        original.state.workspaces = vec![crate::workspace::Workspace::test_new("launcher-restore")];
+        original.state.ensure_test_terminals();
+        original.state.active = Some(0);
+        let pane = original.state.workspaces[0].tabs[0].root_pane;
+        let id = original.state.workspaces[0]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        let session = crate::agent_resume::AgentSessionRef::id("same-uuid").unwrap();
+        let binding = crate::agent_launcher::BoundAgentLauncher {
+                observed: false,
+                argv: Vec::new(), argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "codex".into(), session: Some(session.clone()),
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/usr/bin/python3".into(),
+                prefix_args: vec!["-c".into(), "import os,sys,json;open(sys.argv[1],'w').write(json.dumps([sys.argv[2:],os.environ['FIXTURE_ACCOUNT']]))".into(), receipt.to_string_lossy().into()],
+                env: [("FIXTURE_ACCOUNT".into(), "assigned".into())].into(),
+            },
+        };
+        let terminal = original.state.terminals.get_mut(&id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: session,
+        });
+        terminal.agent_launcher = Some(binding.clone());
+        let snapshot = crate::persist::capture(
+            &original.state.workspaces,
+            &original.state.terminals,
+            &original.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        assert_eq!(snapshot.version, 4);
+        let bytes = serde_json::to_vec(&snapshot).unwrap();
+        let snapshot = serde_json::from_slice(&bytes).unwrap();
+        let mut app = test_app();
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "bash",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        );
+        assert!(runtimes.is_empty());
+        app.state.workspaces = workspaces;
+        app.state.terminals = terminals;
+        app.terminal_runtimes = runtimes.into();
+        app.state.active = Some(0);
+        app.state.default_shell = "bash".into();
+        let id = app.state.terminals.keys().next().unwrap().clone();
+        assert_eq!(
+            app.state.terminals[&id].agent_launcher.as_ref(),
+            Some(&binding)
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        let applied = app.state.terminals[&id].agent_launcher.as_ref().unwrap();
+        assert_eq!(
+            applied.argv_origin,
+            crate::agent_launcher::LauncherArgvOrigin::CanonicalResume
+        );
+        assert_eq!(
+            applied.argv,
+            binding
+                .launcher
+                .argv(&["resume".into(), "same-uuid".into()])
+        );
+        assert!(
+            !applied.observed,
+            "a saved identity alone cannot confirm the new process"
+        );
+        for _ in 0..100 {
+            if receipt.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let result: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([["resume", "same-uuid"], "assigned"])
+        );
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_missing_on_restore_refuses_before_native_spawn() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("launcher-missing")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let id = app.state.terminals.keys().next().unwrap().clone();
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: vec!["codex".into(), "resume".into(), "same-uuid".into()],
+            dedupe_key: "fixture".into(),
+            launcher: Some(crate::agent_launcher::BoundAgentLauncher {
+                observed: false,
+                argv: Vec::new(),
+                argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+                agent: "codex".into(),
+                session: None,
+                launcher: crate::api::schema::AgentLauncher {
+                    executable: "/__missing_launcher__".into(),
+                    prefix_args: vec![],
+                    env: Default::default(),
+                },
+            }),
+        });
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app.state.terminals[&id]
+            .restore_error
+            .as_deref()
+            .unwrap()
+            .contains("launcher"));
+        assert!(app.state.terminals[&id].pending_agent_resume_plan.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_restore_mismatch_retains_unconfirmed_binding() {
+        let mut app = test_app();
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "version":4, "active":0, "selected":0, "workspaces":[{"identity_cwd":cwd, "tabs":[{
+                "layout":{"Pane":0},"zoomed":false,"panes":{"0":{
+                    "cwd":cwd,"agent_session":{"source":"herdr:codex","agent":"codex","kind":"id","value":"saved-native-uuid"},
+                    "agent_launcher":{"kind":"codex","session":{"kind":"id","value":"different-bound-uuid"},
+                        "launcher":{"executable":"/usr/bin/printf","prefix_args":["no execution"],"env":{}},
+                        "argv":["/usr/bin/printf","no execution"],"argv_origin":"admission"}
+                }}
+            }]}]
+        })).unwrap();
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "bash",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        );
+        app.state.workspaces = workspaces;
+        app.state.terminals = terminals;
+        app.terminal_runtimes = runtimes.into();
+        app.state.active = Some(0);
+        let id = app.state.terminals.keys().next().unwrap().clone();
+        assert!(
+            app.state.terminals[&id].agent_launcher.is_some(),
+            "a persisted identity mismatch is not a confirmed replacement"
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app.state.terminals[&id].restore_error.is_some());
+        let saved_again = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        assert_eq!(
+            saved_again.version, 4,
+            "refused recovery must not erase required launcher on the next save"
+        );
+    }
+
+    #[cfg(unix)]
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -424,6 +655,7 @@ mod tests {
             for terminal in app.state.terminals.values_mut() {
                 terminal.cwd = missing.clone();
                 terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                    launcher: None,
                     agent: "codex".into(),
                     argv: vec!["codex".into()],
                     dedupe_key: terminal.id.to_string(),
@@ -519,6 +751,7 @@ mod tests {
             };
             terminal.persisted_agent_session = Some(session.clone());
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                launcher: None,
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: "resume-test".into(),
@@ -555,6 +788,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: marker_resume_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
@@ -633,6 +867,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
@@ -684,6 +919,7 @@ mod tests {
                 .get_mut(terminal_id)
                 .expect("test terminal should exist")
                 .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                launcher: None,
                 agent: "codex".into(),
                 argv: long_running_test_argv(),
                 dedupe_key: format!("herdr:codex\0codex\0Id\0{terminal_id}"),
@@ -754,6 +990,7 @@ mod tests {
             .get_mut(&inactive_terminal)
             .expect("inactive tab terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0inactive-tab-session".into(),
@@ -815,6 +1052,7 @@ mod tests {
             .get_mut(&hidden_terminal)
             .expect("hidden zoom pane terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0zoom-hidden-session".into(),
@@ -873,6 +1111,7 @@ mod tests {
             .get_mut(&previous_terminal)
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
@@ -934,6 +1173,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist")
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            launcher: None,
             agent: "codex".into(),
             argv: long_running_test_argv(),
             dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
