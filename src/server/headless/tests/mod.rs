@@ -6303,6 +6303,7 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
         .get_mut(&terminal_id)
         .expect("test terminal should exist")
         .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+        launcher: None,
         agent: "codex".into(),
         argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
         dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),

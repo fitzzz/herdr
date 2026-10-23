@@ -21,6 +21,12 @@ pub struct ServerSshAgentRegisterParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    /// Optional JSON API methods implemented by this server, not the client binary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Managed launcher start and persisted recovery are both supported.
+    #[serde(default)]
+    pub agent_launcher: bool,
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,

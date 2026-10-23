@@ -42,6 +42,9 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    snapshot
+        .validate_launcher_version()
+        .map_err(std::io::Error::other)?;
     save_json_to_path(path, snapshot)
 }
 

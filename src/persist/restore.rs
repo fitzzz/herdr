@@ -552,6 +552,7 @@ fn unavailable_restored_terminal(
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
+        terminal.agent_launcher = pane.agent_launcher.clone();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
@@ -632,6 +633,7 @@ fn restore_tab(
             terminal.restore_error = Some(placeholder.state.restore_error);
             terminal.manual_label = placeholder.state.label;
             terminal.launch_argv = saved_pane.and_then(|pane| pane.launch_argv.clone());
+            terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
             terminal.begin_handoff_observation_epoch(placeholder.observation_epoch);
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
@@ -666,7 +668,7 @@ fn restore_tab(
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
-        let startup = if preserves_identity {
+        let mut startup = if preserves_identity {
             // Continuing processes are not cold-start conversations. Do not
             // deduplicate their native sessions or plan a resume/acquisition.
             PaneRestoreStartup {
@@ -688,6 +690,9 @@ fn restore_tab(
                 &mut agent_restore,
             )
         };
+        if let Some(plan) = startup.restore_plan.as_mut() {
+            plan.launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
+        }
         let restored_agent_resume = saved_agent_resume
             .filter(|_| !startup.duplicate_agent_session)
             .map(reported_resume_from_snapshot);
@@ -744,6 +749,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -844,6 +850,7 @@ fn restore_tab(
                 #[cfg(not(unix))]
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1734,6 +1741,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            agent_launcher: None,
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1821,6 +1829,7 @@ mod tests {
                         (
                             10,
                             super::super::snapshot::PaneSnapshot {
+                                agent_launcher: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1833,6 +1842,7 @@ mod tests {
                         (
                             20,
                             super::super::snapshot::PaneSnapshot {
+                                agent_launcher: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1887,6 +1897,7 @@ mod tests {
             (
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
+                    agent_launcher: None,
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -1898,6 +1909,7 @@ mod tests {
             )
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
+            agent_launcher: None,
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -2050,6 +2062,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            agent_launcher: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2369,6 +2382,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                agent_launcher: None,
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

@@ -7,7 +7,7 @@ const MAX_SESSION_PATH_LEN: usize = 4096;
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_ARGV_BYTES: usize = 8192;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentSessionRef {
     pub kind: AgentSessionRefKind,
     pub value: String,
@@ -25,6 +25,7 @@ pub struct AgentResumePlan {
     pub agent: String,
     pub argv: Vec<String>,
     pub dedupe_key: String,
+    pub launcher: Option<crate::agent_launcher::BoundAgentLauncher>,
 }
 
 /// A resume command reported by the agent itself, run in the restored pane.
@@ -40,6 +41,7 @@ impl ReportedAgentResume {
     /// for example `agent --continue`, so the directory is part of its identity.
     pub fn plan(&self, cwd: &Path) -> AgentResumePlan {
         AgentResumePlan {
+            launcher: None,
             agent: self.agent.clone(),
             argv: self.argv.clone(),
             dedupe_key: format!(
@@ -312,6 +314,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     };
 
     Some(AgentResumePlan {
+        launcher: None,
         agent: agent.to_string(),
         argv,
         dedupe_key: dedupe_key(source, agent, session_ref),

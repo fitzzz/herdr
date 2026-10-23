@@ -146,6 +146,14 @@ impl App {
         &mut self,
         params: AgentStartParams,
     ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        self.start_agent_using_launcher(params, None)
+    }
+
+    pub(super) fn start_agent_using_launcher(
+        &mut self,
+        params: AgentStartParams,
+        launcher: Option<crate::api::schema::AgentLauncher>,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -194,10 +202,18 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-        argv.extend(params.args);
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
-            .ok_or(AgentStartError::InvalidArgument)?;
+        let (argv, command) = if let Some(launcher) = &launcher {
+            let command = launcher
+                .command(&params.args, &shell_name)
+                .map_err(AgentStartError::InvalidLauncher)?;
+            (launcher.argv(&params.args), command)
+        } else {
+            let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+            argv.extend(params.args);
+            let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+                .ok_or(AgentStartError::InvalidArgument)?;
+            (argv, command)
+        };
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
             params
@@ -219,8 +235,23 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
-        if let Some(session) = persisted_agent_session {
-            terminal.set_managed_agent_launch_session(session);
+        if let Some(launcher) = launcher {
+            let binding = crate::agent_launcher::BoundAgentLauncher {
+                observed: false,
+                argv: argv.clone(),
+                argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+                launcher,
+                agent: crate::detect::agent_label(kind).to_string(),
+                session: persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.session_ref.clone()),
+            };
+            terminal.record_agent_launcher_admission(binding, persisted_agent_session);
+        } else {
+            terminal.agent_launcher = None;
+            if let Some(session) = persisted_agent_session {
+                terminal.set_managed_agent_launch_session(session);
+            }
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
@@ -236,6 +267,10 @@ impl App {
         err: AgentStartError,
     ) -> crate::api::schema::ErrorBody {
         match err {
+            AgentStartError::InvalidLauncher(message) => crate::api::schema::ErrorBody {
+                code: "invalid_agent_launcher".into(),
+                message,
+            },
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
                 code: "invalid_agent_name".into(),
                 message: INVALID_AGENT_NAME_MESSAGE.into(),
@@ -460,6 +495,7 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 }
 
 pub(super) enum AgentStartError {
+    InvalidLauncher(String),
     InvalidName,
     UnsupportedKind(String),
     InvalidArgument,

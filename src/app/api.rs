@@ -1089,6 +1089,12 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentStartWithLauncher(params) => {
+                return self.handle_agent_start_with_launcher(request.id, params)
+            }
+            Method::AgentLauncherInfo(target) => {
+                return self.handle_agent_launcher_info(request.id, target)
+            }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,

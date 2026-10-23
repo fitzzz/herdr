@@ -181,6 +181,27 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn agent_launcher_request_requires_descriptor_and_keeps_legacy_shape() {
+    let mut request = serde_json::json!({"id":"launch", "method":"agent.start_with_launcher", "params": {
+        "name":"worker", "kind":"codex", "pane_id":"w1:p1", "args":["resume","same-uuid"],
+        "launcher":{"executable":"/fixture/authority", "prefix_args":["run","codex","--"], "env":{"REQUIRED":"1"}}
+    }});
+    let parsed: Request = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    request["params"]
+        .as_object_mut()
+        .unwrap()
+        .remove("launcher");
+    assert!(serde_json::from_value::<Request>(request.clone()).is_err());
+    request["method"] = "agent.start".into();
+    assert!(serde_json::from_value::<Request>(request).is_ok());
+    let old: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff":false})).unwrap();
+    assert!(!old.agent_launcher);
+    assert!(old.methods.is_empty());
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {
@@ -749,6 +770,8 @@ fn success_response_round_trips() {
             version: "0.1.2".into(),
             protocol: 6,
             capabilities: Some(ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(1),

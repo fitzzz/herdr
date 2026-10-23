@@ -175,6 +175,27 @@ pub struct AgentStartParams {
     pub timeout_ms: Option<u64>,
 }
 
+/// A process-scoped launcher. Native agent arguments and identity stay separate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentLauncher {
+    pub executable: String,
+    pub prefix_args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Separately advertised so older servers cannot silently ignore the launcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentStartWithLauncherParams {
+    pub name: String,
+    pub kind: String,
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    pub launcher: AgentLauncher,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentPromptParams {
     pub target: String,
