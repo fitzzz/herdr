@@ -226,8 +226,31 @@ pub fn launch_options_from_agent_args(
     };
     Some(match parsed {
         Ok(options) => AgentLaunchOptions::Known(options),
-        Err(reason) => AgentLaunchOptions::Unavailable(reason),
+        Err(rejected) => {
+            if let (LaunchOptionsUnavailable::UnsupportedOption, Some(arg)) =
+                (rejected.reason, args.get(rejected.at))
+            {
+                // The name only: an option's value may hold a secret.
+                tracing::debug!(
+                    agent = crate::detect::agent_label(agent),
+                    option = %option_name(arg),
+                    "launch options not read: unsupported option"
+                );
+            }
+            AgentLaunchOptions::Unavailable(rejected.reason)
+        }
     })
+}
+
+/// The name of the option in `arg`, without a value given in the same
+/// argument: the part of `--name=value` before `=`, or the dash and letter
+/// of a short option with a value or more options attached.
+fn option_name(arg: &str) -> &str {
+    if arg.starts_with("--") {
+        return arg.split_once('=').map_or(arg, |(name, _)| name);
+    }
+    let end = arg.char_indices().nth(2).map_or(arg.len(), |(at, _)| at);
+    &arg[..end]
 }
 
 /// The conversation id a Claude or Codex process command line resumes
@@ -726,6 +749,14 @@ fn next_launch_arg<'a>(
 /// `--add-dir a b` takes every following argument up to the next one that
 /// starts with `-`, so a prompt typed after it is one of its values to Claude
 /// too, and is kept as such.
+/// Why the parser stopped reading a command line, and the argument it
+/// stopped at.
+#[derive(Debug)]
+struct ArgsRejected {
+    reason: LaunchOptionsUnavailable,
+    at: usize,
+}
+
 #[derive(Debug, Default)]
 struct ClaudeLaunch {
     options: Vec<String>,
@@ -735,12 +766,15 @@ struct ClaudeLaunch {
     fork: bool,
 }
 
-fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, LaunchOptionsUnavailable> {
+fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, ArgsRejected> {
     let mut launch = ClaudeLaunch::default();
     let mut operands = 0;
     let mut index = 0;
+    let rejected = |reason, at| ArgsRejected { reason, at };
     while index < args.len() {
-        match next_launch_arg(CLAUDE_OPTIONS, ParserStyle::Commander, &args[index..])? {
+        match next_launch_arg(CLAUDE_OPTIONS, ParserStyle::Commander, &args[index..])
+            .map_err(|reason| rejected(reason, index))?
+        {
             LaunchArg::Option { spec, len, value } => {
                 if spec.keep {
                     launch.options.extend_from_slice(&args[index..index + len]);
@@ -754,7 +788,10 @@ fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, LaunchOptionsUnava
             }
             LaunchArg::Operand => {
                 if operands == 0 && CLAUDE_SUBCOMMANDS.contains(&args[index].as_str()) {
-                    return Err(LaunchOptionsUnavailable::UnrecognizedCommand);
+                    return Err(rejected(
+                        LaunchOptionsUnavailable::UnrecognizedCommand,
+                        index,
+                    ));
                 }
                 operands += 1;
                 index += 1;
@@ -776,22 +813,24 @@ struct CodexLaunch {
 
 /// The parts of a Codex command line: top-level options, then either a
 /// one-time prompt or `resume [SESSION_ID] [PROMPT]` with its options.
-fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, LaunchOptionsUnavailable> {
+fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, ArgsRejected> {
     use LaunchOptionsUnavailable::{UnrecognizedCommand, UnsupportedOption};
     let mut launch = CodexLaunch::default();
     let mut operands = 0;
     let mut options_ended = false;
     let mut index = 0;
+    let rejected = |reason, at| ArgsRejected { reason, at };
     while index < args.len() {
         let arg = if options_ended {
             LaunchArg::Operand
         } else {
-            next_launch_arg(CODEX_OPTIONS, ParserStyle::Clap, &args[index..])?
+            next_launch_arg(CODEX_OPTIONS, ParserStyle::Clap, &args[index..])
+                .map_err(|reason| rejected(reason, index))?
         };
         match arg {
             LaunchArg::Option { spec, len, .. } => {
                 if !launch.resume && !spec.top_level {
-                    return Err(UnsupportedOption);
+                    return Err(rejected(UnsupportedOption, index));
                 }
                 match spec.names[0] {
                     "--last" => launch.last = true,
@@ -816,7 +855,7 @@ fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, LaunchOptionsUnavail
                     && !options_ended
                     && CODEX_SUBCOMMANDS.contains(&operand.as_str())
                 {
-                    return Err(UnrecognizedCommand);
+                    return Err(rejected(UnrecognizedCommand, index));
                 } else {
                     operands += 1;
                 }
@@ -2283,6 +2322,67 @@ mod tests {
             ),
             Some(known(&["--append-system-prompt", ""]))
         );
+    }
+
+    /// The debug lines logged while `run` runs.
+    fn debug_log(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("log buffer poisoned"))?
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_rejected_option_is_logged_by_name_without_its_value() {
+        for (agent, args, name) in [
+            (
+                Agent::Claude,
+                &["--placeholder-unknown=placeholder-value"][..],
+                "--placeholder-unknown",
+            ),
+            (
+                Agent::Claude,
+                &["--placeholder-unknown", "placeholder-value"][..],
+                "--placeholder-unknown",
+            ),
+            (Agent::Claude, &["-Zplaceholder-value"][..], "-Z"),
+            (
+                Agent::Codex,
+                &["--placeholder-unknown=placeholder-value"][..],
+                "--placeholder-unknown",
+            ),
+            (Agent::Codex, &["-Zplaceholder-value"][..], "-Z"),
+        ] {
+            let log = debug_log(|| {
+                assert_eq!(
+                    launch_options_from_agent_args(agent, &argv(args)),
+                    Some(unavailable(LaunchOptionsUnavailable::UnsupportedOption))
+                );
+            });
+            assert!(log.contains(&format!("option={name}")), "{args:?}: {log}");
+            assert!(log.contains(crate::detect::agent_label(agent)), "{log}");
+            assert!(!log.contains("placeholder-value"), "{args:?}: {log}");
+        }
     }
 
     #[test]
