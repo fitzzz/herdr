@@ -29,6 +29,10 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// Absent from runtimes written before this field existed, and when the
+    /// pairing was assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_launch: Option<crate::terminal::state::HandoffAgentLaunch>,
 }
 
 #[cfg(unix)]
@@ -45,4 +49,34 @@ pub(crate) struct ImportedHandoffRuntime {
     pub master_fd: std::os::fd::RawFd,
     #[cfg(unix)]
     pub state: HandoffRuntimeState,
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::HandoffRuntimeState;
+    use crate::terminal::state::HandoffAgentLaunch;
+
+    #[test]
+    fn a_runtime_state_written_before_the_agent_launch_field_still_loads() {
+        let older = serde_json::json!({
+            "pane_id": 1,
+            "child_pid": 2,
+            "rows": 24,
+            "cols": 80,
+            "cell_width_px": 0,
+            "cell_height_px": 0,
+        });
+        let state: HandoffRuntimeState =
+            serde_json::from_value(older).expect("an older runtime state should still load");
+        assert_eq!(state.agent_launch, None);
+
+        let confirmed = Some(HandoffAgentLaunch::Confirmed { process_id: 4242 });
+        let state = HandoffRuntimeState {
+            agent_launch: confirmed,
+            ..state
+        };
+        let loaded: HandoffRuntimeState =
+            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        assert_eq!(loaded.agent_launch, confirmed);
+    }
 }

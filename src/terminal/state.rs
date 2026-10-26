@@ -25,6 +25,19 @@ pub struct HookAuthority {
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// How the launch record of a pane paired its saved conversation, carried by a
+/// live handoff so the next server seeds that launch the same way. Without it
+/// the pairing was assumed.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffAgentLaunch {
+    /// Confirmed for this process.
+    Confirmed { process_id: u32 },
+    /// A saved launch that nothing runs.
+    Saved,
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandoffAgentState {
@@ -328,11 +341,12 @@ pub enum SeededLaunch {
     /// Herdr typed it: a restore's resume command or `herdr agent start`. The
     /// process it binds to is paired with the conversation on evidence only.
     Started,
-    /// It is still running and an earlier server already paired the
-    /// conversation with it (a live handoff, or a pane whose directory is
-    /// missing), so the process it binds to keeps that pairing whatever its
-    /// command line says.
-    Paired,
+    /// An earlier server confirmed the conversation for this launch: for
+    /// `process_id` on a live handoff, which the seed is bound to, so that
+    /// process keeps the pairing whatever its command line says; or for a pane
+    /// whose directory is missing, which runs nothing and saves the launch
+    /// unchanged.
+    Paired { process_id: Option<u32> },
     /// Nothing runs it: a pane restored without resuming its agent keeps the
     /// saved launch for its next save. No process keeps its options or its
     /// mark, and a conversation reported meanwhile belongs to another launch.
@@ -522,11 +536,14 @@ impl TerminalState {
         let seen_session = self.current_session_ref().cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent: seed.agent,
-            process_id: None,
+            process_id: match seed.launch {
+                SeededLaunch::Paired { process_id } => process_id,
+                SeededLaunch::Started | SeededLaunch::Saved => None,
+            },
             options: seed.options,
             resumed_without_options: seed.resumed_without_options,
             session: seed.session,
-            session_confirmed: seed.launch == SeededLaunch::Paired,
+            session_confirmed: matches!(seed.launch, SeededLaunch::Paired { .. }),
             launched: seed.launch != SeededLaunch::Saved,
             seen_session,
             earlier_session: None,
@@ -709,6 +726,21 @@ impl TerminalState {
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
             acquisition_pending: self.agent_process_acquisition_pending,
         })
+    }
+
+    /// How the launch record paired the conversation a session save records,
+    /// for a live handoff.
+    #[cfg(unix)]
+    pub(crate) fn handoff_agent_launch(&self) -> Option<HandoffAgentLaunch> {
+        let launch = self.launch_for_current_session()?;
+        if !launch.launched {
+            return Some(HandoffAgentLaunch::Saved);
+        }
+        launch
+            .session_confirmed
+            .then_some(launch.process_id)
+            .flatten()
+            .map(|process_id| HandoffAgentLaunch::Confirmed { process_id })
     }
 
     #[cfg(unix)]
