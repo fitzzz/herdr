@@ -203,7 +203,7 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
 }
 
 pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>> {
-    let quoted_path = shell_quote(&path.display().to_string());
+    let quoted_path = super::quote_posix_arg(&path.display().to_string());
     let command = format!(
         r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
     );
@@ -211,15 +211,7 @@ pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>
 }
 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
-    super::interactive_unix_shell_command(argv, shell_name, shell_quote)
-}
-
-fn shell_quote(value: &str) -> String {
-    if super::is_plain_unix_word(value) {
-        return value.to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
+    super::interactive_unix_shell_command(argv, shell_name)
 }
 
 #[repr(C)]

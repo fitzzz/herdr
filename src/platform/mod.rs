@@ -390,11 +390,7 @@ fn normalized_process_name(name: &str) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn interactive_unix_shell_command(
-    argv: &[String],
-    shell_name: &str,
-    quote_posix_arg: fn(&str) -> String,
-) -> Option<String> {
+pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
         "pwsh" | "powershell" => quote_powershell_arg,
         "fish" => quote_fish_arg,
@@ -429,6 +425,15 @@ fn quote_csh_arg(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''").replace('!', "'\\!'"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn quote_posix_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
