@@ -35,6 +35,10 @@ pub(crate) use shutdown::monitor_host_shutdown;
 /// is kept for the newline. A pty probe on Linux 7.2 confirmed it: 4095 bytes
 /// arrive whole, and a longer line is cut to its first 4095.
 pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 4095;
+/// Shells that edit their own line and so take a typed line of any length:
+/// the line waits in the n_tty buffer until the shell reads it in raw mode
+/// (bash took a 9,000-character line in the pty probe).
+pub(crate) const LINE_EDITING_SHELLS: &[&str] = &["bash", "zsh", "fish"];
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;

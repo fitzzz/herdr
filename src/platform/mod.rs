@@ -448,16 +448,20 @@ pub(crate) fn is_plain_unix_word(value: &str) -> bool {
         })
 }
 
-/// Whether the pane's shell can take `command` as one typed line. bash, zsh
-/// and fish edit their own line and take any length; any other shell, a
-/// wrapper script included, reads the line in the terminal's canonical mode,
-/// which keeps only `CANONICAL_LINE_MAX_BYTES` of it. `shell` is the pane's
-/// shell program, a path or a name looked up on `PATH`, resolved through
-/// symlinks only when the line is too long for canonical mode.
+/// Whether the pane's shell can take `command` as one typed line. A shell in
+/// this platform's `LINE_EDITING_SHELLS` edits its own line and takes any
+/// length; any other shell, a wrapper script included, reads the line in the
+/// terminal's canonical mode, which keeps only `CANONICAL_LINE_MAX_BYTES` of
+/// it. `shell` is the pane's shell program, a path or a name looked up on
+/// `PATH`, resolved through symlinks only when the line is too long for
+/// canonical mode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_shell_accepts_line(command: &str, shell: &str) -> bool {
     if command.len() <= CANONICAL_LINE_MAX_BYTES {
         return true;
+    }
+    if LINE_EDITING_SHELLS.is_empty() {
+        return false;
     }
     let program = if shell.contains('/') {
         Some(std::path::PathBuf::from(shell))
@@ -476,10 +480,7 @@ pub(crate) fn interactive_shell_accepts_line(command: &str, shell: &str) -> bool
             std::borrow::Cow::Borrowed(shell),
             std::ffi::OsStr::to_string_lossy,
         );
-    matches!(
-        normalized_process_name(&name).as_str(),
-        "bash" | "zsh" | "fish"
-    )
+    LINE_EDITING_SHELLS.contains(&normalized_process_name(&name).as_str())
 }
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
@@ -674,15 +675,19 @@ mod tests {
                 "{shell}"
             );
         }
-        for shell in [
-            "bash",
-            "zsh",
-            "fish",
-            to_text(&bash).as_str(),
-            to_text(&sh).as_str(),
+        // Only shells this platform knows to edit their own line take more:
+        // bash, zsh and fish on Linux, none on macOS.
+        for (shell, name) in [
+            ("bash", "bash"),
+            ("zsh", "zsh"),
+            ("fish", "fish"),
+            (to_text(&bash).as_str(), "bash"),
+            (to_text(&sh).as_str(), "bash"),
         ] {
-            assert!(
+            assert!(interactive_shell_accepts_line(&at_limit, shell), "{shell}");
+            assert_eq!(
                 interactive_shell_accepts_line(&over_limit, shell),
+                LINE_EDITING_SHELLS.contains(&name),
                 "{shell}"
             );
         }

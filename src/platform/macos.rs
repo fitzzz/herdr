@@ -33,6 +33,12 @@ mod config_file_tests;
 /// this many bytes of a typed line: `sys/syslimits.h` defines `MAX_CANON` as
 /// 1024 bytes per canonical input line, and one of them is the newline.
 pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 1023;
+/// Shells that take a typed line longer than `CANONICAL_LINE_MAX_BYTES`. Herdr
+/// types the line right after the shell starts, before it enters raw mode,
+/// and whether the BSD line discipline holds the excess until then is not
+/// tested on a Mac, so every shell, bash, zsh and fish included, takes the
+/// canonical limit.
+pub(crate) const LINE_EDITING_SHELLS: &[&str] = &[];
 
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
