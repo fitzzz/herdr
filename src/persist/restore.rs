@@ -931,7 +931,7 @@ fn restore_plan_for_snapshot(
     )?;
     // The pane's shell must take the typed command in one line; otherwise the
     // options cannot be repeated and restore falls back to the bare command.
-    let fits = crate::platform::interactive_shell_command(&planned.0.argv, shell)
+    let fits = crate::platform::interactive_shell_restore_command(&planned.0.argv, shell)
         .is_some_and(|command| crate::platform::interactive_shell_accepts_line(&command, shell));
     if planned.1 != Some(crate::agent_resume::LaunchOptionsRestore::Kept) || fits {
         return Some(planned);
@@ -1646,6 +1646,34 @@ mod tests {
             .expect("restore should plan the command with its options");
         assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
         assert!(plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_line_counts_its_leading_space_toward_the_canonical_limit() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        // `claude --append-system-prompt <value> --resume claude-session`
+        // without the leading space is exactly as long as `value` allows.
+        let overhead = "claude --append-system-prompt  --resume claude-session".len();
+        let session = |value_len: usize| {
+            launch_options_session(
+                "claude",
+                Some(vec!["--append-system-prompt".into(), "a".repeat(value_len)]),
+            )
+        };
+        let at_limit = crate::platform::CANONICAL_LINE_MAX_BYTES - overhead;
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session(at_limit - 1), true, "placeholder-shell").unwrap();
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session(at_limit), true, "placeholder-shell").unwrap();
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
     }
 
     #[test]

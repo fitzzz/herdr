@@ -389,6 +389,18 @@ fn normalized_process_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The line a restore types into a pane's shell to resume an agent. On Unix it
+/// starts with one space, so bash (`HISTCONTROL=ignorespace`), zsh
+/// (`HIST_IGNORE_SPACE`) and fish keep the saved options out of the shell's
+/// history; the space counts toward the line the shell must take.
+pub(crate) fn interactive_shell_restore_command(
+    argv: &[String],
+    shell_name: &str,
+) -> Option<String> {
+    let prefix = if cfg!(windows) { "" } else { " " };
+    interactive_shell_command(argv, shell_name).map(|command| format!("{prefix}{command}"))
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
@@ -745,6 +757,25 @@ mod tests {
     fn parse_agent_env_hint_ignores_missing_or_unknown_agents() {
         assert_eq!(parse_agent_env_hint(b"PATH=/bin\0TERM=xterm\0"), None);
         assert_eq!(parse_agent_env_hint(b"HERDR_AGENT=not-an-agent\0"), None);
+    }
+
+    #[test]
+    fn restore_command_starts_with_a_space_that_keeps_it_out_of_shell_history() {
+        let argv = [
+            "claude",
+            "--model",
+            "placeholder",
+            "--resume",
+            "placeholder-id",
+        ]
+        .map(String::from);
+        for shell in ["bash", "zsh", "fish", "sh"] {
+            assert_eq!(
+                interactive_shell_restore_command(&argv, shell),
+                interactive_shell_command(&argv, shell).map(|command| format!(" {command}")),
+                "{shell}"
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

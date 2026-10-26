@@ -235,7 +235,8 @@ impl App {
 
         // The pane runs the configured shell, so the command is quoted for it.
         let shell = crate::pane::pane_shell(&self.state.default_shell);
-        let Some(resume_command) = crate::platform::interactive_shell_command(&plan.argv, &shell)
+        let Some(resume_command) =
+            crate::platform::interactive_shell_restore_command(&plan.argv, &shell)
         else {
             tracing::warn!(
                 pane = pane_id.raw(),
@@ -1066,8 +1067,10 @@ mod tests {
             Some(crate::agent_resume::LaunchOptionsRestore::Kept)
         );
         assert_eq!(
-            crate::platform::interactive_shell_command(&plan.argv, "bash").as_deref(),
-            Some("claude --append-system-prompt '' --permission-mode plan --resume claude-session")
+            crate::platform::interactive_shell_restore_command(&plan.argv, "bash").as_deref(),
+            Some(
+                " claude --append-system-prompt '' --permission-mode plan --resume claude-session"
+            )
         );
     }
 }
