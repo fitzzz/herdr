@@ -195,7 +195,11 @@ pub fn launch_options_from_process_argv(
     if !carries_launch_options(agent) {
         return None;
     }
-    let Some(argv) = argv else {
+    // A process that rewrote its title can leave its program name followed by
+    // empty arguments where its command line was.
+    let Some(argv) =
+        argv.filter(|argv| argv.len() < 2 || argv[1..].iter().any(|arg| !arg.is_empty()))
+    else {
         return Some(AgentLaunchOptions::Unavailable(
             LaunchOptionsUnavailable::CommandLineUnreadable,
         ));
@@ -2251,6 +2255,34 @@ mod tests {
                 "{shape:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_program_name_followed_only_by_empty_arguments_is_unreadable() {
+        // A process that rewrites its title can leave its program name
+        // followed by empty arguments where its command line was.
+        for agent in [Agent::Claude, Agent::Codex] {
+            for shape in [&["claude", ""][..], &["claude", "", "", ""][..]] {
+                assert_eq!(
+                    launch_options_from_process_argv(agent, Some(&argv(shape))),
+                    Some(unavailable(LaunchOptionsUnavailable::CommandLineUnreadable)),
+                    "{agent:?} {shape:?}"
+                );
+            }
+        }
+        // The program name alone is an agent launched without options, and an
+        // empty value of an option stays a value.
+        assert_eq!(
+            launch_options_from_process_argv(Agent::Claude, Some(&argv(&["claude"]))),
+            Some(known(&[]))
+        );
+        assert_eq!(
+            launch_options_from_process_argv(
+                Agent::Claude,
+                Some(&argv(&["claude", "--append-system-prompt", ""]))
+            ),
+            Some(known(&["--append-system-prompt", ""]))
+        );
     }
 
     #[test]
