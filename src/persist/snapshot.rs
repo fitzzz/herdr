@@ -1529,6 +1529,7 @@ mod tests {
                     ),
                     resumed_without_options: flagged,
                     session: crate::agent_resume::AgentSessionRef::id("session-1"),
+                    session_confirmed: false,
                 });
             capture_from_state(&state).workspaces[0].tabs[0].panes[&root.raw()]
                 .agent_session

@@ -316,6 +316,11 @@ pub struct AgentLaunchSeed {
     /// The conversation this launch runs: the one a restore resumes or hands
     /// off, or the one `herdr agent start` arguments name.
     pub session: Option<crate::agent_resume::AgentSessionRef>,
+    /// The launch is still running and an earlier server already paired
+    /// `session` with it (a live handoff, or a pane whose directory is
+    /// missing), so the process it binds to keeps that pairing whatever its
+    /// command line says.
+    pub session_confirmed: bool,
 }
 
 /// The launch options of the Claude or Codex process running in a pane, kept
@@ -503,7 +508,7 @@ impl TerminalState {
             options: seed.options,
             resumed_without_options: seed.resumed_without_options,
             session: seed.session,
-            session_confirmed: false,
+            session_confirmed: seed.session_confirmed,
             seen_session,
             earlier_session: None,
             seed_reading: None,
@@ -3020,6 +3025,7 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
@@ -3048,6 +3054,7 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(
             Agent::Claude,
@@ -3081,6 +3088,7 @@ mod tests {
                 options: not_recorded.clone(),
                 resumed_without_options: true,
                 session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+                session_confirmed: false,
             });
             terminal
         };
@@ -3677,6 +3685,7 @@ mod tests {
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
             session: None,
+            session_confirmed: false,
         });
         observe_launcher_then_agent(&mut terminal, None);
         assert_eq!(
@@ -3696,6 +3705,7 @@ mod tests {
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
             session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+            session_confirmed: false,
         });
         observe_launcher_then_agent(&mut terminal, Some("placeholder-session"));
         assert_eq!(
@@ -3718,6 +3728,7 @@ mod tests {
             options: known_options(&["--placeholder-seeded"]),
             resumed_without_options: false,
             session: crate::agent_resume::AgentSessionRef::id("placeholder-a"),
+            session_confirmed: false,
         });
         // The launcher is paired with A by assumption; the agent it execs
         // resumes B, so its options wait for B.
@@ -3801,6 +3812,7 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         for _ in 0..2 {
             terminal.observe_agent_launch(
@@ -3833,6 +3845,7 @@ mod tests {
             ),
             resumed_without_options: true,
             session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+            session_confirmed: false,
         });
         let argv = [
             "claude",
@@ -3868,6 +3881,7 @@ mod tests {
                 options: not_recorded.clone(),
                 resumed_without_options: true,
                 session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+                session_confirmed: false,
             });
         };
 
@@ -3931,6 +3945,7 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Claude, 40, unreadable(), None);
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
@@ -3946,6 +3961,7 @@ mod tests {
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
             session: None,
+            session_confirmed: false,
         });
         let seeded_revision = terminal.agent_launch_revision();
 
@@ -3981,6 +3997,7 @@ mod tests {
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]), None);
         assert_eq!(
@@ -4002,6 +4019,7 @@ mod tests {
             options: not_recorded.clone(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         let launch = terminal.agent_launch().unwrap();
@@ -4016,6 +4034,7 @@ mod tests {
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]), None);
         assert_eq!(
@@ -4033,6 +4052,7 @@ mod tests {
             options: not_recorded,
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]), None);
         assert_eq!(
@@ -4052,6 +4072,7 @@ mod tests {
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: false,
             session: None,
+            session_confirmed: false,
         });
         terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]), None);
         assert_eq!(
@@ -4075,6 +4096,7 @@ mod tests {
                 options: not_recorded(),
                 resumed_without_options: true,
                 session: None,
+                session_confirmed: false,
             });
             terminal
         };
@@ -4088,6 +4110,7 @@ mod tests {
             options: not_recorded(),
             resumed_without_options: true,
             session: None,
+            session_confirmed: false,
         });
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
@@ -4129,6 +4152,7 @@ mod tests {
             options: known_options(&["--placeholder"]),
             resumed_without_options: false,
             session: None,
+            session_confirmed: false,
         });
         assert!(!terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);

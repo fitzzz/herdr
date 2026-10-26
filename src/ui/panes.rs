@@ -1049,6 +1049,7 @@ mod tests {
                 ),
                 resumed_without_options,
                 session: None,
+                session_confirmed: false,
             });
             app.terminals.insert(terminal_id, terminal_state);
             let mut terminal =
@@ -1360,6 +1361,7 @@ mod tests {
                 ),
                 resumed_without_options: true,
                 session: None,
+                session_confirmed: false,
             });
             let area = Rect::new(0, 0, 40, 8);
             let render = |app: &mut AppState| {
@@ -1424,6 +1426,7 @@ mod tests {
                 ),
                 resumed_without_options: true,
                 session: None,
+                session_confirmed: false,
             });
         let area = Rect::new(0, 0, 40, 8);
         app.view.pane_infos = compute_pane_infos(
