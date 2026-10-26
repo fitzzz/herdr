@@ -1018,3 +1018,39 @@ The numbered binary protocol remains for same-install and internal operations,
 including direct terminal attach and live handoff. Check `ping` or `herdr status`
 before using those operations across different builds. JSON API clients should
 ignore unknown fields and handle unsupported methods as normal errors.
+
+### External agent launchers
+
+Discover launcher support from the target server's `ping` response:
+`result.capabilities.agent_launcher` must be `true` and
+`result.capabilities.methods` must contain `agent.start_with_launcher`.
+The local CLI schema alone does not prove server support. An absent capability
+disables this action without disconnecting the server or trying a native launch.
+
+`agent.start_with_launcher` accepts `name`, native `kind`, `pane_id`, native
+`args`, optional `timeout_ms`, and required
+`launcher: {executable, prefix_args, env}`. The executable must be an absolute
+executable file. Herdr runs `executable + prefix_args + args` with a process-only
+environment overlay. The native provider and session identity stay separate;
+Herdr does not choose accounts or interpret provider authentication.
+
+The new `agent_started_with_launcher` result contains `agent`, the applied
+`launcher`, and actual `argv`. It acknowledges submission, not verified native
+authentication. Existing `agent.start` and `agent_started` remain unchanged.
+
+For an uncertain response, discover and call `agent.launcher_info` with
+`{target}`. Its `agent_launcher_info` result contains `agent`, nullable `binding`,
+and `confirmed`. A binding contains native `kind`, nullable `session`
+(`{kind, value}`), `launcher`, `argv`, and `argv_origin` (`admission` or
+`canonical_resume`). Confirmation requires a current matching native report and
+provider process; restored metadata alone never confirms it. Compare pane,
+terminal, provider, native identity and the entire launcher before continuing.
+An unknown or mismatched result is not permission to retry or create a replacement.
+
+Same-identity recovery reapplies the launcher to Herdr's existing canonical
+native resume arguments. A confirmed replacement clears the binding; temporary
+missing observations retain it. Missing or invalid launchers refuse recovery.
+Launcher-bearing disk snapshots use JSON version 4 and handoff manifests use
+version 2; ordinary snapshots/manifests remain 3/1. Older binaries reject these
+new versions. Preserve the original state backups before any downgrade; do not
+remove launcher metadata or lower version numbers to force an old binary to load it.

@@ -1228,6 +1228,32 @@
     },
     "request": {
       "$defs": {
+        "AgentLauncher": {
+          "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
+          "properties": {
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "executable": {
+              "type": "string"
+            },
+            "prefix_args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "executable",
+            "prefix_args",
+            "env"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1369,6 +1395,44 @@
             "name",
             "kind",
             "pane_id"
+          ],
+          "type": "object"
+        },
+        "AgentStartWithLauncherParams": {
+          "description": "Separately advertised so older servers cannot silently ignore the launcher.",
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "launcher": {
+              "$ref": "#/schemas/request/$defs/AgentLauncher"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "pane_id",
+            "launcher"
           ],
           "type": "object"
         },
@@ -5507,6 +5571,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.start_with_launcher",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartWithLauncherParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.launcher_info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.prompt",
               "type": "string"
             },
@@ -6849,6 +6945,32 @@
           ],
           "type": "object"
         },
+        "AgentLauncher": {
+          "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
+          "properties": {
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "executable": {
+              "type": "string"
+            },
+            "prefix_args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "executable",
+            "prefix_args",
+            "env"
+          ],
+          "type": "object"
+        },
         "AgentManifestInfo": {
           "properties": {
             "active_version": {
@@ -6933,6 +7055,21 @@
           ],
           "type": "object"
         },
+        "AgentSessionRef": {
+          "properties": {
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
         "AgentSessionRefKind": {
           "enum": [
             "id",
@@ -6949,6 +7086,42 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "BoundAgentLauncher": {
+          "properties": {
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "argv_origin": {
+              "$ref": "#/schemas/success_response/$defs/LauncherArgvOrigin"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "launcher": {
+              "$ref": "#/schemas/success_response/$defs/AgentLauncher"
+            },
+            "session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "launcher",
+            "kind",
+            "argv",
+            "argv_origin"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -7842,6 +8015,13 @@
             "messages"
           ],
           "type": "object"
+        },
+        "LauncherArgvOrigin": {
+          "enum": [
+            "admission",
+            "canonical_resume"
+          ],
+          "type": "string"
         },
         "LayoutDescription": {
           "properties": {
@@ -9655,6 +9835,63 @@
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
+                "argv": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "launcher": {
+                  "$ref": "#/schemas/success_response/$defs/AgentLauncher"
+                },
+                "type": {
+                  "const": "agent_started_with_launcher",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "argv",
+                "launcher"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "binding": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/BoundAgentLauncher"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "confirmed": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "agent_launcher_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "confirmed"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -10626,6 +10863,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_launcher": {
+              "default": false,
+              "description": "Managed launcher start and persisted recovery are both supported.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
@@ -10646,6 +10888,13 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "methods": {
+              "description": "Optional JSON API methods implemented by this server, not the client binary.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "ssh_agent_registration": {
               "default": false,

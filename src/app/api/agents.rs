@@ -52,6 +52,53 @@ impl App {
         encode_success(id, ResponseResult::AgentInfo { agent })
     }
 
+    pub(super) fn handle_agent_launcher_info(&self, id: String, target: AgentTarget) -> String {
+        let agent = match self.agent_info_for_target(&target.target) {
+            Ok(agent) => agent,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let binding = self
+            .state
+            .terminals
+            .get(agent.terminal_id.as_str())
+            .and_then(|terminal| terminal.agent_launcher.clone());
+        let confirmed = binding.as_ref().is_some_and(|binding| {
+            binding.observed
+                && !binding.argv.is_empty()
+                && agent.agent.as_deref() == Some(binding.agent.as_str())
+                && binding
+                    .session
+                    .as_ref()
+                    .zip(agent.agent_session.as_ref())
+                    .is_some_and(|(bound, current)| {
+                        current.agent == binding.agent
+                            && current.kind == bound.kind
+                            && current.value == bound.value
+                            && crate::agent_resume::is_official_agent_source(
+                                &current.source,
+                                &current.agent,
+                            )
+                    })
+                && crate::detect::parse_agent_label(&binding.agent).is_some_and(|kind| {
+                    self.state
+                        .terminals
+                        .get_key_value(agent.terminal_id.as_str())
+                        .and_then(|(id, _)| self.terminal_runtimes.get(id))
+                        .is_some_and(|runtime| {
+                            crate::app::agents::runtime_hosts_agent(runtime, kind)
+                        })
+                })
+        });
+        encode_success(
+            id,
+            ResponseResult::AgentLauncherInfo {
+                agent,
+                binding,
+                confirmed,
+            },
+        )
+    }
+
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
@@ -77,6 +124,32 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    pub(super) fn handle_agent_start_with_launcher(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentStartWithLauncherParams,
+    ) -> String {
+        let launcher = params.launcher;
+        let native = AgentStartParams {
+            name: params.name,
+            kind: params.kind,
+            pane_id: params.pane_id,
+            args: params.args,
+            timeout_ms: params.timeout_ms,
+        };
+        match self.start_agent_using_launcher(native, Some(launcher.clone())) {
+            Ok((agent, argv)) => encode_success(
+                id,
+                ResponseResult::AgentStartedWithLauncher {
+                    agent,
+                    argv,
+                    launcher,
+                },
+            ),
+            Err(err) => encode_error_body(id, self.agent_start_error_body(err)),
+        }
     }
 
     pub(crate) fn handle_deferred_agent_api_request(

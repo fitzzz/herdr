@@ -70,6 +70,11 @@ pub(crate) fn start_server_with_stop_control(
 
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
+        methods: vec![
+            "agent.start_with_launcher".into(),
+            "agent.launcher_info".into(),
+        ],
+        agent_launcher: true,
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
@@ -613,6 +618,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentStartWithLauncher(_) => "agent.start_with_launcher",
+        Method::AgentLauncherInfo(_) => "agent.launcher_info",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
@@ -1485,6 +1492,8 @@ mod tests {
             },
             &tx,
             Some(ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(
@@ -1538,6 +1547,27 @@ mod tests {
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn agent_launcher_live_ping_advertises_both_methods() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "launcher-capabilities".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["capabilities"]["agent_launcher"], true);
+        assert_eq!(
+            response["result"]["capabilities"]["methods"],
+            serde_json::json!(["agent.start_with_launcher", "agent.launcher_info"])
+        );
     }
 
     #[test]

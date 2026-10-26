@@ -984,6 +984,24 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
     ))
 }
 
+pub(crate) fn agent_launcher_command(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    _shell: &str,
+) -> Option<String> {
+    // A child PowerShell owns the overlay, so a reused parent shell is never changed.
+    let mut script = String::new();
+    for (key, value) in env {
+        script.push_str(&format!(
+            "[Environment]::SetEnvironmentVariable({}, {}, 'Process');",
+            super::quote_powershell_arg(key),
+            super::quote_powershell_arg(value)
+        ));
+    }
+    script.push_str(&powershell_agent_script(argv)?);
+    Some(cmd_encoded_powershell_command(&script))
+}
+
 fn cmd_encoded_powershell_command(script: &str) -> String {
     use base64::Engine as _;
 

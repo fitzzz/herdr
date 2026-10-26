@@ -101,6 +101,16 @@ pub enum ResponseResult {
         agent: AgentInfo,
         argv: Vec<String>,
     },
+    AgentStartedWithLauncher {
+        agent: AgentInfo,
+        argv: Vec<String>,
+        launcher: super::agents::AgentLauncher,
+    },
+    AgentLauncherInfo {
+        agent: AgentInfo,
+        binding: Option<crate::agent_launcher::BoundAgentLauncher>,
+        confirmed: bool,
+    },
     AgentPrompted {
         agent: AgentInfo,
     },
