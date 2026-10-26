@@ -163,6 +163,40 @@ fn resumes(
     })
 }
 
+/// How much a reading of a command line tells: a later reading of the same
+/// process replaces one that told less.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReadingRank {
+    Unreadable,
+    Unrecognized,
+    UnsupportedOption,
+    Parsed,
+}
+
+impl ReadingRank {
+    fn of(options: &crate::agent_resume::AgentLaunchOptions) -> Self {
+        use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
+        match options {
+            AgentLaunchOptions::Known(_) => Self::Parsed,
+            AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::CommandLineUnreadable) => {
+                Self::Unreadable
+            }
+            AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::UnrecognizedCommand) => {
+                Self::Unrecognized
+            }
+            AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::UnsupportedOption) => {
+                Self::UnsupportedOption
+            }
+            // Only a seed holds these, and a seed bound to its process records
+            // the rank of the reading it was kept through.
+            AgentLaunchOptions::Unavailable(
+                LaunchOptionsUnavailable::NotRecorded
+                | LaunchOptionsUnavailable::ExceedsResumeLimits,
+            ) => Self::Parsed,
+        }
+    }
+}
+
 /// The conversation the launch record of `process_id` owns, given the record
 /// it replaces and the pane's current conversation, and the last conversation
 /// an earlier process owned, carried while the new record is unpaired.
@@ -250,7 +284,7 @@ pub struct ObservedAgentLaunch {
     /// While the record still holds a seed's options for its process, the
     /// rank of the reading they were kept through, so a better reading of
     /// that process decides again.
-    seed_reading: Option<u8>,
+    seed_reading: Option<ReadingRank>,
 }
 
 impl ObservedAgentLaunch {
@@ -417,19 +451,7 @@ impl TerminalState {
         options: crate::agent_resume::AgentLaunchOptions,
         resumed_session: Option<&str>,
     ) {
-        // How much a reading of a command line tells: a later reading of the
-        // same process replaces one that told less.
-        fn reading_rank(options: &crate::agent_resume::AgentLaunchOptions) -> u8 {
-            use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
-            match options {
-                AgentLaunchOptions::Unavailable(
-                    LaunchOptionsUnavailable::CommandLineUnreadable,
-                ) => 0,
-                AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::UnrecognizedCommand) => 1,
-                _ => 2,
-            }
-        }
-        let rank = reading_rank(&options);
+        let rank = ReadingRank::of(&options);
         let current = self
             .agent_launch
             .as_ref()
@@ -442,7 +464,7 @@ impl TerminalState {
                 && rank
                     <= current
                         .seed_reading
-                        .unwrap_or_else(|| reading_rank(&current.options))
+                        .unwrap_or_else(|| ReadingRank::of(&current.options))
         }) {
             return;
         }
@@ -3046,7 +3068,7 @@ mod tests {
         let fallback = launch_record(Agent::Claude, None, true, Some("seeded"), None);
         let bound = launch_record(Agent::Claude, Some(10), true, Some("seeded"), None);
         let kept_through_launcher = ObservedAgentLaunch {
-            seed_reading: Some(1),
+            seed_reading: Some(ReadingRank::Unrecognized),
             ..bound.clone()
         };
         for (case, seed, observed, resumed, keeps) in [
@@ -3374,6 +3396,26 @@ mod tests {
             Some(options())
         );
         assert!(!terminal.resumed_without_launch_options());
+    }
+
+    #[test]
+    fn an_unsupported_option_reading_takes_a_later_parsed_reading_of_the_same_process() {
+        let unsupported = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::UnsupportedOption,
+        );
+        let mut terminal = test_terminal();
+        terminal.observe_agent_launch(Agent::Claude, 100, unsupported.clone(), None);
+        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&["--placeholder"]), None);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder".to_string()])
+        );
+        // A later unsupported reading tells less and changes nothing.
+        terminal.observe_agent_launch(Agent::Claude, 100, unsupported, None);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder".to_string()])
+        );
     }
 
     #[test]
