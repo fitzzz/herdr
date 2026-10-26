@@ -229,7 +229,7 @@ impl App {
                 session: persisted_agent_session
                     .as_ref()
                     .map(|session| session.session_ref.clone()),
-                session_confirmed: false,
+                launch: crate::terminal::SeededLaunch::Started,
             });
         }
         if let Some(session) = persisted_agent_session {

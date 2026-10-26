@@ -955,9 +955,10 @@ fn restore_plan_for_snapshot(
 /// keeps them. The conversation runs in the resume command this restore types
 /// (`native_restore` is its outcome) or, with `keeps_saved_launch`, in the
 /// saved launch itself: a handoff pane, whose agent runs on, or a pane whose
-/// directory is missing, which saves its session unchanged; those keep the
-/// mark from their saved session. A restore that types no resume command
-/// seeds nothing. A native restore that fell back to the bare command keeps
+/// directory is missing, which saves its session unchanged. A restore that
+/// types no resume command keeps the saved launch, which nothing runs, for
+/// the next save. Without a resume command the seed keeps the mark from the
+/// saved session. A native restore that fell back to the bare command keeps
 /// its options unknown, so the next save does not record the bare command as
 /// the agent's launch options.
 fn restored_agent_launch(
@@ -974,8 +975,7 @@ fn restored_agent_launch(
     let resumed_without_options = match native_restore {
         Some(crate::agent_resume::LaunchOptionsRestore::NotKept(_)) => true,
         Some(crate::agent_resume::LaunchOptionsRestore::Kept) => false,
-        None if keeps_saved_launch => session.resumed_without_launch_options,
-        None => return None,
+        None => session.resumed_without_launch_options,
     };
     let options = match (&session.launch_options, native_restore) {
         (Some(saved), _) => crate::agent_resume::AgentLaunchOptions::Known(saved.clone()),
@@ -994,7 +994,11 @@ fn restored_agent_launch(
         options,
         resumed_without_options,
         session: Some(persisted_agent_session_from_snapshot(session)?.session_ref),
-        session_confirmed: native_restore.is_none(),
+        launch: match (native_restore, keeps_saved_launch) {
+            (Some(_), _) => crate::terminal::SeededLaunch::Started,
+            (None, true) => crate::terminal::SeededLaunch::Paired,
+            (None, false) => crate::terminal::SeededLaunch::Saved,
+        },
     })
 }
 
@@ -1476,7 +1480,8 @@ mod tests {
         let disabled = startup_for(&session, false, &mut HashSet::new());
         assert!(disabled.restore_plan.is_none());
         assert_eq!(disabled.launch_options_restore, None);
-        // A restore that types no resume command runs no saved launch.
+        // A restore that types no resume command keeps the saved launch,
+        // which nothing runs.
         assert_eq!(
             restored_agent_launch(
                 Some(&session),
@@ -1484,7 +1489,15 @@ mod tests {
                 false,
                 false
             ),
-            None
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options()
+                ),
+                resumed_without_options: false,
+                session: seeded_session("claude"),
+                launch: crate::terminal::SeededLaunch::Saved
+            })
         );
 
         let mut resumed = HashSet::new();
@@ -1517,13 +1530,13 @@ mod tests {
                 ),
                 resumed_without_options: false,
                 session: seeded_session("claude"),
-                session_confirmed: false
+                launch: crate::terminal::SeededLaunch::Started
             })
         );
     }
 
     #[test]
-    fn restored_agent_launch_keeps_the_mark_on_a_handoff_only() {
+    fn restored_agent_launch_keeps_the_mark_without_a_resume_command() {
         use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
 
         let flagged = |launch_options| super::super::snapshot::PaneAgentSessionSnapshot {
@@ -1537,7 +1550,7 @@ mod tests {
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
                 session: seeded_session("claude"),
-                session_confirmed: true
+                launch: crate::terminal::SeededLaunch::Paired
             })
         );
         assert_eq!(
@@ -1552,24 +1565,33 @@ mod tests {
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: true,
                 session: seeded_session("claude"),
-                session_confirmed: true
+                launch: crate::terminal::SeededLaunch::Paired
             })
         );
         assert_eq!(
             restored_agent_launch(Some(&flagged(None)), None, true, true),
             None
         );
-        // A pane that is not handed off starts no agent without a restore.
+        // A pane restored without resuming its agent keeps the mark for the
+        // next save.
         assert_eq!(
             restored_agent_launch(Some(&flagged(None)), None, false, false),
-            None
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true,
+                session: seeded_session("claude"),
+                launch: crate::terminal::SeededLaunch::Saved
+            })
         );
-        // Without the mark, a handoff seeds only saved options, as before.
+        // Without the mark, only saved options are seeded.
         let unflagged = launch_options_session("claude", None);
-        assert_eq!(
-            restored_agent_launch(Some(&unflagged), None, true, false),
-            None
-        );
+        for keeps_saved_launch in [true, false] {
+            assert_eq!(
+                restored_agent_launch(Some(&unflagged), None, keeps_saved_launch, false),
+                None
+            );
+        }
     }
 
     #[test]
@@ -1587,7 +1609,7 @@ mod tests {
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
                 session: seeded_session("claude"),
-                session_confirmed: false
+                launch: crate::terminal::SeededLaunch::Started
             })
         );
         assert_eq!(
@@ -1609,7 +1631,7 @@ mod tests {
                     options: AgentLaunchOptions::Known(placeholder_launch_options()),
                     resumed_without_options: bare_resume,
                     session: seeded_session("codex"),
-                    session_confirmed: false
+                    launch: crate::terminal::SeededLaunch::Started
                 }),
                 "{outcome:?}"
             );
@@ -1618,11 +1640,16 @@ mod tests {
             restored_agent_launch(Some(&saved), Some(LaunchOptionsRestore::Kept), false, true),
             None
         );
-        // A restore that types no resume command seeds nothing, even with
-        // saved options.
+        // A restore that types no resume command keeps the saved options.
         assert_eq!(
             restored_agent_launch(Some(&saved), None, false, false),
-            None
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Codex,
+                options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                resumed_without_options: false,
+                session: seeded_session("codex"),
+                launch: crate::terminal::SeededLaunch::Saved
+            })
         );
     }
 
@@ -2526,10 +2553,11 @@ mod tests {
     }
 
     /// The conversation saved for the restored pane, with its launch options,
-    /// after the user starts Claude by hand with a bypass option in it.
-    fn saved_after_a_hand_started_bypass(
+    /// after `act` runs on its terminal.
+    fn saved_after_restore(
         snapshot: &SessionSnapshot,
         resume_agents_on_restore: bool,
+        act: impl FnOnce(&mut TerminalState),
     ) -> super::super::snapshot::PaneAgentSessionSnapshot {
         let (workspaces, mut terminals, runtimes) = restore(
             snapshot,
@@ -2544,15 +2572,7 @@ mod tests {
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
         );
-        let terminal = terminals.values_mut().next().unwrap();
-        terminal.observe_agent_launch(
-            crate::detect::Agent::Claude,
-            4242,
-            crate::agent_resume::AgentLaunchOptions::Known(vec![
-                "--dangerously-skip-permissions".into()
-            ]),
-            None,
-        );
+        act(terminals.values_mut().next().unwrap());
         let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
         let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
         saved.workspaces[0].tabs[0]
@@ -2562,7 +2582,20 @@ mod tests {
             .unwrap()
             .agent_session
             .clone()
-            .expect("the restored conversation should still be saved")
+            .expect("the restored pane should save a conversation")
+    }
+
+    /// Detection reads a Claude the user started by hand with a bypass option,
+    /// whose command line resumes `resumed`.
+    fn observe_hand_started_bypass(terminal: &mut TerminalState, resumed: Option<&str>) {
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            4242,
+            crate::agent_resume::AgentLaunchOptions::Known(vec![
+                "--dangerously-skip-permissions".into()
+            ]),
+            resumed,
+        );
     }
 
     #[tokio::test]
@@ -2572,7 +2605,9 @@ mod tests {
             "claude",
             Some(placeholder_launch_options()),
         ));
-        let saved = saved_after_a_hand_started_bypass(&snapshot, false);
+        let saved = saved_after_restore(&snapshot, false, |terminal| {
+            observe_hand_started_bypass(terminal, None)
+        });
         assert_eq!(saved.value, "claude-session");
         assert_eq!(saved.launch_options, None);
     }
@@ -2586,9 +2621,78 @@ mod tests {
             "claude",
             Some(placeholder_launch_options()),
         ));
-        let saved = saved_after_a_hand_started_bypass(&snapshot, true);
+        let saved = saved_after_restore(&snapshot, true, |terminal| {
+            observe_hand_started_bypass(terminal, None)
+        });
         assert_eq!(saved.value, "claude-session");
         assert_eq!(saved.launch_options, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_restore_without_resume_keeps_the_saved_launch_for_a_later_resume() {
+        let flagged = super::super::snapshot::PaneAgentSessionSnapshot {
+            resumed_without_launch_options: true,
+            ..launch_options_session("claude", None)
+        };
+        let with_options = launch_options_session("claude", Some(placeholder_launch_options()));
+        for session in [with_options, flagged] {
+            let saved =
+                saved_after_restore(&single_pane_snapshot(session.clone()), false, |terminal| {
+                    // No agent runs, so the pane shows no marker.
+                    assert!(!terminal.resumed_without_launch_options());
+                });
+            assert_eq!(saved, session);
+            let resumed = saved_after_restore(&single_pane_snapshot(saved), true, |_| {});
+            assert_eq!(resumed, session);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_hand_started_agent_that_resumes_the_conversation_a_restore_without_resume_left_takes_it_with_its_own_options(
+    ) {
+        for flagged in [false, true] {
+            let snapshot = single_pane_snapshot(super::super::snapshot::PaneAgentSessionSnapshot {
+                resumed_without_launch_options: flagged,
+                ..launch_options_session("claude", Some(placeholder_launch_options()))
+            });
+            let saved = saved_after_restore(&snapshot, false, |terminal| {
+                observe_hand_started_bypass(terminal, Some("claude-session"))
+            });
+            assert_eq!(saved.value, "claude-session", "flagged {flagged}");
+            assert_eq!(
+                saved.launch_options,
+                Some(vec!["--dangerously-skip-permissions".into()]),
+                "flagged {flagged}"
+            );
+            assert!(!saved.resumed_without_launch_options, "flagged {flagged}");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_conversation_reported_in_a_pane_restored_without_resume_takes_no_saved_options() {
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "codex",
+            Some(placeholder_launch_options()),
+        ));
+        // A Codex started by hand reports its new conversation before
+        // detection reads its command line.
+        let saved = saved_after_restore(&snapshot, false, |terminal| {
+            terminal.set_detected_state(Some(crate::detect::Agent::Codex), AgentState::Idle);
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRef::id("fresh-session"),
+                Some(1),
+                Some("startup".into()),
+            );
+            terminal.sync_agent_launch_session(|_| true);
+        });
+        assert_eq!(saved.value, "fresh-session");
+        assert_eq!(saved.launch_options, None);
+        assert!(!saved.resumed_without_launch_options);
     }
 
     /// The terminal a live handoff restores for a pane whose Claude the old
@@ -2668,7 +2772,7 @@ mod tests {
                         options: not_recorded,
                         resumed_without_options: true,
                         session: crate::agent_resume::AgentSessionRef::id("claude-session"),
-                        session_confirmed: false,
+                        launch: crate::terminal::SeededLaunch::Started,
                     });
                 }
                 // The bare resume command the restore typed.
