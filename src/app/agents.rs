@@ -221,15 +221,18 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
-        if let Some(session) = persisted_agent_session {
-            terminal.set_managed_agent_launch_session(session);
-        }
         if let Some(options) = launch_options {
             terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
                 agent: kind,
                 options,
                 resumed_without_options: false,
+                session: persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.session_ref.clone()),
             });
+        }
+        if let Some(session) = persisted_agent_session {
+            terminal.set_managed_agent_launch_session(session);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();

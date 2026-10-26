@@ -1418,8 +1418,15 @@ mod tests {
                 session_ref: crate::agent_resume::AgentSessionRef::id("session-1").unwrap(),
             });
         }
+        // A restored conversation is paired with a process whose command line
+        // resumes it; one a live agent reported, with the process seen next.
         if let Some((agent, options)) = launch {
-            terminal.observe_agent_launch(agent, 4242, options, None);
+            terminal.observe_agent_launch(
+                agent,
+                4242,
+                options,
+                (!hook_authority).then_some("session-1"),
+            );
         }
         (state, root)
     }
@@ -1521,6 +1528,7 @@ mod tests {
                         crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                     ),
                     resumed_without_options: flagged,
+                    session: crate::agent_resume::AgentSessionRef::id("session-1"),
                 });
             capture_from_state(&state).workspaces[0].tabs[0].panes[&root.raw()]
                 .agent_session
