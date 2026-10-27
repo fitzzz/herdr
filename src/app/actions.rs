@@ -3538,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn another_process_reporting_the_paired_conversation_takes_it_from_the_record() {
+    fn another_process_reporting_the_paired_conversation_takes_it_until_the_agent_reports_it() {
         let other = ProcessInstance::unknown_start(EXITED_PROCESS_ID - 1);
         for (case, evidence) in [
             (
@@ -3569,6 +3569,25 @@ mod tests {
             assert_eq!(
                 saved_claude_restore(&state, pane_id),
                 ("session-a".into(), claude_resume(&[], "session-a")),
+                "{case}"
+            );
+            // The agent reports its conversation itself again, as Claude
+            // does after compacting it.
+            report_claude_with(
+                &mut state,
+                pane_id,
+                (3, "compact"),
+                "session-a",
+                crate::terminal::SessionReportEvidence::Reporter(vec![
+                    ProcessInstance::unknown_start(EXITED_PROCESS_ID),
+                ]),
+            );
+            assert_eq!(
+                saved_claude_restore(&state, pane_id),
+                (
+                    "session-a".into(),
+                    claude_resume(&["--permission-mode", "plan"], "session-a")
+                ),
                 "{case}"
             );
         }
