@@ -431,20 +431,23 @@ impl Default for SessionReportEvidence {
 }
 
 impl SessionReportEvidence {
-    /// The processes this evidence names as the one that reported, or
-    /// `None` when the server cannot tell. A reporter names itself and the
-    /// launchers directly above it. A foreground job running exactly one
-    /// Claude or Codex process names that process, which a launch not yet
-    /// bound to a process is taken to be. An unreadable job, a job running
+    /// The processes this evidence names as the one that reported, and how
+    /// it shows them, or `None` when the server cannot tell. A reporter
+    /// names itself and the launchers directly above it. A foreground job
+    /// running exactly one Claude or Codex process names that process, which
+    /// is the only evidence that names a launch not yet bound to a process,
+    /// taken to be that process. An unreadable job, a job running
     /// none or more than one, and a sender the server read but could not
     /// place in the pane name none. Processes match by id and start time
     /// ([`ProcessInstance::is`]). A report records what it names in
     /// [`ProcessSessions`], which both reports and observations decide from,
     /// so the order they arrive in does not change the pairing.
-    fn named_processes(&self) -> Option<&[ProcessInstance]> {
+    fn named_processes(&self) -> Option<(&[ProcessInstance], ShownBy)> {
         match self {
-            Self::Reporter(reporter) => Some(reporter),
-            Self::ForegroundAgents(Some(agents)) if agents.len() == 1 => Some(agents),
+            Self::Reporter(reporter) => Some((reporter, ShownBy::Reporter)),
+            Self::ForegroundAgents(Some(agents)) if agents.len() == 1 => {
+                Some((agents, ShownBy::ForegroundJob))
+            }
             Self::Unidentified | Self::ForegroundAgents(_) => None,
         }
     }
@@ -930,13 +933,9 @@ impl TerminalState {
             return;
         };
         self.reported_session = Some(session.clone());
-        if let Some(named) = evidence.named_processes() {
-            let shown_by = match evidence {
-                SessionReportEvidence::Reporter(_) => ShownBy::Reporter,
-                SessionReportEvidence::Unidentified
-                | SessionReportEvidence::ForegroundAgents(_) => ShownBy::ForegroundJob,
-            };
-            self.process_sessions.show(named, &session, shown_by);
+        let named = evidence.named_processes();
+        if let Some((processes, shown_by)) = named {
+            self.process_sessions.show(processes, &session, shown_by);
         }
         let Some(launch) = self.agent_launch.as_mut() else {
             return;
@@ -947,9 +946,7 @@ impl TerminalState {
             LaunchState::Started(pairing) => {
                 // A reporter names processes, never an unbound launch, which
                 // it owns once detection binds it to one of them.
-                let names_launch = evidence
-                    .named_processes()
-                    .map(|_| matches!(evidence, SessionReportEvidence::ForegroundAgents(_)));
+                let names_launch = named.map(|(_, shown_by)| shown_by == ShownBy::ForegroundJob);
                 let paired = match names_launch {
                     Some(true) => Pairing::Confirmed(session.clone()),
                     Some(false) if owns_it => Pairing::Unpaired {
@@ -3814,8 +3811,9 @@ mod tests {
             {
                 shown.show(&[*process], session, ShownBy::Reporter);
             }
-            if let Some(named) = report.and_then(SessionReportEvidence::named_processes) {
-                shown.show(named, &current, ShownBy::Reporter);
+            if let Some((named, shown_by)) = report.and_then(SessionReportEvidence::named_processes)
+            {
+                shown.show(named, &current, shown_by);
             }
             if let Resumes(resumed) = reading {
                 shown.read(&process, Some(id(resumed)));
