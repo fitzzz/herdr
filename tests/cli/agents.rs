@@ -542,7 +542,14 @@ fn agent_start_command_works() {
     assert!(report_agent("idle"));
     assert!(report_agent("working"));
     let already_working = prompt_wait("finish active", "2000");
-    assert!(already_working.status.success());
+    assert_eq!(already_working.status.code(), Some(1));
+    let already_working: serde_json::Value =
+        serde_json::from_slice(&already_working.stderr).unwrap();
+    assert_eq!(already_working["error"]["code"], "agent_prompt_stalled");
+    assert!(already_working["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("no acceptance evidence rule")));
+    assert!(report_agent("idle"));
 
     let prompted = prompt_wait("Review this diff", "2000");
     assert!(

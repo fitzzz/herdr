@@ -16,7 +16,7 @@ DEFAULT_BUNDLED_DIR = PROJECT_ROOT / "src" / "detect" / "manifests"
 DEFAULT_PUBLISHED_DIR = PROJECT_ROOT / "distribution" / "agent-detection"
 ENGINE_SOURCE = PROJECT_ROOT / "src" / "detect" / "manifest_update.rs"
 
-MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules"}
+MANIFEST_KEYS = {"id", "version", "min_engine_version", "updated_at", "aliases", "rules", "composer"}
 RULE_KEYS = {
     "id",
     "state",
@@ -33,12 +33,27 @@ RULE_KEYS = {
     "regex",
     "line_regex",
 }
+COMPOSER_KEYS = {
+    "id",
+    "state",
+    "priority",
+    "region",
+    "requires_submitted_text",
+    "all",
+    "any",
+    "not",
+    "contains",
+    "regex",
+    "line_regex",
+}
 GATE_KEYS = {"all", "any", "not", "contains", "regex", "line_regex"}
 STATES = {"idle", "working", "blocked", "unknown"}
+COMPOSER_STATES = {"selection_list", "partial_command", "draft", "queued_evidence"}
 REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
     r"before_current_prompt_marker|current_prompt_block_marker|after_current_prompt_block_marker|"
     r"prompt_box_body|above_prompt_box|last_non_empty_above_prompt_box|after_last_horizontal_rule|"
+    r"current_prompt_line|"
     r"osc_title|osc_progress|"
     r"bottom_lines\([1-9][0-9]*\)|bottom_non_empty_lines\([1-9][0-9]*\)|"
     r"top_non_empty_lines\([1-9][0-9]*\))$"
@@ -164,7 +179,58 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
                 f"{path}: rule {rule['id']} region {region!r} requires min_engine_version 3"
             )
 
+    composer = manifest.get("composer", [])
+    if not isinstance(composer, list):
+        raise CheckError(f"{path}: composer must be an array")
+    if len(composer) > MAX_RULES_PER_MANIFEST:
+        raise CheckError(f"{path}: manifest exceeds max composer rule count {MAX_RULES_PER_MANIFEST}")
+    if composer and min_engine < 4:
+        raise CheckError(f"{path}: composer rules require min_engine_version 4")
+    for index, rule in enumerate(composer):
+        validate_composer(path, index, rule, complexity)
+
     return manifest
+
+
+def validate_composer(path: Path, index: int, rule: object, complexity: dict[str, int]) -> None:
+    if not isinstance(rule, dict):
+        raise CheckError(f"{path}: composer rule {index} must be a table")
+    unknown = sorted(set(rule) - COMPOSER_KEYS)
+    if unknown:
+        raise CheckError(f"{path}: composer rule {index} has unknown field(s): {', '.join(unknown)}")
+    rule_id = rule.get("id")
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise CheckError(f"{path}: composer rule {index} id must be a non-empty string")
+    state = rule.get("state")
+    if not isinstance(state, str) or state not in COMPOSER_STATES:
+        raise CheckError(f"{path}: composer rule {rule_id} has invalid state {state!r}")
+    region = rule.get("region", "whole_recent")
+    if not isinstance(region, str) or not REGION_RE.fullmatch(region):
+        raise CheckError(f"{path}: composer rule {rule_id} has invalid region {region!r}")
+    count_match = REGION_COUNT_RE.search(region)
+    if (
+        region.startswith("top_non_empty_lines(")
+        and count_match
+        and int(count_match.group(1)) > MAX_TOP_REGION_LINE_COUNT
+    ):
+        raise CheckError(f"{path}: composer rule {rule_id} has invalid region {region!r}")
+    requires_submitted_text = rule.get("requires_submitted_text", False)
+    if not isinstance(requires_submitted_text, bool):
+        raise CheckError(f"{path}: composer rule {rule_id} requires_submitted_text must be a boolean")
+    if requires_submitted_text and state != "queued_evidence":
+        raise CheckError(
+            f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state queued_evidence"
+        )
+    allow_empty = requires_submitted_text and state == "queued_evidence"
+    validate_gate(
+        path,
+        f"composer rule {rule_id}",
+        rule,
+        require_positive=not allow_empty,
+        depth=0,
+        complexity=complexity,
+        allowed_keys=COMPOSER_KEYS,
+    )
 
 
 def validate_rule(path: Path, index: int, rule: object, complexity: dict[str, int]) -> None:
@@ -204,13 +270,16 @@ def validate_gate(
     require_positive: bool,
     depth: int,
     complexity: dict[str, int],
+    allowed_keys: set[str] | None = None,
 ) -> None:
     if depth > MAX_GATE_DEPTH:
         raise CheckError(f"{path}: {label} exceeds max gate depth {MAX_GATE_DEPTH}")
     complexity["gates"] += 1
     if complexity["gates"] > MAX_TOTAL_GATES:
         raise CheckError(f"{path}: manifest exceeds max gate count {MAX_TOTAL_GATES}")
-    unknown = sorted(set(gate) - (RULE_KEYS if label.startswith("rule ") else GATE_KEYS))
+    if allowed_keys is None:
+        allowed_keys = RULE_KEYS if label.startswith("rule ") else GATE_KEYS
+    unknown = sorted(set(gate) - allowed_keys)
     if unknown:
         raise CheckError(f"{path}: {label} has unknown gate field(s): {', '.join(unknown)}")
     matcher_count = 0
@@ -333,10 +402,12 @@ def validate_catalog(
         cmp = compare_versions(manifest["version"], bundled_manifest["version"], manifest_path)
         staged_manifest = STAGED_PUBLISHED_MANIFESTS.get(agent_id)
         published_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        # A newer engine still consumes a manifest staged for an older engine, so
+        # the bundled manifest only has to be within the current engine's range.
         stages_new_engine_manifest = (
             staged_manifest
             == (bundled_manifest["version"], manifest["version"], published_digest)
-            and bundled_manifest["min_engine_version"] == engine_version
+            and bundled_manifest["min_engine_version"] <= engine_version
             and manifest["min_engine_version"] < bundled_manifest["min_engine_version"]
         )
         if cmp < 0 and not stages_new_engine_manifest:

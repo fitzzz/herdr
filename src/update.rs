@@ -3059,6 +3059,7 @@ mod tests {
                 ssh_agent_registration: false,
                 terminal_input_ack: false,
                 terminal_input_literal: false,
+                agent_prompt_outcome: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3140,6 +3141,7 @@ mod tests {
                     ssh_agent_registration: false,
                     terminal_input_ack: false,
                     terminal_input_literal: false,
+                    agent_prompt_outcome: false,
                 }),
             },
         };
@@ -3403,6 +3405,7 @@ mod tests {
                     ssh_agent_registration: false,
                     terminal_input_ack: false,
                     terminal_input_literal: false,
+                    agent_prompt_outcome: false,
                 }),
             },
         };

@@ -12,6 +12,12 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+type AgentPromptQueue = (
+    String,
+    crate::api::schema::AgentInfo,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+);
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -185,14 +191,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<AgentPromptQueue, String> {
         if params.text.is_empty() {
             return Err(encode_error(
                 id,
@@ -242,6 +241,33 @@ impl App {
                 format!(
                     "agent {} is no longer the pane foreground process",
                     params.target
+                ),
+            ));
+        }
+        // Check the agent's own input box once per prompt, before any bytes are
+        // written. A selection list, an existing slash command, or unsent typed
+        // text must not be merged into the prompt, so refuse without typing.
+        let composer = crate::detect::composer_match(
+            Some(expected_agent),
+            &runtime.detection_text(),
+            &runtime.agent_osc_title(),
+            &runtime.agent_osc_progress(),
+        );
+        if let Some(composer) = composer.as_ref().filter(|composer| {
+            matches!(
+                composer.state,
+                crate::detect::ComposerState::SelectionList
+                    | crate::detect::ComposerState::PartialCommand
+                    | crate::detect::ComposerState::Draft
+            )
+        }) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!(
+                    "agent {} is not at an empty prompt: {}",
+                    params.target,
+                    composer.state.refusal_reason()
                 ),
             ));
         }
@@ -718,6 +744,102 @@ mod tests {
             .is_err(),
             "blocked prompt wrote or scheduled terminal input"
         );
+    }
+
+    fn codex_agent_with_screen(screen: &[u8]) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, screen, 4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_a_codex_selection_list_without_writing() {
+        let (mut app, mut rx) = codex_agent_with_screen(
+            b"  Select Model and Effort\n\n  enter select \xc2\xb7 esc back\n",
+        );
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("selection list"),
+            "message should name the composer state: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_a_partial_slash_command_without_writing() {
+        let (mut app, mut rx) = codex_agent_with_screen(b"\xe2\x80\xba /mo\n");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("slash command"),
+            "message should name the composer state: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_unsent_typed_text_without_writing() {
+        let (mut app, mut rx) = codex_agent_with_screen(b"\xe2\x80\xba draft\n");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("unsent typed text"),
+            "message should name the unsent text: {}",
+            error.error.message
+        );
+        assert!(
+            !error.error.message.contains("draft"),
+            "message must not echo the draft: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
     }
 
     #[tokio::test]

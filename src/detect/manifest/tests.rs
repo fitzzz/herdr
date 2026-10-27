@@ -40,6 +40,24 @@ id = "codex"
     )
 }
 
+fn composer_manifest(composer: &str) -> String {
+    format!(
+        r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 4
+updated_at = "2026-06-10T12:00:00Z"
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+{composer}
+"#
+    )
+}
+
 fn with_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let old_config = std::env::var_os("XDG_CONFIG_HOME");
@@ -786,6 +804,187 @@ id = "background"
 state = "working"
 region = " top_non_empty_lines(1) "
 contains = ["active"]
+"#;
+    assert!(parse_manifest(manifest).is_err());
+}
+
+#[test]
+fn composer_match_returns_highest_priority_state_and_region_text() {
+    with_manifest_dirs("composer-priority", || {
+        write_local_codex(&composer_manifest(
+            r#"
+[[composer]]
+id = "low"
+state = "draft"
+priority = 1
+region = "current_prompt_line"
+contains = ["draft"]
+
+[[composer]]
+id = "high"
+state = "partial_command"
+priority = 10
+region = "current_prompt_line"
+contains = ["/"]
+"#,
+        ));
+        let screen = "› /draft\n";
+        let matched = composer_match(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+        )
+        .expect("composer match");
+        assert_eq!(matched.id, "high");
+        assert_eq!(matched.state, ComposerState::PartialCommand);
+        assert_eq!(matched.priority, 10);
+        assert_eq!(matched.region, "current_prompt_line");
+        assert_eq!(matched.region_text, "› /draft");
+    });
+}
+
+#[test]
+fn queued_evidence_skipped_by_composer_match_and_matches_needle() {
+    with_manifest_dirs("composer-queued", || {
+        write_local_codex(&composer_manifest(
+            r#"
+[[composer]]
+id = "queued"
+state = "queued_evidence"
+priority = 100
+region = "whole_recent"
+requires_submitted_text = true
+"#,
+        ));
+        let screen = "› first\n\nQueued follow-up inputs\n  Hello World\n";
+        assert!(composer_match(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+        )
+        .is_none());
+        assert!(queued_evidence_supported(Agent::Codex));
+        assert!(composer_queued_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "hello world",
+        ));
+        assert!(composer_queued_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "hello\nworld",
+        ));
+        assert!(!composer_queued_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "missing",
+        ));
+    });
+}
+
+#[test]
+fn current_prompt_line_region_returns_last_prompt_line() {
+    let screen = "› first\nsome text\n› second\n";
+    assert_eq!(
+        region(
+            DetectionInput {
+                screen,
+                osc_title: "",
+                osc_progress: ""
+            },
+            "current_prompt_line"
+        ),
+        "› second"
+    );
+    assert_eq!(
+        region(
+            DetectionInput {
+                screen: "no prompt here\n",
+                osc_title: "",
+                osc_progress: ""
+            },
+            "current_prompt_line"
+        ),
+        ""
+    );
+}
+
+#[test]
+fn valid_composer_manifest_parses() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 4
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+region = "current_prompt_line"
+contains = ["draft"]
+"#;
+    assert!(parse_manifest(manifest).is_ok());
+}
+
+#[test]
+fn composer_validation_rejects_requires_submitted_text_on_non_queued_state() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 4
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+requires_submitted_text = true
+"#;
+    assert!(parse_manifest(manifest).is_err());
+}
+
+#[test]
+fn composer_validation_rejects_below_engine_four() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 3
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "queued"
+state = "queued_evidence"
+region = "whole_recent"
+requires_submitted_text = true
 "#;
     assert!(parse_manifest(manifest).is_err());
 }

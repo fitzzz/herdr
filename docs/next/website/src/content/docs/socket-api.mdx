@@ -112,7 +112,15 @@ Raw socket method names use dot notation:
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
-`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls.
+
+Before writing, `agent.prompt` refuses a busy composer with `agent_not_ready`: a recognised selection list is open, a slash command is already in the agent's input box, or unsent typed text is present. The refusal does not echo the typed text and never clears, edits, or retries it. Placeholder text, suggestions and predicted replies never count as a draft. For an agent kind where Herdr has no evidence-based rule to tell real typed text apart, it does not refuse; the after-typing check applies. If the resolved agent is already `blocked`, it returns `agent_blocked` without sending input or starting the wait.
+
+Without `wait`, the call waits up to five seconds for acceptance evidence. From a non-working state, an observed `working` or `blocked` state after submission means acceptance. From a working state, the submitted text must appear as a queued message under the working status. A success answer means acceptance was observed.
+
+Without acceptance evidence, `agent.prompt` returns `agent_prompt_stalled`. Its message gives one of two reasons: no acceptance evidence rule is available for this agent kind, or evidence was expected and was not observed within the window. Both say the input was written and must not be resent without checking the agent. When Herdr has positive evidence that the text stayed in the agent's input box or that the agent rejected it as an unrecognized command, it returns `agent_prompt_not_submitted`; that message also says the input was written and must not be resent without checking.
+
+Servers advertise this with the boolean `agent_prompt_outcome` capability. Older servers omit the capability and keep the old success meaning: the bytes were written, not acceptance.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

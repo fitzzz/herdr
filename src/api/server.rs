@@ -83,6 +83,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         terminal_input_ack: true,
         terminal_input_literal: true,
+        agent_prompt_outcome: true,
     })
 }
 
@@ -1504,6 +1505,7 @@ mod tests {
                 ssh_agent_registration: false,
                 terminal_input_ack: false,
                 terminal_input_literal: false,
+                agent_prompt_outcome: false,
             }),
             None,
             None,
@@ -1547,6 +1549,12 @@ mod tests {
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ping_advertises_truthful_agent_prompt_outcome() {
+        let capabilities = default_capabilities().expect("capabilities");
+        assert!(capabilities.agent_prompt_outcome);
     }
 
     #[test]

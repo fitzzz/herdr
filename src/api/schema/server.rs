@@ -50,4 +50,11 @@ pub struct ServerCapabilities {
     /// same acknowledged streams as `terminal.input.write`.
     #[serde(default)]
     pub terminal_input_literal: bool,
+    /// `agent.prompt` reports a truthful submission outcome: it refuses a busy
+    /// composer with `agent_not_ready`, answers `agent_prompt_stalled` when
+    /// acceptance evidence is missing, and answers `agent_prompt_not_submitted`
+    /// when the text stayed in the composer or was rejected. A success answer
+    /// means acceptance was observed.
+    #[serde(default)]
+    pub agent_prompt_outcome: bool,
 }

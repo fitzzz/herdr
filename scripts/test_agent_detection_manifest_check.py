@@ -20,6 +20,26 @@ contains = ["{contains}"]
 '''
 
 
+def composer_manifest(
+    agent_id: str,
+    version: str,
+    min_engine_version: int,
+    composer: str,
+) -> str:
+    return f'''id = "{agent_id}"
+version = "{version}"
+min_engine_version = {min_engine_version}
+updated_at = "2026-06-10T00:00:00Z"
+
+[[rules]]
+id = "idle"
+state = "idle"
+contains = ["ready"]
+
+{composer}
+'''
+
+
 def catalog(agent_id: str = "codex", path: str = "codex.toml") -> str:
     return f'''schema_version = 1
 
@@ -243,6 +263,44 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
                     check.validate_rule(
                         Path("test.toml"), 0, rule, {"gates": 0, "matchers": 0}
                     )
+
+    def test_valid_composer_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            content = composer_manifest(
+                "codex",
+                "2026.06.10.1",
+                4,
+                """[[composer]]
+id = "draft"
+state = "draft"
+region = "current_prompt_line"
+contains = ["draft"]""",
+            )
+            (bundled / "codex.toml").write_text(content)
+
+            manifests = check.load_manifest_dir(bundled, engine_version=4)
+            self.assertIn("codex", manifests)
+
+    def test_rejects_composer_below_engine_four(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            content = composer_manifest(
+                "codex",
+                "2026.06.10.1",
+                3,
+                """[[composer]]
+id = "draft"
+state = "draft"
+region = "current_prompt_line"
+contains = ["draft"]""",
+            )
+            (bundled / "codex.toml").write_text(content)
+
+            with self.assertRaisesRegex(check.CheckError, "composer rules require min_engine_version 4"):
+                check.load_manifest_dir(bundled, engine_version=4)
 
 
 if __name__ == "__main__":
