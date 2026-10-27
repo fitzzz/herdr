@@ -458,12 +458,6 @@ impl ClientConnection {
         self.render_pending = true;
     }
 
-    pub(crate) fn take_deferred_render(&mut self) -> DeferredRender {
-        let deferred = self.deferred_render();
-        self.clear_deferred_render();
-        deferred
-    }
-
     pub(crate) fn is_shell_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::ClientShell)
     }

@@ -220,6 +220,14 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     super::interactive_unix_shell_command(argv, shell_name)
 }
 
+pub(crate) fn agent_launcher_command(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    shell: &str,
+) -> Option<String> {
+    super::unix_agent_launcher_command(argv, env, shell)
+}
+
 #[repr(C)]
 struct TisInputSource {
     _private: [u8; 0],

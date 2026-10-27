@@ -498,7 +498,7 @@ On macOS, `system` tries `terminal-notifier` first and falls back to `/usr/bin/o
 
 ## Sound
 
-Sound notifications play through the local Herdr client. Custom sounds must be mp3 files; Herdr resolves relative paths from the config file's directory.
+Sound notifications play through the local Herdr client. Custom sounds must be mp3 files; Herdr resolves relative paths from the config file's directory. When several clients are attached on the same machine, only one of them plays at a time, and notifications that arrive while a sound is playing are skipped.
 
 ```toml
 [ui.sound]

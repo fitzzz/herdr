@@ -3047,6 +3047,8 @@ mod tests {
             version: Some("0.5.5".to_string()),
             protocol: Some(2),
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(
@@ -3055,6 +3057,8 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_input_ack: false,
+                terminal_input_literal: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3063,6 +3067,8 @@ mod tests {
         };
         let incompatible_generation = crate::api::RuntimeStatus {
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION + 1,
                 ),
@@ -3122,6 +3128,8 @@ mod tests {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    methods: Vec::new(),
+                    agent_launcher: false,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
@@ -3130,6 +3138,8 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    terminal_input_ack: false,
+                    terminal_input_literal: false,
                 }),
             },
         };
@@ -3381,6 +3391,8 @@ mod tests {
                 version: Some("9.8.6".to_string()),
                 protocol: Some(76),
                 capabilities: Some(crate::api::schema::ServerCapabilities {
+                    methods: Vec::new(),
+                    agent_launcher: false,
                     live_handoff: true,
                     detached_server_daemon: true,
                     endpoint_protocol_generation: Some(
@@ -3389,6 +3401,8 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    terminal_input_ack: false,
+                    terminal_input_literal: false,
                 }),
             },
         };

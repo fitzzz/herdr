@@ -187,38 +187,7 @@ pub(super) fn snapshot_with_completions(
         .filter_map(|entry| app.public_pane_id(entry.ws_idx, entry.pane_id))
         .collect();
 
-    let zoomed = focused_tab_id
-        .as_deref()
-        .and_then(|tab_id| app.parse_tab_id(tab_id))
-        .and_then(|(workspace_index, tab_index)| {
-            app.state
-                .workspaces
-                .get(workspace_index)?
-                .tabs
-                .get(tab_index)
-        })
-        .is_some_and(|tab| tab.zoomed);
-    let tab_bar_right = app
-        .state
-        .tab_bar_right
-        .iter()
-        .filter_map(|segment| match segment {
-            crate::app::state::TabBarStatusSegment::Zoom if zoomed => {
-                Some(protocol::ClientShellTabStatusSegment {
-                    text: "ZOOM".to_owned(),
-                    accent: true,
-                })
-            }
-            crate::app::state::TabBarStatusSegment::Text(Some(text)) if !text.is_empty() => {
-                Some(protocol::ClientShellTabStatusSegment {
-                    text: text.clone(),
-                    accent: false,
-                })
-            }
-            crate::app::state::TabBarStatusSegment::Zoom
-            | crate::app::state::TabBarStatusSegment::Text(_) => None,
-        })
-        .collect();
+    let tab_bar_right = tab_bar_right(app, focused_tab_id.as_deref());
 
     let product_announcement = app.state.product_announcement.as_ref().map(|announcement| {
         protocol::ClientShellProductAnnouncement {
@@ -265,6 +234,115 @@ pub(super) fn snapshot_with_completions(
         commands: app.client_shell_command_manifest(),
     };
     (shell, completions)
+}
+
+fn tab_bar_right(
+    app: &app::App,
+    focused_tab_id: Option<&str>,
+) -> Vec<protocol::ClientShellTabStatusSegment> {
+    let zoomed = focused_tab_id
+        .and_then(|tab_id| app.parse_tab_id(tab_id))
+        .and_then(|(workspace_index, tab_index)| {
+            app.state
+                .workspaces
+                .get(workspace_index)?
+                .tabs
+                .get(tab_index)
+        })
+        .is_some_and(|tab| tab.zoomed);
+    app.state
+        .tab_bar_right
+        .iter()
+        .filter_map(|segment| match segment {
+            crate::app::state::TabBarStatusSegment::Zoom if zoomed => {
+                Some(protocol::ClientShellTabStatusSegment {
+                    text: "ZOOM".to_owned(),
+                    accent: true,
+                })
+            }
+            crate::app::state::TabBarStatusSegment::Text(Some(text)) if !text.is_empty() => {
+                Some(protocol::ClientShellTabStatusSegment {
+                    text: text.clone(),
+                    accent: false,
+                })
+            }
+            crate::app::state::TabBarStatusSegment::Zoom
+            | crate::app::state::TabBarStatusSegment::Text(_) => None,
+        })
+        .collect()
+}
+
+/// Apply client-local navigation to a fresh observation shared only within this
+/// render pass. No mutable runtime observation is retained across passes.
+pub(super) fn snapshot_for_location(
+    app: &app::App,
+    base: &(
+        protocol::ClientShellSnapshot,
+        protocol::endpoint::EndpointAgentCompletions,
+    ),
+    revision: u64,
+    location: Option<&crate::server::clients::ClientShellLocation>,
+) -> (
+    protocol::ClientShellSnapshot,
+    protocol::endpoint::EndpointAgentCompletions,
+) {
+    let (mut snapshot, mut completions) = base.clone();
+    snapshot.revision = revision;
+    completions.revision = revision;
+    let Some(location) = location else {
+        return (snapshot, completions);
+    };
+    snapshot.focused_workspace_id = location
+        .focused_workspace_id
+        .clone()
+        .or(snapshot.focused_workspace_id);
+    snapshot.focused_tab_id = location
+        .focused_tab_id()
+        .map(str::to_owned)
+        .or(snapshot.focused_tab_id);
+    snapshot.focused_pane_id = snapshot
+        .focused_tab_id
+        .as_deref()
+        .and_then(|tab_id| app.parse_tab_id(tab_id))
+        .and_then(|(ws_idx, tab_idx)| {
+            let pane_id = app
+                .state
+                .workspaces
+                .get(ws_idx)?
+                .tabs
+                .get(tab_idx)?
+                .layout
+                .focused();
+            app.public_pane_id(ws_idx, pane_id)
+        })
+        .or(snapshot.focused_pane_id);
+    for (ws_idx, workspace) in snapshot.workspaces.iter_mut().enumerate() {
+        workspace.focused =
+            snapshot.focused_workspace_id.as_deref() == Some(workspace.workspace_id.as_str());
+        if let Some(active_tab_id) = location.active_tab_ids.get(&workspace.workspace_id) {
+            if *active_tab_id != workspace.active_tab_id {
+                let tab_idx = app
+                    .parse_tab_id(active_tab_id)
+                    .and_then(|(tab_ws_idx, tab_idx)| (tab_ws_idx == ws_idx).then_some(tab_idx));
+                workspace.new_workspace_cwd = app
+                    .resolved_new_workspace_cwd_from_tab(ws_idx, tab_idx)
+                    .display()
+                    .to_string();
+                workspace.active_tab_id = active_tab_id.clone();
+            }
+        }
+    }
+    for tab in &mut snapshot.tabs {
+        tab.focused = snapshot.focused_tab_id.as_deref() == Some(tab.tab_id.as_str());
+    }
+    for pane in &mut snapshot.panes {
+        pane.focused = snapshot.focused_pane_id.as_deref() == Some(pane.pane_id.as_str());
+    }
+    for agent in &mut snapshot.agents {
+        agent.focused = snapshot.focused_pane_id.as_deref() == Some(agent.pane_id.as_str());
+    }
+    snapshot.tab_bar_right = tab_bar_right(app, snapshot.focused_tab_id.as_deref());
+    (snapshot, completions)
 }
 
 pub(super) struct RenderedPaneSurface {

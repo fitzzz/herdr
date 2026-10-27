@@ -4,12 +4,11 @@
 //! Uses afplay (macOS), Windows MediaPlayer, or decoder-capable Linux audio
 //! players — no Rust audio dependencies.
 
-use std::io::Write;
+use std::fs::{File, OpenOptions, TryLockError};
 #[cfg(not(any(windows, target_os = "macos")))]
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(any(windows, target_os = "macos")))]
 use std::time::{Duration, Instant};
 
@@ -22,8 +21,9 @@ const WINDOWS_SOUND_PATH_ENV: &str = "HERDR_SOUND_PATH";
 const AUDIO_PLAYER_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(not(any(windows, target_os = "macos")))]
 const AUDIO_PLAYER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const SOUND_DIR: &str = "sound";
+const PLAYER_LOCK_FILE: &str = "player.lock";
 
-static SOUND_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.mp3");
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.mp3");
 
@@ -38,30 +38,31 @@ pub enum Sound {
 
 /// Play a notification sound in a background thread.
 /// Silently does nothing if no audio player is available.
+///
+/// Every attached client receives the same agent transitions, so playback is
+/// gated by a lock file in Herdr's state directory, shared by every client on
+/// this machine whichever server or session it is attached to. Whoever holds
+/// it plays; requests that arrive while a sound is
+/// playing are dropped, which also coalesces a burst of transitions into one
+/// sound. The OS releases the lock when its holder exits, even mid-play.
 pub fn play(sound: Sound, config: &crate::config::SoundConfig) {
     if sound_playback_disabled_by_env() {
         return;
     }
 
+    let dir = crate::config::state_dir().join(SOUND_DIR);
+    let lock = match try_lock_player(&dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(dir = %dir.display(), err = %err, "sound player lock unavailable");
+            return;
+        }
+    };
     let custom_path = config.path_for(sound);
     std::thread::spawn(move || {
-        if let Some(path) = custom_path {
-            match play_file(&path) {
-                Ok(()) => return,
-                Err(err) => {
-                    warn!(path = %path.display(), sound = ?sound, err = %err, "custom sound playback failed, falling back to built-in sound")
-                }
-            }
-        }
-
-        let data = match sound {
-            Sound::Done => SOUND_DONE,
-            Sound::Request => SOUND_REQUEST,
-        };
-
-        if let Err(err) = play_bytes(data) {
-            warn!(sound = ?sound, err = %err, "sound playback failed");
-        }
+        play_locked(&dir, sound, custom_path.as_deref(), play_file);
+        drop(lock);
     });
 }
 
@@ -69,29 +70,69 @@ fn sound_playback_disabled_by_env() -> bool {
     std::env::var_os(DISABLE_SOUND_ENV).is_some() || std::env::var_os("NEXTEST").is_some()
 }
 
+/// Returns the held player lock, or `None` when another player holds it.
+fn try_lock_player(dir: &Path) -> std::io::Result<Option<File>> {
+    std::fs::create_dir_all(dir)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(PLAYER_LOCK_FILE))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// Plays `sound` with `play_path`. The caller must hold the player lock in `dir`.
+fn play_locked(
+    dir: &Path,
+    sound: Sound,
+    custom_path: Option<&Path>,
+    play_path: impl Fn(&Path) -> Result<(), String>,
+) {
+    if let Some(path) = custom_path {
+        match play_path(path) {
+            Ok(()) => return,
+            Err(err) => {
+                warn!(path = %path.display(), sound = ?sound, err = %err, "custom sound playback failed, falling back to built-in sound")
+            }
+        }
+    }
+
+    let result = embedded_sound_path(dir, sound)
+        .map_err(|err| err.to_string())
+        .and_then(|path| play_path(&path));
+    if let Err(err) = result {
+        warn!(sound = ?sound, err = %err, "sound playback failed");
+    }
+}
+
+/// Writes the embedded sound to a fixed file in `dir` when it is missing or
+/// differs, because the supported audio players need a file path. The caller
+/// must hold the player lock, so the fixed staging name cannot collide.
+fn embedded_sound_path(dir: &Path, sound: Sound) -> std::io::Result<PathBuf> {
+    let (name, data) = match sound {
+        Sound::Done => ("done.mp3", SOUND_DONE),
+        Sound::Request => ("request.mp3", SOUND_REQUEST),
+    };
+    let path = dir.join(name);
+    if std::fs::read(&path).is_ok_and(|existing| existing == data) {
+        return Ok(path);
+    }
+    let staging = dir.join(format!("{name}.tmp"));
+    std::fs::write(&staging, data)?;
+    std::fs::rename(&staging, &path)?;
+    Ok(path)
+}
+
 fn play_file(path: &Path) -> Result<(), String> {
     match run_player(path) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => Err(playback_error(&output)),
         Err(err) => Err(err),
-    }
-}
-
-fn play_bytes(data: &[u8]) -> Result<(), String> {
-    // Write to a temp file because the supported audio players need a file path.
-    let tmp = temp_sound_path();
-    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    file.write_all(data).map_err(|e| e.to_string())?;
-    drop(file);
-
-    let result = run_player(&tmp);
-
-    let _ = std::fs::remove_file(&tmp);
-
-    match result {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(playback_error(&output)),
-        Err(e) => Err(e),
     }
 }
 
@@ -103,11 +144,6 @@ fn playback_error(output: &Output) -> String {
     } else {
         format!("player exited with {}: {stderr}", output.status)
     }
-}
-
-fn temp_sound_path() -> PathBuf {
-    let id = SOUND_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("herdr-sound-{}-{id}.mp3", std::process::id()))
 }
 
 #[cfg(windows)]
@@ -366,9 +402,153 @@ fn player_error(player: AudioPlayer, output: &Output) -> String {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-sound-test-{name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn temp_sound_paths_are_unique() {
-        assert_ne!(temp_sound_path(), temp_sound_path());
+    fn player_lock_admits_one_holder_until_released() {
+        let dir = unique_test_dir("lock");
+
+        let held = try_lock_player(&dir)
+            .unwrap()
+            .expect("first client gets the lock");
+        assert!(
+            try_lock_player(&dir).unwrap().is_none(),
+            "a second client must not play while the first one is playing"
+        );
+        drop(held);
+        assert!(try_lock_player(&dir).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn simultaneous_requests_from_many_clients_start_one_player() {
+        const CLIENTS: usize = 12;
+        let dir = unique_test_dir("burst");
+        let barrier = Arc::new(Barrier::new(CLIENTS));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                let (dir, barrier) = (dir.clone(), barrier.clone());
+                let (attempted, started) = (attempted.clone(), started.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let lock = try_lock_player(&dir).unwrap();
+                    attempted.fetch_add(1, Ordering::SeqCst);
+                    let Some(lock) = lock else {
+                        return;
+                    };
+                    play_locked(&dir, Sound::Done, None, |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        // Keep playing until every other client has asked to play.
+                        while attempted.load(Ordering::SeqCst) < CLIENTS {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Ok(())
+                    });
+                    drop(lock);
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn embedded_sounds_play_from_stable_files_without_leftovers() {
+        let dir = unique_test_dir("stable");
+        let played = Mutex::new(Vec::new());
+        let record = |path: &Path| {
+            played.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        };
+
+        for _ in 0..3 {
+            play_locked(&dir, Sound::Done, None, record);
+            play_locked(&dir, Sound::Request, None, record);
+        }
+
+        let played = played.into_inner().unwrap();
+        assert_eq!(played.len(), 6);
+        assert!(played
+            .iter()
+            .step_by(2)
+            .all(|path| path == &dir.join("done.mp3")));
+        assert!(played
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|path| path == &dir.join("request.mp3")));
+        assert_eq!(dir_entries(&dir), ["done.mp3", "request.mp3"]);
+        assert_eq!(std::fs::read(dir.join("done.mp3")).unwrap(), SOUND_DONE);
+        assert_eq!(
+            std::fs::read(dir.join("request.mp3")).unwrap(),
+            SOUND_REQUEST
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn embedded_sound_file_is_replaced_when_its_content_differs() {
+        let dir = unique_test_dir("replace");
+        std::fs::write(dir.join("done.mp3"), b"from another herdr version").unwrap();
+
+        play_locked(&dir, Sound::Done, None, |_| Ok(()));
+
+        assert_eq!(std::fs::read(dir.join("done.mp3")).unwrap(), SOUND_DONE);
+        assert_eq!(dir_entries(&dir), ["done.mp3"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_custom_sound_falls_back_to_embedded_file() {
+        let dir = unique_test_dir("custom");
+        let custom = dir.join("custom.wav");
+        let played = Mutex::new(Vec::new());
+
+        play_locked(&dir, Sound::Request, Some(&custom), |path| {
+            played.lock().unwrap().push(path.to_path_buf());
+            if path == custom {
+                Err("unsupported".into())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(
+            played.into_inner().unwrap(),
+            [custom.clone(), dir.join("request.mp3")]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -386,7 +566,8 @@ mod tests {
     #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn linux_audio_player_does_not_wait_forever() {
-        let pid_path = temp_sound_path().with_extension("pid");
+        let dir = unique_test_dir("timeout");
+        let pid_path = dir.join("player.pid");
         let player = AudioPlayer {
             program: "sh",
             args: &[
@@ -398,7 +579,7 @@ mod tests {
         let result = player.output_with_timeout(&pid_path, Duration::from_millis(100));
         let pid = std::fs::read_to_string(&pid_path)
             .expect("hanging test player should record its process ID");
-        let _ = std::fs::remove_file(pid_path);
+        let _ = std::fs::remove_dir_all(dir);
 
         let err = result.expect_err("hanging audio player should time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
@@ -463,14 +644,15 @@ mod tests {
     #[test]
     fn windows_media_player_reports_invalid_media() {
         let _lock = crate::integration::integration_env_lock();
-        let path = temp_sound_path();
+        let dir = unique_test_dir("invalid-media");
+        let path = dir.join("invalid.mp3");
         std::fs::write(&path, b"not an mp3").unwrap();
         let script = windows_media_player_script_with_timeout(2);
         // Whether the host media stack raises MediaFailed before the playback
         // timeout is environment-dependent, so use a short test-only timer and
         // accept either terminal error instead of the production 15 second wait.
         let output = windows_player_command(&path, &script).output().unwrap();
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
 
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);

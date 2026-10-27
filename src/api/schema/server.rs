@@ -21,6 +21,12 @@ pub struct ServerSshAgentRegisterParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    /// Optional JSON API methods implemented by this server, not the client binary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    /// Managed launcher start and persisted recovery are both supported.
+    #[serde(default)]
+    pub agent_launcher: bool,
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,
@@ -36,4 +42,12 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `terminal.input.open`, `terminal.input.write` and
+    /// `terminal.input.reconcile`.
+    #[serde(default)]
+    pub terminal_input_ack: bool,
+    /// Supports byte-preserving UTF-8 `terminal.input.write_literal` on the
+    /// same acknowledged streams as `terminal.input.write`.
+    #[serde(default)]
+    pub terminal_input_literal: bool,
 }

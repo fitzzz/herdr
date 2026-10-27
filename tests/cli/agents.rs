@@ -1,6 +1,91 @@
 use super::harness::*;
 
 #[test]
+fn agent_launcher_real_api_uses_absolute_command_and_process_env() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("launcher.sock");
+    let receipt = base.join("launcher-receipt.json");
+    let herdr = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\nshell_mode = \"non_login\"\n",
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let ping = send_request(&socket_path, r#"{"id":"ping","method":"ping","params":{}}"#);
+    assert_eq!(ping["result"]["capabilities"]["agent_launcher"], true);
+    assert!(ping["result"]["capabilities"]["methods"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("agent.start_with_launcher")));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || {
+            let info = send_request(&socket_path, &serde_json::json!({"id":"process", "method":"pane.process_info", "params":{"pane_id":pane}}).to_string());
+            info.get("error").is_none()
+        }
+    ));
+    let native = vec!["resume", "same-uuid", "white space", "quote'\"$()`", ""];
+    let launcher = serde_json::json!({"executable":"/usr/bin/python3", "prefix_args":["-c", "import os,sys,json;open(sys.argv[1],'w').write(json.dumps([sys.argv[2:],os.environ['FIXTURE_ACCOUNT'],os.environ['FIXTURE_REQUIRED']]))",receipt], "env":{"FIXTURE_ACCOUNT":"explicit-account","FIXTURE_REQUIRED":"1"}});
+    let request = serde_json::json!({"id":"start", "method":"agent.start_with_launcher", "params":{"name":"launcher-fixture", "kind":"codex", "pane_id":pane, "args":native, "launcher":launcher}});
+    let mut response = send_request(&socket_path, &request.to_string());
+    // A new shell can still be initializing. Retry only an explicit pre-admission busy error.
+    if response["error"]["code"] == "agent_pane_busy" {
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || {
+                response = send_request(&socket_path, &request.to_string());
+                response["error"]["code"] != "agent_pane_busy"
+            }
+        ));
+    }
+    assert_eq!(
+        response["result"]["type"], "agent_started_with_launcher",
+        "{response}"
+    );
+    assert_eq!(response["result"]["launcher"], launcher);
+    let expected: Vec<serde_json::Value> = std::iter::once(launcher["executable"].clone())
+        .chain(launcher["prefix_args"].as_array().unwrap().iter().cloned())
+        .chain(native.iter().map(|arg| serde_json::json!(arg)))
+        .collect();
+    assert_eq!(response["result"]["argv"], serde_json::json!(expected));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || receipt.exists()
+    ));
+    let observed: serde_json::Value = serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        observed,
+        serde_json::json!([native, "explicit-account", "1"])
+    );
+    // No native process has reported this identity, so receipt lookup must not
+    // upgrade this fake executable into a confirmed provider launch.
+    let lookup = send_request(&socket_path, &serde_json::json!({"id":"lookup", "method":"agent.launcher_info", "params":{"target":pane}}).to_string());
+    if lookup.get("error").is_none() {
+        assert_eq!(lookup["result"]["confirmed"], false);
+        assert_eq!(
+            lookup["result"]["binding"]["argv"],
+            response["result"]["argv"]
+        );
+    }
+    cleanup_spawned_herdr(herdr, base);
+}
+
+#[test]
 fn agent_explain_missing_file_reports_json_error() {
     let base = unique_test_dir();
     let missing = base.join("missing-screen.txt");

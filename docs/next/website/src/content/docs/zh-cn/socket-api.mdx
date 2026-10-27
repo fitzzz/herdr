@@ -761,3 +761,29 @@ herdr agent wait w1:p1 --until blocked
 由客户端渲染的 Herdr UI 对本地和 SSH 服务器使用稳定的端点代数。客户端和服务器构建不必一致。连接时，双方会协商核心快照、屏幕、输入和 blob 编解码器，服务器则公布支持的 API 方法和可选能力。已保存的 SSH 机器需要 `surface_interest` 来确保只有选中的机器传输窗格画面，并需要 `health_check` 来发现空闲连接的故障。缺少这些能力的服务器会显示 Attention，直到明确更新。详见[连接机器](/zh-cn/docs/connecting-machines/)。缺少方法时,只禁用该服务器上的对应操作并显示客户端本地通知;操作被拒绝或超时也不会断开连接。只有早于端点第 1 代的服务器需要最后更新一次。
 
 带编号的二进制协议仍用于同一安装内的内部操作,包括直接终端连接和实时交接。跨不同构建使用这些操作前,请检查 `ping` 或 `herdr status`。JSON API 客户端应忽略未知字段,并把不支持的方法当作普通错误处理。
+
+### 外部代理启动器
+
+请从目标服务器的 `ping` 响应确认支持：`result.capabilities.agent_launcher`
+必须为 `true`，且 `result.capabilities.methods` 包含 `agent.start_with_launcher`。
+本地 CLI 模式不能证明服务器支持。缺少能力时仅禁用此操作，不断开连接，也不退回原生启动。
+
+`agent.start_with_launcher` 接收 `name`、原生 `kind`、`pane_id`、`args`、
+可选的 `timeout_ms` 和必需的 `launcher: {executable, prefix_args, env}`。
+可执行文件必须使用绝对路径。实际参数为 `executable + prefix_args + args`，
+环境覆盖只作用于子进程。Herdr 不选择账号，也不解释服务商的身份验证设置。
+
+新响应 `agent_started_with_launcher` 包含 `agent`、实际应用的 `launcher` 和 `argv`。
+它确认已提交启动，不证明原生身份验证成功。旧的 `agent.start` 和 `agent_started` 保持不变。
+
+响应不确定时，先确认支持，再用 `{target}` 调用 `agent.launcher_info`。
+其 `agent_launcher_info` 响应包含 `agent`、可为 null 的 `binding` 和 `confirmed`。
+binding 包含 `kind`、可为 null 的 `session: {kind, value}`、`launcher`、`argv` 和
+`argv_origin`（`admission` 或 `canonical_resume`）。确认要求当前原生报告与服务商进程匹配；
+仅有保存记录不能确认。继续之前必须核对窗格、终端、服务商、原生会话 ID 和完整启动器。
+不明确或不匹配的结果不允许盲目重试或创建替代会话。
+
+同一会话恢复时，启动器包装现有的标准原生恢复参数。只有确认会话被替换才清除绑定，
+暂时缺少观察不会清除。启动器缺失或无效时拒绝恢复。包含启动器的磁盘 JSON 快照使用
+version 4，交接清单使用 version 2；普通记录仍为 3/1。旧程序会拒绝新版本。
+降级前保留原始状态备份，不要删除启动器信息或降低版本号来强制旧程序读取。

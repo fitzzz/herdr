@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
@@ -52,7 +52,10 @@ pub(crate) struct HandoffManifest {
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
-    pub fds: Vec<RawFd>,
+    pub fds: Vec<OwnedFd>,
+    #[cfg(target_os = "linux")]
+    pub identities:
+        Option<std::collections::HashMap<u32, super::handoff_identity::AdmittedPaneIdentity>>,
     pub stream: UnixStream,
 }
 
@@ -227,20 +230,56 @@ pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
 
 #[cfg(unix)]
 pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHandoff> {
+    receive_inner(
+        socket_path,
+        token,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn receive_with_identity(
+    socket_path: &Path,
+    token: &str,
+    attempt: &super::handoff_identity::IdentityAttempt,
+) -> io::Result<ReceivedHandoff> {
+    let result = receive_inner(socket_path, token, Some(attempt));
+    if let Err(error) = &result {
+        attempt.record_error("receive", error);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn receive_inner(
+    socket_path: &Path,
+    token: &str,
+    #[cfg(target_os = "linux")] identity: Option<&super::handoff_identity::IdentityAttempt>,
+) -> io::Result<ReceivedHandoff> {
     let mut stream = UnixStream::connect(socket_path)?;
+    #[cfg(target_os = "linux")]
+    if let Some(attempt) = identity {
+        attempt.verify_peer(&stream)?;
+    }
     stream.write_all(token.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
 
     let manifest_line = read_line_unbuffered(&mut stream)?;
+    #[cfg(target_os = "linux")]
+    let manifest: HandoffManifest = if identity.is_some() {
+        serde_json::from_value(super::handoff_identity::parse_unique_json(
+            manifest_line.as_bytes(),
+        )?)
+        .map_err(io::Error::other)?
+    } else {
+        serde_json::from_str(&manifest_line).map_err(io::Error::other)?
+    };
+    #[cfg(not(target_os = "linux"))]
     let manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
-    if manifest.version != HANDOFF_VERSION {
-        return Err(io::Error::other(format!(
-            "unsupported handoff version {}",
-            manifest.version
-        )));
-    }
+    validate_manifest_format(&manifest)?;
     if manifest
         .expected_protocol
         .is_some_and(|protocol| protocol != crate::protocol::PROTOCOL_VERSION)
@@ -262,12 +301,28 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             crate::build_info::version()
         )));
     }
+    #[cfg(target_os = "linux")]
+    let identities = identity
+        .map(|attempt| attempt.admit(&manifest, manifest_line.as_bytes()))
+        .transpose()?;
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
+    let fds: Vec<OwnedFd> = recv_fds(&stream, manifest.panes.len())?
+        .into_iter()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect();
+    #[cfg(target_os = "linux")]
+    if let Some(attempt) = identity {
+        for fd in &fds {
+            crate::platform::migration_validate_master_fd(fd.as_raw_fd())?;
+        }
+        attempt.verify_processes()?;
+    }
     Ok(ReceivedHandoff {
         manifest,
         fds,
+        #[cfg(target_os = "linux")]
+        identities,
         stream,
     })
 }
@@ -309,7 +364,11 @@ pub(crate) fn manifest_for(
     api_window_title: Option<String>,
 ) -> HandoffManifest {
     HandoffManifest {
-        version: HANDOFF_VERSION,
+        version: if snapshot.has_agent_launcher() {
+            2
+        } else {
+            HANDOFF_VERSION
+        },
         source_version: crate::build_info::version(),
         source_protocol: crate::protocol::PROTOCOL_VERSION,
         expected_version,
@@ -318,6 +377,26 @@ pub(crate) fn manifest_for(
         panes,
         api_window_title,
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn validate_manifest_format(manifest: &HandoffManifest) -> io::Result<()> {
+    manifest
+        .snapshot
+        .validate_launcher_version()
+        .map_err(io::Error::other)?;
+    let required_version = if manifest.snapshot.has_agent_launcher() {
+        2
+    } else {
+        HANDOFF_VERSION
+    };
+    if manifest.version != required_version {
+        return Err(io::Error::other(format!(
+            "unsupported or inconsistent handoff version {}",
+            manifest.version
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -517,6 +596,15 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
     if out.is_empty() {
         return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
     }
+    // Received copies do not inherit their source descriptor's CLOEXEC bit.
+    // Seal the whole batch before restoration can start helper subprocesses,
+    // including copies not yet consumed by an individual PTY actor.
+    for fd in &out {
+        if let Err(error) = crate::pty::fd::set_cloexec(*fd) {
+            close_raw_fds(&out);
+            return Err(error);
+        }
+    }
     Ok(out)
 }
 
@@ -528,6 +616,89 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_launcher_inconsistent_import_rejects_before_descriptor_admission() {
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let path = temp.path().join("handoff.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let sender = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(read_line_unbuffered(&mut stream).unwrap(), "token\n");
+            let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
+            manifest.version = 999;
+            serde_json::to_writer(&mut stream, &manifest).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.is_empty(),
+                "unsupported import must not send validated/receive descriptors"
+            );
+        });
+        let error = receive(&path, "token")
+            .err()
+            .expect("unsupported manifest must fail");
+        assert!(error.to_string().contains("handoff version"));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn agent_launcher_handoff_uses_feature_dependent_version() {
+        let state = crate::app::AppState::test_with_adversarial_identity_state();
+        let mut snapshot = crate::persist::capture(
+            &state.workspaces,
+            &state.terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            state.active,
+            state.selected,
+        );
+        let pane = snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| &mut ws.tabs)
+            .flat_map(|tab| tab.panes.values_mut())
+            .next()
+            .unwrap();
+        pane.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "codex".into(),
+            session: crate::agent_resume::AgentSessionRef::id("same-uuid"),
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/fixture/authority".into(),
+                prefix_args: vec![],
+                env: Default::default(),
+            },
+        });
+        snapshot.version = 4;
+        let mut manifest = manifest_for(snapshot, Vec::new(), None, None, None);
+        assert_eq!(manifest.version, 2);
+        // An old receiver rejects version != 1 before sending validated.
+        assert_ne!(manifest.version, HANDOFF_VERSION);
+        assert!(validate_manifest_format(&manifest).is_ok());
+        manifest.version = 1;
+        assert!(validate_manifest_format(&manifest).is_err());
+        let ordinary = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
+        assert_eq!(ordinary.version, 1);
+        assert!(validate_manifest_format(&ordinary).is_ok());
+    }
+
+    #[test]
+    fn received_handoff_descriptors_are_sealed_before_restore() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let source = std::fs::File::open("/dev/null").unwrap();
+        send_fds(&sender, &[source.as_raw_fd(), source.as_raw_fd()]).unwrap();
+        let received = recv_fds(&receiver, 2).unwrap();
+        assert_eq!(received.len(), 2);
+        for fd in &received {
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        }
+        close_raw_fds(&received);
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

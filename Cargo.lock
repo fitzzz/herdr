@@ -183,6 +183,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cell-damage"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -786,6 +793,7 @@ dependencies = [
  "base64",
  "bincode",
  "bytes",
+ "cell-damage",
  "clap",
  "clap_complete",
  "crossterm",

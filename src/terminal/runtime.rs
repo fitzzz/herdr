@@ -435,6 +435,19 @@ impl TerminalRuntime {
         self.0.visible_hyperlinks(area)
     }
 
+    /// Shared immutable copy of the visible screen; see `crate::pane::TerminalScreen`.
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<crate::pane::TerminalScreen>> {
+        self.0.screen_snapshot()
+    }
+
+    pub(crate) fn release_idle_screen(
+        &self,
+        now: std::time::Instant,
+        retention: std::time::Duration,
+    ) -> bool {
+        self.0.release_idle_screen(now, retention)
+    }
+
     pub(crate) fn link_regions_at(
         &self,
         col: u16,
@@ -476,6 +489,10 @@ impl TerminalRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn input_streams(&self) -> &super::input_streams::TerminalInputStreams {
+        self.0.input_streams()
     }
 
     pub fn queue_user_input_submission(
@@ -592,6 +609,10 @@ impl TerminalRuntime {
 
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
+    }
+
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        self.0.crop_rows_above(view_rows)
     }
 
     pub(crate) fn content_seq(&self) -> u64 {

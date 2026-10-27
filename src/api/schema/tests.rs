@@ -63,6 +63,34 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn agent_observation_epoch_is_optional_and_round_trips_without_counter_changes() {
+    let legacy = serde_json::json!({
+        "terminal_id": "continuing-terminal",
+        "agent_status": "idle",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": false,
+        "state_change_seq": 42,
+        "completion_seq": 42,
+        "revision": 0
+    });
+    let mut agent: AgentInfo = serde_json::from_value(legacy).unwrap();
+    assert!(agent.state_change_epoch.is_none());
+    assert!(serde_json::to_value(&agent)
+        .unwrap()
+        .get("state_change_epoch")
+        .is_none());
+
+    agent.state_change_epoch = Some("migration-token".into());
+    let json = serde_json::to_value(&agent).unwrap();
+    assert_eq!(json["state_change_epoch"], "migration-token");
+    assert_eq!(json["state_change_seq"], 42);
+    assert_eq!(json["completion_seq"], 42);
+    assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), agent);
+}
+
+#[test]
 fn workspace_close_group_intent_defaults_false_and_round_trips() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "id": "close",
@@ -150,6 +178,27 @@ fn agent_start_and_prompt_requests_round_trip() {
         serde_json::from_value::<Request>(prompt_and_wait_json).unwrap(),
         prompt_and_wait
     );
+}
+
+#[test]
+fn agent_launcher_request_requires_descriptor_and_keeps_legacy_shape() {
+    let mut request = serde_json::json!({"id":"launch", "method":"agent.start_with_launcher", "params": {
+        "name":"worker", "kind":"codex", "pane_id":"w1:p1", "args":["resume","same-uuid"],
+        "launcher":{"executable":"/fixture/authority", "prefix_args":["run","codex","--"], "env":{"REQUIRED":"1"}}
+    }});
+    let parsed: Request = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+    request["params"]
+        .as_object_mut()
+        .unwrap()
+        .remove("launcher");
+    assert!(serde_json::from_value::<Request>(request.clone()).is_err());
+    request["method"] = "agent.start".into();
+    assert!(serde_json::from_value::<Request>(request).is_ok());
+    let old: ServerCapabilities =
+        serde_json::from_value(serde_json::json!({"live_handoff":false})).unwrap();
+    assert!(!old.agent_launcher);
+    assert!(old.methods.is_empty());
 }
 
 #[test]
@@ -721,12 +770,16 @@ fn success_response_round_trips() {
             version: "0.1.2".into(),
             protocol: 6,
             capabilities: Some(ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_input_ack: false,
+                terminal_input_literal: false,
             }),
         },
     };

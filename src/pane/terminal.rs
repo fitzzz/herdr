@@ -16,9 +16,20 @@ use crate::layout::PaneId;
 use crate::protocol::CellData;
 
 #[cfg(test)]
+mod full_render_parity_tests;
+#[cfg(test)]
 mod migration_tests;
+mod screen;
+mod screen_extract;
+#[cfg(test)]
+mod screen_tests;
+#[cfg(test)]
+mod terminal_cells_eligibility_tests;
 #[cfg(windows)]
 mod windows_recent_fallback;
+
+pub(crate) use screen::TerminalScreen;
+pub(crate) use screen_extract::IDLE_SCREEN_RETENTION;
 
 #[cfg(test)]
 use super::cursor::CURSOR_POSITION_SETTLE;
@@ -53,6 +64,34 @@ pub struct ScrollMetrics {
     pub offset_from_bottom: usize,
     pub max_offset_from_bottom: usize,
     pub viewport_rows: usize,
+}
+
+/// Terminal viewport rows hidden above a view `view_rows` tall. Nonzero only
+/// when another client holds the PTY taller than this view. A live view
+/// follows the cursor, or keeps the bottom when the cursor is outside the
+/// viewport. A scrolled-back view depends only on the viewport's position in
+/// history, so new output does not move it, and it reaches the oldest row.
+pub(crate) fn crop_rows_above(
+    screen_rows: u16,
+    view_rows: u16,
+    cursor_row: Option<u16>,
+    scroll: Option<ScrollMetrics>,
+) -> u16 {
+    // A view shorter than Herdr's minimum PTY got that grid from Herdr
+    // itself and keeps drawing its top rows.
+    if screen_rows <= view_rows.max(super::MIN_PTY_ROWS) {
+        return 0;
+    }
+    let max = screen_rows - view_rows;
+    if let Some(scroll) = scroll.filter(|scroll| scroll.offset_from_bottom > 0) {
+        let viewport_top = scroll
+            .max_offset_from_bottom
+            .saturating_sub(scroll.offset_from_bottom);
+        return u16::try_from(viewport_top).unwrap_or(u16::MAX).min(max);
+    }
+    cursor_row.map_or(max, |row| {
+        row.saturating_add(1).saturating_sub(view_rows).min(max)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,6 +147,8 @@ pub struct TerminalCursorState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TerminalDirtyPatch {
     pub rows: Vec<(u16, Vec<CellData>)>,
+    /// OSC 8 URIs that the cells' `hyperlink` indices refer to.
+    pub hyperlinks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +235,9 @@ pub(crate) struct GhosttyPaneTerminal {
 pub(crate) struct GhosttyPaneCore {
     #[cfg(test)]
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
+    /// Screen rows read from Ghostty since creation, for operation-count tests.
+    #[cfg(test)]
+    rows_extracted: u64,
     pub terminal: crate::ghostty::Terminal,
     synchronized_output_epoch: u64,
     #[cfg(windows)]
@@ -214,6 +258,14 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Retained display snapshot; the only consumer of render dirty flags.
+    screen: Option<Arc<TerminalScreen>>,
+    screen_used_at: Instant,
+    patch_baseline: Option<screen_extract::PatchBaseline>,
+    /// Some view drew this grid from below its top row since the last dirty
+    /// patch. Row patches address grid rows from the top, so the next patch
+    /// consumer must take a full frame instead.
+    cropped_view_drawn: bool,
 }
 
 pub(crate) struct PaneTerminal {
@@ -539,6 +591,10 @@ impl PaneTerminal {
         self.ghostty.render(frame, area, show_cursor);
     }
 
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        self.ghostty.crop_rows_above(view_rows)
+    }
+
     pub fn collect_dirty_patch(
         &self,
         area_width: u16,
@@ -549,6 +605,14 @@ impl PaneTerminal {
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
         self.ghostty.visible_hyperlinks(area)
+    }
+
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<TerminalScreen>> {
+        self.ghostty.screen_snapshot()
+    }
+
+    pub(crate) fn release_idle_screen(&self, now: Instant, retention: Duration) -> bool {
+        self.ghostty.release_idle_screen(now, retention)
     }
 
     pub(crate) fn link_regions_at(
@@ -1175,6 +1239,8 @@ impl GhosttyPaneTerminal {
             core: Mutex::new(GhosttyPaneCore {
                 #[cfg(test)]
                 dirty_collection_hook: None,
+                #[cfg(test)]
+                rows_extracted: 0,
                 terminal,
                 synchronized_output_epoch: 0,
                 #[cfg(windows)]
@@ -1195,6 +1261,10 @@ impl GhosttyPaneTerminal {
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
+                screen: None,
+                screen_used_at: Instant::now(),
+                patch_baseline: None,
+                cropped_view_drawn: false,
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
@@ -1805,17 +1875,23 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn scroll_metrics(&self) -> Option<ScrollMetrics> {
-        let Ok(core) = self.core.lock() else {
-            return None;
+        let core = self.core.lock().ok()?;
+        ghostty_scroll_metrics(&core.terminal)
+    }
+
+    /// Viewport rows hidden above a view `view_rows` tall; see `crop_rows_above`.
+    pub(crate) fn crop_rows_above(&self, view_rows: u16) -> u16 {
+        let Ok(mut core) = self.core.lock() else {
+            return 0;
         };
-        let scrollbar = core.terminal.scrollbar().ok()?;
-        Some(ScrollMetrics {
-            offset_from_bottom: scrollbar
-                .total
-                .saturating_sub(scrollbar.offset + scrollbar.len),
-            max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
-            viewport_rows: scrollbar.len,
-        })
+        let Ok(rows) = core.terminal.rows() else {
+            return 0;
+        };
+        if rows <= view_rows {
+            return 0;
+        }
+        let cursor_row = current_cursor_state(&mut core).map(|cursor| cursor.y);
+        ghostty_crop_rows_above(&mut core, rows, view_rows, cursor_row)
     }
 
     pub fn keyboard_protocol(&self) -> Option<crate::input::KeyboardProtocol> {
@@ -2320,11 +2396,51 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
-        self.core
-            .lock()
-            .ok()
-            .and_then(|mut core| ghostty_visible_hyperlinks(&mut core, area).ok())
-            .unwrap_or_default()
+        let Ok(mut core) = self.core.lock() else {
+            return Vec::new();
+        };
+        if screen_extract::screen_snapshot_enabled() {
+            if let Ok(screen) = screen_extract::refresh_screen(&mut core) {
+                let rows_above = ghostty_crop_rows_above(
+                    &mut core,
+                    screen.rows,
+                    area.height,
+                    screen.cursor.map(|cursor| cursor.y),
+                );
+                drop(core);
+                return screen.visible_hyperlinks(area, rows_above);
+            }
+        }
+        ghostty_visible_hyperlinks(&mut core, area).unwrap_or_default()
+    }
+
+    /// The pane's current screen, refreshed from dirty rows. None while
+    /// synchronized output is active or when the snapshot path is disabled.
+    pub(crate) fn screen_snapshot(&self) -> Option<Arc<TerminalScreen>> {
+        if !screen_extract::screen_snapshot_enabled() {
+            return None;
+        }
+        let mut core = self.core.lock().ok()?;
+        if core
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        screen_extract::refresh_screen(&mut core).ok()
+    }
+
+    /// Drops the retained screen if nobody read it within `retention`.
+    /// Skips a busy core; the next sweep retries.
+    pub(crate) fn release_idle_screen(&self, now: Instant, retention: Duration) -> bool {
+        self.try_lock_core()
+            .is_some_and(|mut core| screen_extract::release_idle_screen(&mut core, now, retention))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn screen_is_retained(&self) -> bool {
+        self.core.lock().is_ok_and(|core| core.screen.is_some())
     }
 
     pub(crate) fn kitty_graphics_may_have_placements(&self) -> bool {
@@ -2362,9 +2478,58 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        if !screen_extract::screen_snapshot_enabled() {
+            return self.render_legacy(frame, area, show_cursor);
+        }
+        let lock_started = crate::render_prof::timer();
+        let (screen, cursor, rows_above) = {
+            let Ok(mut core) = self.core.lock() else {
+                return;
+            };
+            crate::render_prof::duration_since("full_viewport.core_lock_wait", lock_started);
+            if core
+                .terminal
+                .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let Ok(screen) = screen_extract::refresh_screen(&mut core) else {
+                drop(core);
+                return self.render_legacy(frame, area, show_cursor);
+            };
+            let cursor = show_cursor
+                .then(|| effective_cursor_state(&mut core, screen.cursor))
+                .flatten();
+            let rows_above = ghostty_crop_rows_above(
+                &mut core,
+                screen.rows,
+                area.height,
+                screen.cursor.map(|cursor| cursor.y),
+            );
+            (screen, cursor, rows_above)
+        };
+        // The core lock is released; writing cells only reads the snapshot.
+        let write_started = crate::render_prof::timer();
+        screen.write_to_buffer(frame.buffer_mut(), area, rows_above);
+        crate::render_prof::duration_since("full_viewport.conversion", write_started);
+        if let Some(cursor) = cursor.filter(|cursor| cursor.visible) {
+            if let Some(y) = cursor.y.checked_sub(rows_above) {
+                if cursor.x < area.width && y < area.height {
+                    frame.set_cursor_position((area.x + cursor.x, area.y + y));
+                }
+            }
+        }
+    }
+
+    fn render_legacy(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        let mut profile = crate::render_prof::timer().map(FullViewportProfile::new);
         let Ok(mut core) = self.core.lock() else {
             return;
         };
+        if let Some(profile) = profile.as_mut() {
+            profile.lock_wait = Some(profile.started.elapsed());
+        }
         if core
             .terminal
             .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
@@ -2379,6 +2544,7 @@ impl GhosttyPaneTerminal {
             terminal,
             render_state,
             decscusr_tracker,
+            cropped_view_drawn,
             ..
         } = &mut *core;
         if render_state.update(terminal).is_err() {
@@ -2396,6 +2562,21 @@ impl GhosttyPaneTerminal {
             .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
         let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
 
+        let rows_above = match render_state.rows() {
+            Ok(rows) if rows > area.height => crop_rows_above(
+                rows,
+                area.height,
+                cursor_state_from_render_state(render_state, decscusr_tracker)
+                    .map(|cursor| cursor.y),
+                ghostty_scroll_metrics(terminal),
+            ),
+            _ => 0,
+        };
+        *cropped_view_drawn |= rows_above > 0;
+
+        if let Some(profile) = profile.as_mut() {
+            profile.conversion_started = Some(Instant::now());
+        }
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
             Err(_) => return,
@@ -2412,6 +2593,11 @@ impl GhosttyPaneTerminal {
             };
             let mut grapheme_bytes = Vec::new();
             let mut symbol_scratch = String::new();
+            for _ in 0..rows_above {
+                if !rows.next() {
+                    break;
+                }
+            }
             let mut y = 0u16;
             while y < area.height && rows.next() {
                 let mut cells = match rows.populate_cells(&mut row_cells) {
@@ -2420,6 +2606,13 @@ impl GhosttyPaneTerminal {
                 };
                 let mut x = 0u16;
                 while x < area.width && cells.next() {
+                    if let Some(profile) = profile.as_mut() {
+                        match cells.is_default_blank() {
+                            Ok(true) => profile.blank_cells += 1,
+                            Ok(false) => profile.nonblank_cells += 1,
+                            Err(_) => profile.blank_read_errors += 1,
+                        }
+                    }
                     let basic = cells.basic_data().unwrap_or_default();
                     let style = ghostty_cell_style(
                         &cells,
@@ -2451,6 +2644,9 @@ impl GhosttyPaneTerminal {
                     x += 1;
                 }
                 while x < area.width {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.padding_cells += 1;
+                    }
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                     x += 1;
@@ -2459,6 +2655,9 @@ impl GhosttyPaneTerminal {
             }
             while y < area.height {
                 for x in 0..area.width {
+                    if let Some(profile) = profile.as_mut() {
+                        profile.padding_cells += 1;
+                    }
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
                 }
@@ -2466,15 +2665,21 @@ impl GhosttyPaneTerminal {
             }
         }
 
-        ghostty_clear_render_dirty(render_state, area.height);
+        if let Some(profile) = profile.as_mut() {
+            profile.conversion_elapsed =
+                profile.conversion_started.map(|started| started.elapsed());
+        }
+        ghostty_clear_render_dirty(render_state, area.height.saturating_add(rows_above));
 
         let current_cursor = cursor_state_from_render_state(render_state, decscusr_tracker);
         if show_cursor {
             if let Some(cursor) =
                 effective_cursor_state(&mut core, current_cursor).filter(|cursor| cursor.visible)
             {
-                if cursor.x < area.width && cursor.y < area.height {
-                    frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+                if let Some(y) = cursor.y.checked_sub(rows_above) {
+                    if cursor.x < area.width && y < area.height {
+                        frame.set_cursor_position((area.x + cursor.x, area.y + y));
+                    }
                 }
             }
         }
@@ -2500,9 +2705,65 @@ impl GhosttyPaneTerminal {
                 if let Some(hook) = core.dirty_collection_hook.take() {
                     hook();
                 }
-                ghostty_collect_dirty_patch(&mut core, area_width, area_height)
+                if std::mem::take(&mut core.cropped_view_drawn) {
+                    crate::render_prof::event("dirty_fallback.cropped_view_drawn");
+                    core.patch_baseline = None;
+                    return TerminalDirtyPatchOutcome::Fallback;
+                }
+                if screen_extract::screen_snapshot_enabled() {
+                    screen_extract::screen_dirty_patch(&mut core, area_width, area_height)
+                } else {
+                    ghostty_collect_dirty_patch(&mut core, area_width, area_height)
+                }
             })
             .unwrap_or(TerminalDirtyPatchOutcome::Fallback)
+    }
+}
+
+// Declared before the core lock in render(), so metrics publish after that lock
+// drops, including early exits. Disabled profiling performs no blank-cell probes.
+struct FullViewportProfile {
+    started: Instant,
+    lock_wait: Option<Duration>,
+    conversion_started: Option<Instant>,
+    conversion_elapsed: Option<Duration>,
+    blank_cells: u64,
+    nonblank_cells: u64,
+    blank_read_errors: u64,
+    padding_cells: u64,
+}
+
+impl FullViewportProfile {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            lock_wait: None,
+            conversion_started: None,
+            conversion_elapsed: None,
+            blank_cells: 0,
+            nonblank_cells: 0,
+            blank_read_errors: 0,
+            padding_cells: 0,
+        }
+    }
+}
+
+impl Drop for FullViewportProfile {
+    fn drop(&mut self) {
+        crate::render_prof::duration(
+            "full_viewport.core_lock_wait",
+            self.lock_wait.unwrap_or_else(|| self.started.elapsed()),
+        );
+        if let Some(started) = self.conversion_started {
+            crate::render_prof::duration(
+                "full_viewport.conversion",
+                self.conversion_elapsed.unwrap_or_else(|| started.elapsed()),
+            );
+        }
+        crate::render_prof::counter("full_viewport.blank_cells", self.blank_cells);
+        crate::render_prof::counter("full_viewport.nonblank_cells", self.nonblank_cells);
+        crate::render_prof::counter("full_viewport.blank_read_errors", self.blank_read_errors);
+        crate::render_prof::counter("full_viewport.padding_cells", self.padding_cells);
     }
 }
 
@@ -2548,6 +2809,38 @@ fn render_delay_after_pty_write(
             .flatten();
         cursor_delay.max(has_kitty_graphics_sequence.then_some(KITTY_GRAPHICS_REDRAW_SETTLE))
     }
+}
+
+fn ghostty_scroll_metrics(terminal: &crate::ghostty::Terminal) -> Option<ScrollMetrics> {
+    let scrollbar = terminal.scrollbar().ok()?;
+    Some(ScrollMetrics {
+        offset_from_bottom: scrollbar
+            .total
+            .saturating_sub(scrollbar.offset + scrollbar.len),
+        max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+        viewport_rows: scrollbar.len,
+    })
+}
+
+/// `crop_rows_above` with the scroll position read under the held core lock.
+/// Reads the scrollbar only when the grid is taller than the view.
+fn ghostty_crop_rows_above(
+    core: &mut GhosttyPaneCore,
+    screen_rows: u16,
+    view_rows: u16,
+    cursor_row: Option<u16>,
+) -> u16 {
+    if screen_rows <= view_rows {
+        return 0;
+    }
+    let rows_above = crop_rows_above(
+        screen_rows,
+        view_rows,
+        cursor_row,
+        ghostty_scroll_metrics(&core.terminal),
+    );
+    core.cropped_view_drawn |= rows_above > 0;
+    rows_above
 }
 
 fn current_cursor_state(core: &mut GhosttyPaneCore) -> Option<TerminalCursorState> {
@@ -2761,7 +3054,8 @@ fn ghostty_collect_dirty_patch(
     }
 
     finish!(TerminalDirtyPatchOutcome::Patch(TerminalDirtyPatch {
-        rows: patch_rows
+        rows: patch_rows,
+        hyperlinks: Vec::new(),
     }));
 }
 
@@ -2772,12 +3066,31 @@ fn ghostty_visible_hyperlinks(
     let GhosttyPaneCore {
         terminal,
         render_state,
+        decscusr_tracker,
+        cropped_view_drawn,
         ..
     } = core;
     render_state.update(terminal)?;
+    let screen_rows = render_state.rows()?;
+    let rows_above = if screen_rows > area.height {
+        crop_rows_above(
+            screen_rows,
+            area.height,
+            cursor_state_from_render_state(render_state, decscusr_tracker).map(|cursor| cursor.y),
+            ghostty_scroll_metrics(terminal),
+        )
+    } else {
+        0
+    };
+    *cropped_view_drawn |= rows_above > 0;
     let mut row_iterator = crate::ghostty::RowIterator::new()?;
     let mut row_cells = crate::ghostty::RowCells::new()?;
     let mut rows = render_state.populate_row_iterator(&mut row_iterator)?;
+    for _ in 0..rows_above {
+        if !rows.next() {
+            break;
+        }
+    }
     let mut links = Vec::new();
     let mut y = 0u16;
     while y < area.height && rows.next() {
@@ -2785,7 +3098,7 @@ fn ghostty_visible_hyperlinks(
         let mut x = 0u16;
         while x < area.width && cells.next() {
             if cells.has_hyperlink()? {
-                if let Some(uri) = terminal.viewport_hyperlink_uri(x, y.into())? {
+                if let Some(uri) = terminal.viewport_hyperlink_uri(x, (y + rows_above).into())? {
                     links.push(((area.x + x, area.y + y), ghostty_cell_symbol(&cells)?, uri));
                 }
             }
@@ -3545,6 +3858,7 @@ fn terminal_theme_color(color: crate::ghostty::RgbColor) -> crate::terminal_them
 // host makes it resolve against the host's own palette, discarding the redefinition.
 // Only overridden entries become RGB; the rest stay indexed and keep following the
 // host theme. None when nothing was redefined, which is the common case.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PaletteOverrides([Option<crate::ghostty::RgbColor>; 256]);
 
 impl PaletteOverrides {
@@ -3633,6 +3947,48 @@ mod tests {
     use super::*;
     use ratatui::{layout::Rect, style::Color};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn crop_rows_above_follows_the_cursor_of_a_live_view_taller_than_it() {
+        let live = Some(ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 200,
+            viewport_rows: 109,
+        });
+        // The grid fits: nothing is hidden, wherever the cursor is.
+        assert_eq!(crop_rows_above(60, 60, Some(59), live), 0);
+        assert_eq!(crop_rows_above(40, 60, Some(39), live), 0);
+        // A one-row pane always gets Herdr's two-row minimum PTY.
+        assert_eq!(
+            crop_rows_above(crate::pane::MIN_PTY_ROWS, 1, Some(1), live),
+            0
+        );
+        assert_eq!(crop_rows_above(3, 1, Some(2), live), 2);
+        // A 109-row grid in a 60-row view.
+        assert_eq!(crop_rows_above(109, 60, Some(108), live), 49);
+        assert_eq!(crop_rows_above(109, 60, Some(70), live), 11);
+        assert_eq!(crop_rows_above(109, 60, Some(30), live), 0);
+        // No cursor in the viewport keeps the bottom.
+        assert_eq!(crop_rows_above(109, 60, None, live), 49);
+        assert_eq!(crop_rows_above(109, 60, None, None), 49);
+    }
+
+    #[test]
+    fn crop_rows_above_of_a_scrolled_back_view_tracks_the_viewport_position_only() {
+        let scrolled = |offset_from_bottom| {
+            Some(ScrollMetrics {
+                offset_from_bottom,
+                max_offset_from_bottom: 200,
+                viewport_rows: 109,
+            })
+        };
+        // The cursor does not matter once scrolled back.
+        assert_eq!(crop_rows_above(109, 60, Some(20), scrolled(5)), 49);
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(5)), 49);
+        // Near the oldest row the hidden rows shrink to reach it.
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(190)), 10);
+        assert_eq!(crop_rows_above(109, 60, None, scrolled(200)), 0);
+    }
 
     #[test]
     fn plain_page_keys_host_scroll_for_shell_like_decckm_with_bracketed_paste() {

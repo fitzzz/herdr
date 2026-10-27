@@ -810,6 +810,168 @@ async fn oversized_inline_trims_largest_and_sends_fitting_asset_without_retry_sp
 }
 
 #[tokio::test]
+async fn writer_recovery_unproducible_graphics_metadata_waits_for_representable_shape() {
+    let (mut server, _control, _frames, pane) = retained_test_server_with_control(
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    let writer = ClientWriter::test_paused();
+    let client = server.clients.get_mut(&1).unwrap();
+    client.writer = Some(writer.clone());
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    client.direct_graphics = false;
+    server.app.state.kitty_graphics_enabled = true;
+    server.render_and_stream();
+    let baseline = server.clients[&1]
+        .render_state
+        .last_pane_surface()
+        .unwrap()
+        .clone();
+    let _ = drain_native_render_messages(&writer);
+    write_shared_test_pane(&mut server, pane, b"\x1b[2;1HCHANGED");
+    server.clients.get_mut(&1).unwrap().shell_graphics_delivery = DeliveryCache::default();
+    server.clients.get_mut(&1).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 });
+    server.test_render_frame_limit = 1000;
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    assert!(server.render_recoveries_waiting_for_change.contains_key(&1));
+    assert_eq!(
+        server.clients[&1].render_state.last_pane_surface(),
+        Some(&baseline)
+    );
+    assert!(drain_native_render_messages(&writer)
+        .iter()
+        .all(|message| !matches!(
+            message,
+            ServerMessage::PaneSurface(_) | ServerMessage::GraphicsFile { .. }
+        )));
+    let attempts = server.render_recovery_attempts;
+    server.app.render_dirty.take();
+    for _ in 0..15 {
+        assert!(!server.has_pending_presentation_work(false, false));
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(server.render_recovery_attempts, attempts);
+    server.clients.get_mut(&1).unwrap().terminal_size = (1, 1);
+    assert!(server.has_pending_presentation_work(false, false));
+    assert!(server.render_pending_work(false, false, &HashSet::new()));
+    let represented = drain_native_render_messages(&writer);
+    assert!(represented
+        .iter()
+        .any(|message| matches!(message, ServerMessage::PaneSurface(_))));
+    assert!(server.pending_render_recoveries.is_empty());
+    assert!(server.render_recoveries_waiting_for_change.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn writer_recovery_native_transfer_waits_for_ack_or_expiry_without_dense_polling() {
+    for acknowledge in [true, false] {
+        let mut server = test_headless_server();
+        let (_control, frames) = add_client(&mut server, 7);
+        let (_path, transfer, image) = prepare_and_commit(&mut server, 7);
+        server.clients.get_mut(&7).unwrap().defer_full_render();
+        server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 7 });
+        server.app.render_dirty.take();
+        assert!(!server.has_pending_presentation_work(false, false));
+        for _ in 0..15 {
+            assert!(!server.render_pending_work(false, false, &HashSet::new()));
+        }
+        assert_eq!(server.render_recovery_attempts, 0);
+        assert!(server.pending_render_recoveries.contains(&7));
+        assert_eq!(server.clients[&7].deferred_render(), DeferredRender::Full);
+        assert!(server.native_graphics.is_pending(7));
+        assert!(frames.try_recv().is_err());
+
+        let full = if acknowledge {
+            assert!(native_started(&mut server, 7, transfer, image));
+            native_result(&mut server, 7, transfer, image, true)
+        } else {
+            server.expire_native_graphics(Instant::now() + Duration::from_secs(120))
+        };
+        assert!(!server.native_graphics.is_pending(7));
+        assert!(server.has_pending_presentation_work(full, false));
+        assert!(server.render_pending_work(full, false, &HashSet::new()));
+        let _ = recv_pane_surface(&frames, "native completion recovery");
+        assert!(server.pending_render_recoveries.is_empty());
+        assert_eq!(server.clients[&7].deferred_render(), DeferredRender::None);
+    }
+}
+
+#[tokio::test]
+async fn writer_recovery_native_geometry_change_retires_transfer_before_quiet_recovery() {
+    let (mut server, _control, _frames, pane) = retained_test_server_with_control(
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=1,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    let writer = ClientWriter::test_paused();
+    let client = server.clients.get_mut(&1).unwrap();
+    client.writer = Some(writer.clone());
+    client.mode = ClientConnectionMode::ClientShell;
+    client.render_state =
+        crate::server::render_stream::ClientRenderState::new(RenderEncoding::SemanticFrame);
+    client.cell_size = crate::kitty_graphics::HostCellSize {
+        width_px: 10,
+        height_px: 20,
+    };
+    client.direct_graphics = true;
+    client.pixel_mouse = true;
+    server.app.state.kitty_graphics_enabled = true;
+    server.render_and_stream();
+    let initial = drain_native_render_messages(&writer);
+    let (transfer, image) = initial
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::GraphicsFile {
+                transfer_id,
+                image_id,
+                ..
+            } => Some((*transfer_id, *image_id)),
+            _ => None,
+        })
+        .expect("native file");
+    assert!(native_started(&mut server, 1, transfer, image));
+    server.clients.get_mut(&1).unwrap().defer_full_render();
+    server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 });
+    for _ in 0..15 {
+        assert!(!server.render_pending_work(false, false, &HashSet::new()));
+    }
+    assert_eq!(server.render_recovery_attempts, 0);
+    write_shared_test_pane(
+        &mut server,
+        pane,
+        b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=2,r=1,q=2;/wAA/w==\x1b\\",
+    );
+    server.app.render_dirty.take();
+    assert!(server.render_pending_work(false, false, &HashSet::from([pane])));
+    assert!(!server.native_graphics.is_pending(1));
+    assert!(server.pending_render_recoveries.contains(&1));
+    assert!(server.app.render_dirty.has_immediate_work());
+    let retired = drain_native_render_messages(&writer);
+    assert!(retired.iter().any(|message| matches!(message,
+        ServerMessage::GraphicsTransmissionRetired { transfer_id, image_id }
+            if *transfer_id == transfer && *image_id == image)));
+    assert!(!native_result(&mut server, 1, transfer, image, true));
+    assert!(server.render_pending_work(true, false, &HashSet::new()));
+    let recovered = drain_native_render_messages(&writer);
+    let surface = recovered
+        .iter()
+        .find_map(|message| match message {
+            ServerMessage::PaneSurface(surface) => Some(surface),
+            _ => None,
+        })
+        .expect("quiet inline recovery");
+    assert_eq!(surface.graphics.placements[0].cols, 2);
+    assert_eq!(surface.graphics.assets[0].data, [255, 0, 0, 255]);
+    assert!(server.pending_render_recoveries.is_empty());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn quiet_native_producer_geometry_retirement_schedules_full_inline_recovery() {
     for retained in [false, true] {
         let (mut server, _control, _render, pane) = retained_test_server_with_control(

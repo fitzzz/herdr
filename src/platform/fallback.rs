@@ -186,6 +186,14 @@ pub(crate) fn interactive_shell_accepts_line(_command: &str, _shell_name: &str) 
     true
 }
 
+pub(crate) fn agent_launcher_command(
+    _argv: &[String],
+    _env: &std::collections::BTreeMap<String, String>,
+    _shell: &str,
+) -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(

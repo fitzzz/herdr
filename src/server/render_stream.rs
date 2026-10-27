@@ -4,11 +4,12 @@ use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::layout::{Position, Rect, Size};
 
 use crate::app::state::AppState;
-use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
+use crate::protocol::render_ansi::RowRevisions;
 use crate::protocol::{
     CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePatch, RenderEncoding, ServerMessage,
     SurfaceGraphicsAssetKey, SurfaceGraphicsScene, TerminalFrame,
 };
+use crate::server::terminal_encoder::{TerminalEncoded, TerminalEncoder};
 use crate::terminal::TerminalRuntimeRegistry;
 
 /// Per-client render baseline for the negotiated render encoding.
@@ -22,9 +23,10 @@ pub(crate) enum ClientRenderState {
         surface_scroll: bool,
         recompute_pending: bool,
     },
-    /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
+    /// Direct terminal clients keep a terminal diff encoder (ANSI, or negotiated
+    /// terminal cells) and sequence number.
     TerminalAnsi {
-        blit_encoder: BlitEncoder,
+        encoder: TerminalEncoder,
         seq: u64,
         repaint_pending: bool,
     },
@@ -42,7 +44,7 @@ impl ClientRenderState {
                 recompute_pending: false,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
-                blit_encoder: BlitEncoder::new(),
+                encoder: TerminalEncoder::ansi(),
                 seq: 0,
                 repaint_pending: false,
             },
@@ -58,6 +60,16 @@ impl ClientRenderState {
     pub(crate) fn enable_surface_delta(&mut self, enabled: bool) {
         if let Self::Semantic { surface_delta, .. } = self {
             *surface_delta = enabled;
+        }
+    }
+
+    /// Switches a direct terminal client that has not received a frame to terminal cells.
+    pub(crate) fn enable_terminal_cells(&mut self) -> bool {
+        match self {
+            Self::TerminalAnsi {
+                encoder, seq: 0, ..
+            } => encoder.enable_cells(),
+            _ => false,
         }
     }
 
@@ -94,11 +106,11 @@ impl ClientRenderState {
         match self {
             Self::Semantic { last_surface, .. } => *last_surface = None,
             Self::TerminalAnsi {
-                blit_encoder,
+                encoder,
                 repaint_pending,
                 ..
             } => {
-                *blit_encoder = BlitEncoder::new();
+                encoder.reset();
                 *repaint_pending = false;
             }
         }
@@ -113,39 +125,75 @@ impl ClientRenderState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
+        self.prepare_frame_with_revisions(frame, None)
+    }
+
+    /// `revisions`, from the retained terminal screen, lets row damage skip
+    /// rows the committed frame already has.
+    pub(crate) fn prepare_frame_with_revisions(
+        &mut self,
+        frame: FrameData,
+        revisions: Option<RowRevisions>,
+    ) -> Option<PreparedRender> {
         match self {
             Self::Semantic { .. } => None,
             Self::TerminalAnsi {
-                blit_encoder,
+                encoder,
                 seq,
                 repaint_pending,
             } => {
-                if !*repaint_pending && blit_encoder.is_current(&frame) {
+                if !*repaint_pending && encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
-                let mut encoded = blit_encoder.encode(&frame, *repaint_pending);
-                crate::render_prof::event("prepare_frame.ansi.changed");
-                crate::render_prof::counter("prepare_frame.ansi.bytes", encoded.bytes.len() as u64);
-                if encoded.full {
+                let mut encoded = match revisions {
+                    Some(revisions) => encoder.encode_with_row_revisions(
+                        &frame,
+                        *repaint_pending,
+                        *seq + 1,
+                        *seq,
+                        revisions,
+                    ),
+                    None => encoder.encode(&frame, *repaint_pending, *seq + 1, *seq),
+                };
+                if encoded.full() {
                     crate::render_prof::event("prepare_frame.ansi.full");
                 } else {
                     crate::render_prof::event("prepare_frame.ansi.partial");
                 }
-                insert_graphics_before_sync_end(&mut encoded.bytes, &frame.graphics);
-                crate::render_prof::counter(
-                    "prepare_frame.graphics.bytes",
-                    frame.graphics.len() as u64,
-                );
+                let message = match &mut encoded {
+                    TerminalEncoded::Ansi(encoded) => {
+                        crate::render_prof::event("prepare_frame.ansi.changed");
+                        crate::render_prof::counter(
+                            "prepare_frame.ansi.bytes",
+                            encoded.bytes.len() as u64,
+                        );
+                        insert_graphics_before_sync_end(&mut encoded.bytes, &frame.graphics);
+                        crate::render_prof::counter(
+                            "prepare_frame.graphics.bytes",
+                            frame.graphics.len() as u64,
+                        );
+                        ServerMessage::Terminal(TerminalFrame {
+                            seq: *seq + 1,
+                            width: frame.width,
+                            height: frame.height,
+                            full: encoded.full,
+                            bytes: encoded.bytes.clone(),
+                        })
+                    }
+                    TerminalEncoded::Cells(encoded) => {
+                        crate::render_prof::event("prepare_frame.cells.changed");
+                        crate::render_prof::counter(
+                            "prepare_frame.cells.bytes",
+                            encoded.bytes.len() as u64,
+                        );
+                        crate::protocol::terminal_cells::frame_message(&encoded.bytes)
+                    }
+                };
                 Some(PreparedRender::TerminalAnsi {
-                    message: ServerMessage::Terminal(TerminalFrame {
-                        seq: *seq + 1,
-                        width: frame.width,
-                        height: frame.height,
-                        full: encoded.full,
-                        bytes: encoded.bytes.clone(),
-                    }),
+                    message,
                     frame,
                     encoded: Some(encoded),
                 })
@@ -158,6 +206,53 @@ impl ClientRenderState {
             Self::Semantic { last_surface, .. } => last_surface.as_deref(),
             Self::TerminalAnsi { .. } => None,
         }
+    }
+
+    /// Only a committed, current-size ANSI baseline can accept terminal row damage.
+    pub(crate) fn last_terminal_frame(&self) -> Option<&FrameData> {
+        match self {
+            Self::TerminalAnsi {
+                encoder,
+                repaint_pending: false,
+                ..
+            } => encoder.last_frame(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn prepare_terminal_patch(
+        &self,
+        rows: Vec<crate::protocol::PaneSurfacePatchRow>,
+        cursor: Option<CursorState>,
+    ) -> Option<PreparedRender> {
+        let Self::TerminalAnsi {
+            encoder,
+            seq,
+            repaint_pending: false,
+        } = self
+        else {
+            return None;
+        };
+        let frame = encoder.last_frame()?;
+        let encoded = encoder.encode_patch(&rows, cursor.clone(), *seq + 1, *seq)?;
+        let message = match &encoded {
+            TerminalEncoded::Ansi(encoded) => ServerMessage::Terminal(TerminalFrame {
+                seq: *seq + 1,
+                width: frame.width,
+                height: frame.height,
+                full: false,
+                bytes: encoded.bytes.clone(),
+            }),
+            TerminalEncoded::Cells(encoded) => {
+                crate::protocol::terminal_cells::frame_message(&encoded.bytes)
+            }
+        };
+        Some(PreparedRender::TerminalAnsiPatch {
+            message,
+            rows,
+            cursor,
+            encoded,
+        })
     }
 
     #[cfg(test)]
@@ -319,7 +414,7 @@ impl ClientRenderState {
             }
             (
                 Self::TerminalAnsi {
-                    blit_encoder,
+                    encoder,
                     seq,
                     repaint_pending,
                 },
@@ -329,7 +424,25 @@ impl ClientRenderState {
                     ..
                 },
             ) => {
-                blit_encoder.commit(frame, encoded);
+                encoder.commit(frame, encoded);
+                *seq += 1;
+                *repaint_pending = false;
+            }
+            (
+                Self::TerminalAnsi {
+                    encoder,
+                    seq,
+                    repaint_pending,
+                },
+                PreparedRender::TerminalAnsiPatch {
+                    rows,
+                    cursor,
+                    encoded,
+                    ..
+                },
+            ) => {
+                let committed = encoder.commit_patch(&rows, cursor, encoded);
+                debug_assert!(committed, "prepared terminal patch baseline");
                 *seq += 1;
                 *repaint_pending = false;
             }
@@ -387,7 +500,13 @@ pub(crate) enum PreparedRender {
     TerminalAnsi {
         message: ServerMessage,
         frame: FrameData,
-        encoded: Option<EncodedBlit>,
+        encoded: Option<TerminalEncoded>,
+    },
+    TerminalAnsiPatch {
+        message: ServerMessage,
+        rows: Vec<crate::protocol::PaneSurfacePatchRow>,
+        cursor: Option<CursorState>,
+        encoded: TerminalEncoded,
     },
 }
 
@@ -396,7 +515,8 @@ impl PreparedRender {
         match self {
             Self::Semantic { message, .. }
             | Self::SemanticPatch { message, .. }
-            | Self::TerminalAnsi { message, .. } => message,
+            | Self::TerminalAnsi { message, .. }
+            | Self::TerminalAnsiPatch { message, .. } => message,
         }
     }
 
@@ -412,7 +532,9 @@ impl PreparedRender {
                 queued_graphics_assets,
                 ..
             } => Some((&committed_surface.graphics, queued_graphics_assets)),
-            Self::SemanticPatch { .. } | Self::TerminalAnsi { .. } => None,
+            Self::SemanticPatch { .. }
+            | Self::TerminalAnsi { .. }
+            | Self::TerminalAnsiPatch { .. } => None,
         }
     }
 
@@ -606,6 +728,31 @@ pub(crate) fn render_terminal_virtual(
         });
 
     (buffer, cursor)
+}
+
+/// The helper frame `render_terminal_virtual` plus `visible_hyperlinks` and
+/// `FrameData::from_ratatui_buffer_with_hyperlinks` produce, built straight
+/// from the pane's shared screen. None when no screen is available
+/// (synchronized output, snapshot path disabled); callers use the legacy path.
+/// The row revisions are present when every frame row maps to one screen row.
+pub(crate) fn render_terminal_frame(
+    runtime: &crate::terminal::TerminalRuntime,
+    area: Rect,
+) -> Option<(FrameData, Option<RowRevisions>)> {
+    let screen = runtime.screen_snapshot()?;
+    let cursor = runtime.cursor_state(area, true).map(|cursor| CursorState {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible && !crate::ui::pane_is_scrolled_back(runtime),
+        shape: cursor.shape,
+    });
+    let rows_above = runtime.crop_rows_above(area.height);
+    let (frame, revisions) = screen.frame_data_with_row_revisions(area, rows_above, cursor);
+    let revisions = revisions.map(|revisions| RowRevisions {
+        key: revisions.key,
+        rows: revisions.rows,
+    });
+    Some((frame, revisions))
 }
 
 #[cfg(test)]

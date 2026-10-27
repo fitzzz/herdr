@@ -637,10 +637,7 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
         snapshot: &crate::persist::SessionSnapshot,
-        imports: &mut std::collections::HashMap<
-            u32,
-            crate::handoff_runtime::ImportedHandoffRuntime,
-        >,
+        imports: &mut std::collections::HashMap<u32, crate::handoff_runtime::HandoffImport>,
     ) -> io::Result<Self> {
         let mut app = Self::new(
             config,
@@ -2845,6 +2842,168 @@ mod tests {
         assert_eq!(response["error"]["code"], "agent_pane_unavailable");
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_api_preserves_args_and_refuses_missing_executable() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("launcher-api");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let (runtime, mut receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let args = vec![
+            "--model",
+            "fixture model",
+            "resume",
+            "same-uuid",
+            "quote'\"$()`",
+        ];
+        let launcher = serde_json::json!({"executable":"/usr/bin/printf", "prefix_args":["%s", "provider", "--"], "env":{"FIXTURE_ACCOUNT":"selected"}});
+        let request = |launcher: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+            "id":"launcher", "method":"agent.start_with_launcher", "params":{
+                "name":"worker", "kind":"codex", "pane_id":pane_id, "args":args, "launcher":launcher
+            }
+        })).unwrap()
+        };
+        let mut missing = launcher.clone();
+        missing["executable"] = "/__herdr_missing_launcher__".into();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request(missing))).unwrap();
+        assert_eq!(response["error"]["code"], "invalid_agent_launcher");
+        assert!(receiver.try_recv().is_err());
+        assert!(app.state.terminals[&terminal_id].agent_launcher.is_none());
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request(launcher.clone()))).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started_with_launcher");
+        assert_eq!(response["result"]["launcher"], launcher);
+        let expected: Vec<_> = ["/usr/bin/printf", "%s", "provider", "--"]
+            .into_iter()
+            .chain(args)
+            .collect();
+        assert_eq!(response["result"]["argv"], serde_json::json!(expected));
+        let submitted = String::from_utf8(receiver.try_recv().unwrap().to_vec()).unwrap();
+        assert!(submitted.contains("/usr/bin/env -- FIXTURE_ACCOUNT=selected /usr/bin/printf"));
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .agent_launcher
+                .as_ref()
+                .unwrap()
+                .agent,
+            "codex"
+        );
+        // A lost start reply can be reconciled by a later read, but a submitted
+        // descriptor alone is not native identity evidence.
+        let lookup = || crate::api::schema::Request {
+            id: "lookup".into(),
+            method: crate::api::schema::Method::AgentLauncherInfo(
+                crate::api::schema::AgentTarget {
+                    target: pane_id.clone(),
+                },
+            ),
+        };
+        let before: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
+        assert_eq!(before["result"]["confirmed"], false);
+        assert_eq!(before["result"]["binding"]["launcher"], launcher);
+        assert_eq!(before["result"]["binding"]["argv_origin"], "admission");
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::agent_resume::AgentSessionRef::id("same-uuid"),
+            Some(1),
+            Some("startup".into()),
+        );
+        let revision = app.state.terminals[&terminal_id].revision;
+        let confirmed: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
+        assert_eq!(confirmed["result"]["confirmed"], true, "{confirmed}");
+        assert_eq!(
+            confirmed["result"]["binding"]["session"]["value"],
+            "same-uuid"
+        );
+        assert_eq!(app.state.terminals[&terminal_id].revision, revision);
+        assert!(receiver.try_recv().is_err(), "lookup must not submit input");
+        let saved = serde_json::to_vec(
+            app.state.terminals[&terminal_id]
+                .agent_launcher
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_launcher = Some(serde_json::from_slice(&saved).unwrap());
+        let persisted_only: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
+        assert_eq!(persisted_only["result"]["confirmed"], false);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_launcher = None;
+        let no_record: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
+        assert_eq!(no_record["result"]["confirmed"], false);
+        assert!(no_record["result"]["binding"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_new_admission_does_not_capture_previous_shell_session() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("launcher-reused-shell");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).unwrap().clone();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("previous-uuid").unwrap(),
+            });
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let (runtime, _receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 8);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"new", "method":"agent.start_with_launcher", "params":{
+                "name":"fresh", "kind":"codex", "pane_id":pane_id, "args":[],
+                "launcher":{"executable":"/usr/bin/printf","prefix_args":["new"],"env":{}}
+            }}),
+        )
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started_with_launcher");
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("previous-uuid"), "a fresh admitted launch must not resume a previous shell occupant after a crash: {serialized}");
     }
 
     #[tokio::test]

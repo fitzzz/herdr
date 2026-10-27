@@ -175,6 +175,27 @@ pub struct AgentStartParams {
     pub timeout_ms: Option<u64>,
 }
 
+/// A process-scoped launcher. Native agent arguments and identity stay separate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentLauncher {
+    pub executable: String,
+    pub prefix_args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Separately advertised so older servers cannot silently ignore the launcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentStartWithLauncherParams {
+    pub name: String,
+    pub kind: String,
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    pub launcher: AgentLauncher,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentPromptParams {
     pub target: String,
@@ -218,6 +239,11 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// Sequence comparisons are valid only within the same observation epoch.
+    /// Absent on ordinary terminals; present after an admitted legacy handoff
+    /// that preserved terminal identity without old completion watermarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_change_epoch: Option<String>,
     /// The current idle transition completed work, independently of who has viewed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_seq: Option<u64>,

@@ -1228,6 +1228,32 @@
     },
     "request": {
       "$defs": {
+        "AgentLauncher": {
+          "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
+          "properties": {
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "executable": {
+              "type": "string"
+            },
+            "prefix_args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "executable",
+            "prefix_args",
+            "env"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -1369,6 +1395,44 @@
             "name",
             "kind",
             "pane_id"
+          ],
+          "type": "object"
+        },
+        "AgentStartWithLauncherParams": {
+          "description": "Separately advertised so older servers cannot silently ignore the launcher.",
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "launcher": {
+              "$ref": "#/schemas/request/$defs/AgentLauncher"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "pane_id",
+            "launcher"
           ],
           "type": "object"
         },
@@ -4357,6 +4421,109 @@
           ],
           "type": "object"
         },
+        "TerminalInputOpenParams": {
+          "properties": {
+            "incarnation": {
+              "description": "Incarnation the client is bound to. Omit to bind to the current one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        "TerminalInputReconcileParams": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id"
+          ],
+          "type": "object"
+        },
+        "TerminalInputWriteLiteralParams": {
+          "additionalProperties": false,
+          "description": "Literal UTF-8 input, without paste or key encoding. Its stream and sequence\nare shared with `terminal.input.write`.",
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "literal": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq",
+            "literal"
+          ],
+          "type": "object"
+        },
+        "TerminalInputWriteParams": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "keys": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "seq": {
+              "description": "Starts at 1 and increases by exactly 1 per write on the stream.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq"
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -5404,6 +5571,38 @@
         {
           "properties": {
             "method": {
+              "const": "agent.start_with_launcher",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartWithLauncherParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.launcher_info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.prompt",
               "type": "string"
             },
@@ -5905,6 +6104,70 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendInputParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.write",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputWriteParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.write_literal",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputWriteLiteralParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "terminal.input.reconcile",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalInputReconcileParams"
             }
           },
           "required": [
@@ -6614,6 +6877,13 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "state_change_epoch": {
+              "description": "Sequence comparisons are valid only within the same observation epoch.\nAbsent on ordinary terminals; present after an admitted legacy handoff\nthat preserved terminal identity without old completion watermarks.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",
@@ -6672,6 +6942,32 @@
             "pane_id",
             "focused",
             "revision"
+          ],
+          "type": "object"
+        },
+        "AgentLauncher": {
+          "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
+          "properties": {
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "executable": {
+              "type": "string"
+            },
+            "prefix_args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "executable",
+            "prefix_args",
+            "env"
           ],
           "type": "object"
         },
@@ -6759,6 +7055,21 @@
           ],
           "type": "object"
         },
+        "AgentSessionRef": {
+          "properties": {
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
         "AgentSessionRefKind": {
           "enum": [
             "id",
@@ -6775,6 +7086,42 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "BoundAgentLauncher": {
+          "properties": {
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "argv_origin": {
+              "$ref": "#/schemas/success_response/$defs/LauncherArgvOrigin"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "launcher": {
+              "$ref": "#/schemas/success_response/$defs/AgentLauncher"
+            },
+            "session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSessionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "launcher",
+            "kind",
+            "argv",
+            "argv_origin"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -7668,6 +8015,13 @@
             "messages"
           ],
           "type": "object"
+        },
+        "LauncherArgvOrigin": {
+          "enum": [
+            "admission",
+            "canonical_resume"
+          ],
+          "type": "string"
         },
         "LayoutDescription": {
           "properties": {
@@ -9481,6 +9835,63 @@
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
+                "argv": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "launcher": {
+                  "$ref": "#/schemas/success_response/$defs/AgentLauncher"
+                },
+                "type": {
+                  "const": "agent_started_with_launcher",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "argv",
+                "launcher"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "binding": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/BoundAgentLauncher"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "confirmed": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "agent_launcher_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "confirmed"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
                 "type": {
                   "const": "agent_prompted",
                   "type": "string"
@@ -9795,6 +10206,38 @@
               "required": [
                 "type",
                 "read"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "stream": {
+                  "$ref": "#/schemas/success_response/$defs/TerminalInputStreamInfo"
+                },
+                "type": {
+                  "const": "terminal_input_stream",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "stream"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "terminal_input_written",
+                  "type": "string"
+                },
+                "write": {
+                  "$ref": "#/schemas/success_response/$defs/TerminalInputWriteAck"
+                }
+              },
+              "required": [
+                "type",
+                "write"
               ],
               "type": "object"
             },
@@ -10420,6 +10863,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_launcher": {
+              "default": false,
+              "description": "Managed launcher start and persisted recovery are both supported.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
@@ -10441,6 +10889,13 @@
             "live_handoff": {
               "type": "boolean"
             },
+            "methods": {
+              "description": "Optional JSON API methods implemented by this server, not the client binary.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "ssh_agent_registration": {
               "default": false,
               "description": "Supports connection-scoped `server.ssh_agent.register` on the local JSON API.",
@@ -10449,6 +10904,16 @@
             "surface_interest": {
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
+              "type": "boolean"
+            },
+            "terminal_input_ack": {
+              "default": false,
+              "description": "Supports `terminal.input.open`, `terminal.input.write` and\n`terminal.input.reconcile`.",
+              "type": "boolean"
+            },
+            "terminal_input_literal": {
+              "default": false,
+              "description": "Supports byte-preserving UTF-8 `terminal.input.write_literal` on the\nsame acknowledged streams as `terminal.input.write`.",
               "type": "boolean"
             }
           },
@@ -10570,6 +11035,74 @@
             "focused",
             "pane_count",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "TerminalInputStreamInfo": {
+          "properties": {
+            "incarnation": {
+              "type": "string"
+            },
+            "last_admitted_seq": {
+              "description": "Highest sequence admitted to the terminal's ordered PTY write queue.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_written_seq": {
+              "description": "Every sequence up to this one was written to the PTY.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "last_admitted_seq",
+            "last_written_seq"
+          ],
+          "type": "object"
+        },
+        "TerminalInputWriteAck": {
+          "properties": {
+            "digest": {
+              "description": "Hex SHA-256 of the request's text and keys.",
+              "type": "string"
+            },
+            "duplicate": {
+              "description": "True when an earlier request with this sequence already wrote it.",
+              "type": "boolean"
+            },
+            "incarnation": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stream_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "incarnation",
+            "stream_id",
+            "seq",
+            "digest",
+            "duplicate"
           ],
           "type": "object"
         },

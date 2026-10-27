@@ -11,6 +11,7 @@ pub(super) mod responses;
 mod session;
 mod status;
 mod tabs;
+mod terminal_input;
 mod workspaces;
 mod worktrees;
 
@@ -1092,6 +1093,12 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentStartWithLauncher(params) => {
+                return self.handle_agent_start_with_launcher(request.id, params)
+            }
+            Method::AgentLauncherInfo(target) => {
+                return self.handle_agent_launcher_info(request.id, target)
+            }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1179,6 +1186,19 @@ impl App {
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
                 return self.handle_pane_send_input(request.id, params);
+            }
+            Method::TerminalInputOpen(params) => {
+                return self.handle_terminal_input_open(request.id, params);
+            }
+            Method::TerminalInputReconcile(params) => {
+                return self.handle_terminal_input_reconcile(request.id, params);
+            }
+            Method::TerminalInputWrite(_) | Method::TerminalInputWriteLiteral(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "acknowledged terminal writes are handled asynchronously by the app runtime",
+                );
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PopupClose(_) => {

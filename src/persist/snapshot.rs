@@ -10,6 +10,7 @@ use crate::workspace::Workspace;
 
 /// Current snapshot format version.
 pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(super) const LAUNCHER_SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -26,6 +27,29 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+}
+
+impl SessionSnapshot {
+    pub(crate) fn has_agent_launcher(&self) -> bool {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.agent_launcher.is_some())
+    }
+
+    pub(crate) fn validate_launcher_version(&self) -> Result<(), String> {
+        if self.version > LAUNCHER_SNAPSHOT_VERSION {
+            return Err("session snapshot version is newer than supported".into());
+        }
+        if self.has_agent_launcher() && self.version < LAUNCHER_SNAPSHOT_VERSION {
+            return Err("launcher state requires session snapshot version 4".into());
+        }
+        if self.version == LAUNCHER_SNAPSHOT_VERSION && !self.has_agent_launcher() {
+            return Err("session snapshot version 4 is missing its required launcher state".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,6 +122,8 @@ pub struct TabSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_launcher: Option<crate::agent_launcher::BoundAgentLauncher>,
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -278,18 +304,23 @@ pub fn capture(
     active: Option<usize>,
     selected: usize,
 ) -> SessionSnapshot {
-    SessionSnapshot {
+    let workspaces: Vec<_> = workspaces
+        .iter()
+        .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+        .collect();
+    let mut snapshot = SessionSnapshot {
         version: SNAPSHOT_VERSION,
-        workspaces: workspaces
-            .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
-            .collect(),
+        workspaces,
         active,
         selected,
         sidebar_width: None,
         sidebar_section_split: None,
         collapsed_space_keys: std::collections::HashSet::new(),
+    };
+    if snapshot.has_agent_launcher() {
+        snapshot.version = LAUNCHER_SNAPSHOT_VERSION;
     }
+    snapshot
 }
 
 fn capture_workspace(
@@ -395,6 +426,7 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
+                agent_launcher: terminal.and_then(|terminal| terminal.agent_launcher.clone()),
                 cwd,
                 label,
                 agent_name,
@@ -497,13 +529,15 @@ pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
 
 pub(super) fn parse_snapshot(content: &str) -> Result<SessionSnapshot, String> {
     let raw = serde_json::from_str::<RawSessionSnapshot>(content).map_err(|e| e.to_string())?;
-    if raw.version > SNAPSHOT_VERSION {
+    if raw.version > LAUNCHER_SNAPSHOT_VERSION {
         return Err(format!(
             "snapshot version {} is newer than supported {}",
-            raw.version, SNAPSHOT_VERSION
+            raw.version, LAUNCHER_SNAPSHOT_VERSION
         ));
     }
-    migrate_snapshot(raw)
+    let snapshot = migrate_snapshot(raw)?;
+    snapshot.validate_launcher_version()?;
+    Ok(snapshot)
 }
 
 pub(super) fn parse_history_snapshot(content: &str) -> Result<SessionHistorySnapshot, String> {
@@ -540,6 +574,50 @@ mod tests {
     use crate::layout::NavDirection;
     use crate::platform::ProcessInstance;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn agent_launcher_snapshot_fences_old_readers_and_round_trips_disk() {
+        let mut state = state_with_workspaces(&["launcher"]);
+        state.ensure_test_terminals();
+        assert_eq!(capture_from_state(&state).version, 3);
+        let terminal = state.terminals.values_mut().next().unwrap();
+        terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "codex".into(),
+            session: crate::agent_resume::AgentSessionRef::id("same-uuid"),
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/fixture/authority".into(),
+                prefix_args: vec!["run".into()],
+                env: Default::default(),
+            },
+        });
+        let snapshot = capture_from_state(&state);
+        // The actual old reader checks this before decoding/ignoring pane fields.
+        assert!(snapshot.version > 3);
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let path = temp.path().join("session.json");
+        super::super::io::save_to_path(&path, &snapshot).unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert!(restored.has_agent_launcher());
+        let mut downgraded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        downgraded["version"] = 3.into();
+        assert!(parse_snapshot(&downgraded.to_string()).is_err());
+        let mut missing: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let panes = missing["workspaces"][0]["tabs"][0]["panes"]
+            .as_object_mut()
+            .unwrap();
+        for pane in panes.values_mut() {
+            pane.as_object_mut().unwrap().remove("agent_launcher");
+        }
+        assert!(parse_snapshot(&missing.to_string()).is_err());
+        let mut inconsistent = restored;
+        inconsistent.version = 3;
+        assert!(super::super::io::save_to_path(&path, &inconsistent).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), json);
+    }
 
     fn session_fixture(name: &str) -> &'static str {
         match name {
@@ -715,6 +793,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                agent_launcher: None,
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -727,6 +806,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                agent_launcher: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -1606,6 +1686,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                agent_launcher: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -1618,6 +1699,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                agent_launcher: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

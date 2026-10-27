@@ -281,6 +281,8 @@ struct ServerCapabilitiesJson {
     surface_interest: bool,
     health_check: bool,
     ssh_agent_registration: bool,
+    terminal_input_ack: bool,
+    terminal_input_literal: bool,
 }
 
 #[derive(Serialize)]
@@ -327,6 +329,8 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
                     ssh_agent_registration: capabilities.ssh_agent_registration,
+                    terminal_input_ack: capabilities.terminal_input_ack,
+                    terminal_input_literal: capabilities.terminal_input_literal,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -419,12 +423,16 @@ mod tests {
             version: version.map(str::to_owned),
             protocol: Some(crate::protocol::PROTOCOL_VERSION),
             capabilities: Some(crate::api::schema::ServerCapabilities {
+                methods: Vec::new(),
+                agent_launcher: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                terminal_input_ack: false,
+                terminal_input_literal: false,
             }),
         }
     }

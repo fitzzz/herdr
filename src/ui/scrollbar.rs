@@ -24,6 +24,46 @@ pub(crate) fn release_notes_scrollbar_rect(
     ))
 }
 
+/// Scroll metrics for a view that draws `view_rows` of a taller grid,
+/// starting `rows_above` rows down. Grid rows outside the view count as
+/// scrollable rows, so the pane scrollbar marks the view as cropped and shows
+/// which slice it draws.
+pub(crate) fn cropped_view_scroll_metrics(
+    metrics: crate::pane::ScrollMetrics,
+    screen_rows: u16,
+    view_rows: u16,
+    rows_above: u16,
+) -> crate::pane::ScrollMetrics {
+    let hidden = usize::from(screen_rows.saturating_sub(view_rows));
+    if hidden == 0 {
+        return metrics;
+    }
+    let below = hidden.saturating_sub(usize::from(rows_above));
+    crate::pane::ScrollMetrics {
+        offset_from_bottom: metrics.offset_from_bottom.saturating_add(below),
+        max_offset_from_bottom: metrics.max_offset_from_bottom.saturating_add(hidden),
+        viewport_rows: usize::from(view_rows),
+    }
+}
+
+/// The pane's scroll metrics as a view `view_rows` tall presents them.
+pub(crate) fn pane_view_scroll_metrics(
+    rt: &crate::terminal::TerminalRuntime,
+    view_rows: u16,
+) -> Option<crate::pane::ScrollMetrics> {
+    let metrics = rt.scroll_metrics()?;
+    let screen_rows = rt.current_size().0;
+    if screen_rows <= view_rows {
+        return Some(metrics);
+    }
+    Some(cropped_view_scroll_metrics(
+        metrics,
+        screen_rows,
+        view_rows,
+        rt.crop_rows_above(view_rows),
+    ))
+}
+
 pub(crate) fn should_show_scrollbar(metrics: crate::pane::ScrollMetrics) -> bool {
     metrics.max_offset_from_bottom > 0
 }
@@ -189,10 +229,10 @@ pub(super) fn render_pane_scrollbar(
     info: &PaneInfo,
     rt: &crate::terminal::TerminalRuntime,
 ) {
-    let Some(metrics) = rt.scroll_metrics() else {
+    let Some(track) = pane_scrollbar_rect(info) else {
         return;
     };
-    let Some(track) = pane_scrollbar_rect(info) else {
+    let Some(metrics) = pane_view_scroll_metrics(rt, info.inner_rect.height) else {
         return;
     };
     render_pane_scrollbar_buffer(
@@ -202,4 +242,65 @@ pub(super) fn render_pane_scrollbar(
         &app.palette,
         info.is_focused,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::ScrollMetrics;
+
+    #[test]
+    fn cropped_view_scrollbar_counts_the_rows_the_view_hides() {
+        let live = ScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 0,
+            viewport_rows: 109,
+        };
+        // A view as tall as the grid keeps the grid's metrics.
+        assert_eq!(cropped_view_scroll_metrics(live, 109, 109, 0), live);
+        // A 60-row view of a 109-row grid with no history shows a scrollbar.
+        let cropped = cropped_view_scroll_metrics(live, 109, 60, 49);
+        assert_eq!(
+            cropped,
+            ScrollMetrics {
+                offset_from_bottom: 0,
+                max_offset_from_bottom: 49,
+                viewport_rows: 60,
+            }
+        );
+        assert!(should_show_scrollbar(cropped));
+        let track = Rect::new(0, 0, 1, 60);
+        let thumb = scrollbar_thumb(cropped, track).unwrap();
+        assert_eq!(thumb.top + thumb.len, 60, "a live view sits at the bottom");
+        assert!(thumb.len < 60);
+
+        // The same view drawing the top of the grid sits at the top.
+        let top = cropped_view_scroll_metrics(live, 109, 60, 0);
+        assert_eq!(top.offset_from_bottom, 49);
+        assert_eq!(scrollbar_thumb(top, track).unwrap().top, 0);
+    }
+
+    #[tokio::test]
+    async fn pane_view_scroll_metrics_crop_a_runtime_taller_than_the_view() {
+        let lines = (0..10)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 10, lines.as_bytes());
+        assert_eq!(
+            pane_view_scroll_metrics(&runtime, 10),
+            runtime.scroll_metrics()
+        );
+        let metrics = pane_view_scroll_metrics(&runtime, 4).unwrap();
+        assert_eq!(metrics.viewport_rows, 4);
+        assert_eq!(metrics.offset_from_bottom, 0);
+        assert_eq!(
+            metrics.max_offset_from_bottom,
+            runtime.scroll_metrics().unwrap().max_offset_from_bottom + 6
+        );
+        assert_eq!(runtime.crop_rows_above(4), 6);
+        let cursor = runtime.cursor_state(Rect::new(5, 2, 20, 4), true).unwrap();
+        assert_eq!((cursor.x, cursor.y), (5 + 2, 2 + 3));
+    }
 }

@@ -233,6 +233,10 @@ mod tests {
     }
 
     fn endpoint_method_shape_digests() -> BTreeMap<String, String> {
+        method_shape_digests(CLIENT_SHELL_METHODS)
+    }
+
+    fn method_shape_digests(methods: &[&str]) -> BTreeMap<String, String> {
         let schema = serde_json::to_value(schemars::schema_for!(crate::api::schema::Request))
             .expect("request schema");
         let definitions = schema
@@ -245,7 +249,7 @@ mod tests {
             .expect("request method branches");
         let mut digests = BTreeMap::new();
 
-        for method in CLIENT_SHELL_METHODS {
+        for method in methods {
             let branch = branches
                 .iter()
                 .find(|branch| {
@@ -301,6 +305,31 @@ mod tests {
         assert_eq!(
             actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"
+        );
+    }
+
+    /// The acknowledged terminal input methods are JSON API methods, not part
+    /// of the client-shell lane. Their request shapes are frozen in their own
+    /// fixture so a change needs a new method name.
+    #[test]
+    fn terminal_input_method_shapes_stay_at_their_v1_contract() {
+        let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/terminal-input-method-shapes-v1.json"
+        )))
+        .expect("terminal input method shape fixture");
+        let methods = [
+            "terminal.input.open",
+            "terminal.input.reconcile",
+            "terminal.input.write",
+        ];
+        assert!(methods
+            .iter()
+            .all(|method| !supports_client_shell_method_name(method)));
+        assert_eq!(
+            method_shape_digests(&methods),
+            expected,
+            "a terminal input method changed shape; add a new method instead"
         );
     }
 

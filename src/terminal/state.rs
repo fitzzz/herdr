@@ -677,6 +677,7 @@ pub struct TerminalState {
     /// A live agent reported `persisted_agent_session`, rather than a restore
     /// leaving it or `herdr agent start` arguments naming it.
     persisted_agent_session_reported: bool,
+    pub(crate) agent_launcher: Option<crate::agent_launcher::BoundAgentLauncher>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
     pub terminal_title: Option<String>,
@@ -693,6 +694,9 @@ pub struct TerminalState {
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
+    /// A fresh observation namespace for an explicitly admitted legacy handoff.
+    /// Old exporters do not transfer the public state/completion watermarks.
+    pub state_change_epoch: Option<String>,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
     pub revision: u64,
@@ -729,6 +733,7 @@ impl TerminalState {
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
             persisted_agent_session_reported: false,
+            agent_launcher: None,
             reported_resume: None,
             reported_resume_revision: 0,
             terminal_title: None,
@@ -745,6 +750,7 @@ impl TerminalState {
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
+            state_change_epoch: None,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
             revision: 0,
@@ -1100,6 +1106,20 @@ impl TerminalState {
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
     }
 
+    /// Begin a fresh sequence namespace after preserving a legacy terminal ID.
+    ///
+    /// Admission supplies a nonempty, one-use migration token. Captured public
+    /// watermarks cannot prove what happened before the old exporter froze, so
+    /// they are deliberately not installed. This changes no effective state or
+    /// acquisition policy and creates no completion; a later completion must
+    /// still come through the ordinary state-transition handler.
+    #[cfg(unix)]
+    pub(crate) fn begin_handoff_observation_epoch(&mut self, epoch: String) {
+        self.state_change_epoch = Some(epoch);
+        self.last_agent_state_change_seq = None;
+        self.last_agent_completion_seq = None;
+    }
+
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
         let reached_idle = self.agent_process_acquisition_pending && self.state == AgentState::Idle;
         let suppress_completion = reached_idle && self.recent_agent_process_exit.is_none();
@@ -1279,6 +1299,11 @@ impl TerminalState {
                 .is_some_and(|launch| Some(launch.agent) != agent)
         {
             self.set_agent_launch(None);
+        }
+        if let Some(binding) = self.agent_launcher.as_mut() {
+            if process_exited || agent != crate::detect::parse_agent_label(&binding.agent) {
+                binding.observed = false;
+            }
         }
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
@@ -2323,6 +2348,20 @@ impl TerminalState {
         self.managed_agent_launch_session = Some(session);
     }
 
+    /// Called only after the new launch bytes were accepted. Previous shell
+    /// occupants cannot supply the identity or resume command for this launch.
+    pub(crate) fn record_agent_launcher_admission(
+        &mut self,
+        binding: crate::agent_launcher::BoundAgentLauncher,
+        session: Option<crate::agent_resume::PersistedAgentSession>,
+    ) {
+        self.set_reported_resume(None);
+        self.persisted_agent_session = session.clone();
+        self.persisted_agent_session_reported = false;
+        self.managed_agent_launch_session = session;
+        self.agent_launcher = Some(binding);
+    }
+
     pub fn set_agent_session_ref(
         &mut self,
         source: String,
@@ -3264,6 +3303,12 @@ impl TerminalState {
         agent_label: &str,
         session_ref: Option<&crate::agent_resume::AgentSessionRef>,
     ) {
+        self.reconcile_launcher_owner(agent_label, session_ref);
+        if let Some(binding) = self.agent_launcher.as_mut() {
+            if binding.agent == agent_label && session_ref.is_some() {
+                binding.observed = true;
+            }
+        }
         if self.agent_name.is_none() {
             return;
         }
@@ -3308,6 +3353,28 @@ impl TerminalState {
                     .flatten()
             })
         })
+    }
+
+    fn reconcile_launcher_owner(
+        &mut self,
+        agent: &str,
+        session: Option<&crate::agent_resume::AgentSessionRef>,
+    ) {
+        let Some(launcher) = self.agent_launcher.as_mut() else {
+            return;
+        };
+        // Missing observations are not proof that a saved launch was replaced.
+        if crate::detect::parse_agent_label(agent).is_none() {
+            return;
+        }
+        let Some(session) = session else {
+            return;
+        };
+        if launcher.agent != agent || launcher.session.as_ref().is_some_and(|old| old != session) {
+            self.agent_launcher = None;
+        } else {
+            launcher.session = Some(session.clone());
+        }
     }
 
     fn recompute_effective_state(
@@ -3361,10 +3428,158 @@ pub(crate) fn stabilize_agent_detection(detection: crate::detect::AgentDetection
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_launcher_keeps_unknown_and_stored_identity_unconfirmed() {
+        let mut terminal =
+            TerminalState::new(TerminalId::alloc(), std::env::current_dir().unwrap());
+        terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "codex".into(),
+            session: None,
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/fixture/authority".into(),
+                prefix_args: vec![],
+                env: Default::default(),
+            },
+        });
+        terminal.reconcile_launcher_owner("unknown", None);
+        terminal.reconcile_launcher_owner("codex", None);
+        let same = crate::agent_resume::AgentSessionRef::id("same-uuid").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: same.clone(),
+        });
+        terminal.reconcile_launcher_owner("codex", Some(&same));
+        assert_eq!(
+            terminal.agent_launcher.as_ref().unwrap().session,
+            Some(same)
+        );
+        terminal.reconcile_launcher_owner("codex", None);
+        assert!(terminal.agent_launcher.is_some());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("replacement").unwrap(),
+        });
+        assert!(terminal.agent_launcher.is_some());
+        assert!(!terminal.agent_launcher.as_ref().unwrap().observed);
+    }
+
+    #[test]
+    fn agent_launcher_retains_other_provider_observation_until_native_replacement() {
+        let mut terminal =
+            TerminalState::new(TerminalId::alloc(), std::env::current_dir().unwrap());
+        let original = crate::agent_resume::AgentSessionRef::id("original-codex-uuid").unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: original.clone(),
+        });
+        terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            agent: "codex".into(),
+            session: Some(original),
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/fixture/authority".into(),
+                prefix_args: vec![],
+                env: Default::default(),
+            },
+            argv: vec!["/fixture/authority".into()],
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            observed: true,
+        });
+        let mut saved = terminal.agent_launcher.clone();
+        saved.as_mut().unwrap().observed = false;
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert_eq!(
+            terminal.agent_launcher, saved,
+            "provider detection without native identity is not confirmed replacement"
+        );
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert!(
+            !terminal.agent_launcher.as_ref().unwrap().observed,
+            "a returning provider without a fresh native report is unconfirmed"
+        );
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("replacement-claude-uuid"),
+            Some(10),
+            Some("startup".into()),
+        );
+        assert!(
+            terminal.agent_launcher.is_none(),
+            "accepted authoritative replacement must clear the prior launcher"
+        );
+    }
     use crate::detect::AgentDetection;
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_drops_watermarks_without_changing_authority() {
+        let mut terminal = test_terminal();
+        let id = terminal.id.clone();
+        let now = Instant::now();
+        terminal.set_detected_agent_process_at(Agent::Claude, now);
+        terminal.hook_authority = Some(HookAuthority {
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            state: AgentState::Idle,
+            message: None,
+            reported_at: now,
+            session_ref: crate::agent_resume::AgentSessionRef::id("continuing-session"),
+        });
+        terminal.state = AgentState::Idle;
+        terminal.finish_agent_process_acquisition();
+        terminal
+            .hook_report_sequences
+            .insert("herdr:claude".into(), 27);
+        terminal.last_agent_state_change_seq = Some(42);
+        terminal.last_agent_completion_seq = Some(42);
+        terminal.revision = 19;
+        let authority = terminal.hook_authority.clone();
+
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+
+        assert_eq!(terminal.id, id);
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert_eq!(terminal.last_agent_state_change_seq, None);
+        assert_eq!(terminal.last_agent_completion_seq, None);
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert_eq!(terminal.hook_authority, authority);
+        assert_eq!(terminal.hook_report_sequences["herdr:claude"], 27);
+        assert!(!terminal.agent_process_acquisition_pending);
+        assert_eq!(terminal.revision, 19);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_handoff_observation_epoch_stays_with_a_respawned_terminal() {
+        let mut terminal = test_terminal();
+        assert!(terminal.state_change_epoch.is_none());
+        terminal.begin_handoff_observation_epoch("migration-token".into());
+        terminal.last_agent_state_change_seq = Some(3);
+        terminal.last_agent_completion_seq = Some(3);
+
+        terminal.clear_agent_runtime_identity_after_respawn();
+
+        assert_eq!(
+            terminal.state_change_epoch.as_deref(),
+            Some("migration-token")
+        );
+        assert!(terminal.last_agent_state_change_seq.is_none());
+        assert!(terminal.last_agent_completion_seq.is_none());
     }
 
     fn test_session_path(name: &str) -> String {

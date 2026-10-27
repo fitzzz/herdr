@@ -28,6 +28,8 @@ mod config_file_tests;
 
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
+mod migration;
+pub(crate) use migration::*;
 
 /// A shell that reads its line in the terminal's canonical mode gets at most
 /// this many bytes of a typed line: the n_tty line buffer is 4096 bytes
@@ -334,6 +336,14 @@ pub(crate) fn scrollback_editor_argv(path: &std::path::Path) -> std::io::Result<
 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     super::interactive_unix_shell_command(argv, shell_name)
+}
+
+pub(crate) fn agent_launcher_command(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    shell: &str,
+) -> Option<String> {
+    super::unix_agent_launcher_command(argv, env, shell)
 }
 
 /// Collect the foreground terminal job for a given child PID.

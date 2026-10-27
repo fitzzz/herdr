@@ -383,6 +383,25 @@ pub(crate) fn end_cli_output() {}
 
 #[cfg(target_os = "linux")]
 mod linux;
+/// Kernel-backed identity checked only during explicit live migration.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MigrationProcessStamp {
+    pub pid: u32,
+    pub uid: u32,
+    pub start_ticks: u64,
+    pub boot_id: String,
+    pub pid_namespace: String,
+    pub mount_namespace: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MigrationFileStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+}
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
@@ -432,8 +451,14 @@ pub(crate) fn interactive_shell_restore_command(
     argv: &[String],
     shell_name: &str,
 ) -> Option<String> {
+    interactive_shell_command(argv, shell_name).map(shell_restore_line)
+}
+
+/// A restore command as typed: with the leading space on Unix that keeps it
+/// out of the shell's history, as `interactive_shell_restore_command` says.
+pub(crate) fn shell_restore_line(command: String) -> String {
     let prefix = if cfg!(windows) { "" } else { " " };
-    interactive_shell_command(argv, shell_name).map(|command| format!("{prefix}{command}"))
+    format!("{prefix}{command}")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -550,6 +575,51 @@ pub(crate) fn interactive_shell_accepts_line(command: &str, shell: &str) -> bool
             std::ffi::OsStr::to_string_lossy,
         );
     LINE_EDITING_SHELLS.contains(&normalized_process_name(&name).as_str())
+}
+
+pub(crate) fn launcher_executable_available(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn unix_agent_launcher_command(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    shell: &str,
+) -> Option<String> {
+    if argv.is_empty() {
+        return None;
+    }
+    let command_argv: Vec<String> = ["/usr/bin/env".into(), "--".into()]
+        .into_iter()
+        .chain(env.iter().map(|(key, value)| format!("{key}={value}")))
+        .chain(argv.iter().cloned())
+        .collect();
+    let command = interactive_unix_shell_command(&command_argv, shell)?;
+    Some(
+        if matches!(
+            normalized_process_name(shell).as_str(),
+            "pwsh" | "powershell"
+        ) {
+            format!("& {command}")
+        } else {
+            command
+        },
+    )
 }
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {

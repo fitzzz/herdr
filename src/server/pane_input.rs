@@ -38,6 +38,24 @@ pub(super) fn downgrade_ineligible_pixel_mouse(
     }
 }
 
+/// Moves cell mouse rows from a cropped view to grid rows. A view shorter
+/// than the grid draws it from `rows_above` down; pixel positions already fell
+/// back to cells because the view's geometry differs from the grid's.
+pub(super) fn offset_cropped_mouse_rows(events: &mut [ClientPaneInputEvent], rows_above: u16) {
+    if rows_above == 0 {
+        return;
+    }
+    for event in events {
+        if let ClientPaneInputEvent::Mouse {
+            position: crate::protocol::ClientMousePosition::Cell { row, .. },
+            ..
+        } = event
+        {
+            *row = row.saturating_add(rows_above);
+        }
+    }
+}
+
 pub(super) fn terminal_attach_mouse_position(
     runtime: &crate::terminal::TerminalRuntime,
     terminal_size: (u16, u16),
@@ -416,6 +434,34 @@ mod tests {
             ),
             Some(crate::protocol::ClientMousePosition::Cell { column: 12, row: 4 })
         );
+    }
+
+    #[test]
+    fn cropped_view_mouse_rows_address_the_drawn_grid_rows() {
+        let mouse = |position| ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
+            position,
+            geometry: None,
+            modifiers: 0,
+            lines: 1,
+        };
+        let mut events = vec![
+            mouse(crate::protocol::ClientMousePosition::Cell { column: 3, row: 4 }),
+            ClientPaneInputEvent::Paste("x".into()),
+        ];
+
+        offset_cropped_mouse_rows(&mut events, 0);
+        assert_eq!(
+            events[0],
+            mouse(crate::protocol::ClientMousePosition::Cell { column: 3, row: 4 })
+        );
+
+        offset_cropped_mouse_rows(&mut events, 49);
+        assert_eq!(
+            events[0],
+            mouse(crate::protocol::ClientMousePosition::Cell { column: 3, row: 53 })
+        );
+        assert_eq!(events[1], ClientPaneInputEvent::Paste("x".into()));
     }
 
     #[test]
