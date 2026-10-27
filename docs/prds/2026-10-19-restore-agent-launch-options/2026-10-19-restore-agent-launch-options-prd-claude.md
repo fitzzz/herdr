@@ -863,6 +863,11 @@ in the same pane and directory, using Herdr's existing restore order and spacing
   (no peer process id, as on the client-shell endpoint, or no Claude or Codex ancestor), pairing falls back to process
   order and the foreground job, so two agent processes inside one process-check interval (about 5 seconds) can still
   be paired wrongly. Hook reports on the host where the agents run carry the sender since round 9 (`b0ab1307`).
+- Known limit, inferred (review round 14): when another Claude or Codex process reports the agent's own conversation,
+  for example one the agent starts from its shell tool with `--resume` on that conversation, the agent's options are no
+  longer saved beside it, so it comes back bare with the `launch options not kept` marker (`w22` case M). A handed-off
+  assumed pairing is decided again after the handoff and can drop the same way. Both lose options; neither saves the
+  wrong ones.
 - Inferred rows that stay inferred because they would not change what is built: FR-14 (options always belong to the
   pane's current conversation), FR-16 (a shared conversation still resumes once), FR-17 (the resume setting still turns
   restore off), FR-21 (unreleased docs updated), FR-22 (options survive repeated restores).
