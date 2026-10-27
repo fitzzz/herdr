@@ -759,20 +759,38 @@ mod tests {
         assert_eq!(parse_agent_env_hint(b"HERDR_AGENT=not-an-agent\0"), None);
     }
 
-    #[test]
-    fn restore_command_starts_with_a_space_that_keeps_it_out_of_shell_history() {
-        let argv = [
+    fn placeholder_restore_argv() -> [String; 5] {
+        [
             "claude",
             "--model",
             "placeholder",
             "--resume",
             "placeholder-id",
         ]
-        .map(String::from);
+        .map(String::from)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_command_starts_with_a_space_that_keeps_it_out_of_shell_history() {
+        let argv = placeholder_restore_argv();
         for shell in ["bash", "zsh", "fish", "sh"] {
             assert_eq!(
                 interactive_shell_restore_command(&argv, shell),
                 interactive_shell_command(&argv, shell).map(|command| format!(" {command}")),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_command_is_the_shell_command_unchanged_on_windows() {
+        let argv = placeholder_restore_argv();
+        for shell in ["pwsh", "powershell", "cmd", "bash"] {
+            assert_eq!(
+                interactive_shell_restore_command(&argv, shell),
+                interactive_shell_command(&argv, shell),
                 "{shell}"
             );
         }

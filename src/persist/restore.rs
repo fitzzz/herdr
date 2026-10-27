@@ -1722,32 +1722,66 @@ mod tests {
         );
     }
 
+    /// A Claude session whose restore line is longer than any canonical limit.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn restore_plan_falls_back_when_a_canonical_shell_cannot_take_the_line() {
-        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
-
-        let session = launch_options_session(
+    fn session_with_a_long_restore_line() -> super::super::snapshot::PaneAgentSessionSnapshot {
+        launch_options_session(
             "claude",
             Some(vec![
                 "--append-system-prompt".into(),
                 "placeholder ".repeat(400),
             ]),
-        );
-        let (plan, outcome) = restore_plan_for_snapshot(&session, true, "placeholder-shell")
-            .expect("restore should plan the bare command");
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_falls_back_when_a_canonical_shell_cannot_take_the_line() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let (plan, outcome) = restore_plan_for_snapshot(
+            &session_with_a_long_restore_line(),
+            true,
+            "placeholder-shell",
+        )
+        .expect("restore should plan the bare command");
         assert_eq!(
             outcome,
             Some(LaunchOptionsRestore::NotKept(
                 LaunchOptionsUnavailable::ExceedsResumeLimits
             ))
         );
-        assert!(!plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
+    }
 
-        let (plan, outcome) = restore_plan_for_snapshot(&session, true, "bash")
-            .expect("restore should plan the command with its options");
-        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_plan_keeps_a_long_line_for_bash_on_linux() {
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash")
+                .expect("restore should plan the command with its options");
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
         assert!(plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_plan_falls_back_for_a_long_bash_line_on_macos() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash")
+                .expect("restore should plan the bare command");
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
