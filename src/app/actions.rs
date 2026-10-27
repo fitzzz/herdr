@@ -1556,20 +1556,14 @@ impl AppState {
                 evidence,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    let reported = session_ref.clone();
-                    let mutation = terminal.set_agent_session_ref_for_session_start(
+                    terminal.apply_agent_session_report(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    );
-                    // A report the pane did not take, such as an older one,
-                    // says nothing about who runs its conversation.
-                    if reported.is_some_and(|session| terminal.session_ref_is_current(&session)) {
-                        terminal.sync_agent_launch_session(&evidence);
-                    }
-                    mutation
+                        &evidence,
+                    )
                 })
                 .into_iter()
                 .collect(),
@@ -3520,6 +3514,93 @@ mod tests {
             assert_eq!(
                 saved_claude_restore(&state, pane_id),
                 ("session-a".into(), claude_resume(&[], "session-a")),
+                "{case}"
+            );
+        }
+    }
+
+    fn report_claude_with(
+        state: &mut AppState,
+        pane_id: PaneId,
+        (seq, start): (u64, &str),
+        session: &str,
+        evidence: crate::terminal::SessionReportEvidence,
+    ) {
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(seq),
+            session_ref: crate::agent_resume::AgentSessionRef::id(session),
+            session_start_source: Some(start.into()),
+            evidence,
+        });
+    }
+
+    #[test]
+    fn another_process_reporting_the_paired_conversation_takes_it_from_the_record() {
+        let other = ProcessInstance::unknown_start(EXITED_PROCESS_ID - 1);
+        for (case, evidence) in [
+            (
+                "its reporter",
+                crate::terminal::SessionReportEvidence::Reporter(vec![other]),
+            ),
+            (
+                "the lone agent in the job",
+                crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![other])),
+            ),
+        ] {
+            let mut state = app_with_workspaces(&["one"]);
+            state.ensure_test_terminals();
+            let pane_id = state.workspaces[0].tabs[0].root_pane;
+            report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
+            observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+            assert_eq!(
+                saved_claude_restore(&state, pane_id),
+                (
+                    "session-a".into(),
+                    claude_resume(&["--permission-mode", "plan"], "session-a")
+                ),
+                "{case}"
+            );
+            // Another Claude reports the same conversation before detection
+            // reads it.
+            report_claude_with(&mut state, pane_id, (2, "resume"), "session-a", evidence);
+            assert_eq!(
+                saved_claude_restore(&state, pane_id),
+                ("session-a".into(), claude_resume(&[], "session-a")),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_report_does_not_replace_the_evidence_of_the_accepted_one() {
+        for (case, rejected) in [
+            ("the same conversation", "session-a"),
+            ("another conversation", "session-b"),
+        ] {
+            let mut state = app_with_workspaces(&["one"]);
+            state.ensure_test_terminals();
+            let pane_id = state.workspaces[0].tabs[0].root_pane;
+            report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 2, "session-a");
+            // An older report from another Claude arrives late.
+            report_claude_with(
+                &mut state,
+                pane_id,
+                (1, "startup"),
+                rejected,
+                crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![
+                    ProcessInstance::unknown_start(EXITED_PROCESS_ID - 1),
+                ])),
+            );
+            observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
+            assert_eq!(
+                saved_claude_restore(&state, pane_id),
+                (
+                    "session-a".into(),
+                    claude_resume(&["--permission-mode", "plan"], "session-a")
+                ),
                 "{case}"
             );
         }
