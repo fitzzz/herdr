@@ -769,7 +769,11 @@ impl TerminalState {
             &process,
             reading,
         );
-        let seen_session = current_session.cloned();
+        // Undecided, the pane's conversation stays unseen, so a later report
+        // of it decides again.
+        let seen_session = current_session
+            .filter(|session| pairing.session() == Some(*session))
+            .cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
             options,
@@ -9125,6 +9129,43 @@ mod tests {
             "claude",
             "claude-b",
             (3, "compact"),
+            None,
+            &[(10, "claude")],
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder-a".into()])
+        );
+    }
+
+    #[test]
+    fn a_report_first_beside_two_agents_is_decided_again_after_observation() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        // Claude-b is reported beside two Claudes before detection reads
+        // process 10, which leaves it undecided.
+        report_from(
+            &mut terminal,
+            "claude",
+            "claude-b",
+            (1, "startup"),
+            None,
+            &[(10, "claude"), (12, "claude")],
+        );
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--placeholder-a"]),
+            None,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+        // The second one exits, and claude-b is reported again beside 10
+        // alone.
+        report_from(
+            &mut terminal,
+            "claude",
+            "claude-b",
+            (2, "compact"),
             None,
             &[(10, "claude")],
         );
