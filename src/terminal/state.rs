@@ -341,14 +341,12 @@ pub enum SeededLaunch {
     /// Herdr typed it: a restore's resume command or `herdr agent start`. The
     /// process it binds to is paired with the conversation on evidence only.
     Started,
-    /// An earlier server confirmed the conversation for this launch: for
-    /// `process_id` on a live handoff, which the seed is bound to, so that
-    /// process keeps the pairing whatever its command line says; or for a pane
-    /// whose directory is missing, which runs nothing and saves the launch
-    /// unchanged.
-    Paired { process_id: Option<u32> },
-    /// Nothing runs it: a pane restored without resuming its agent keeps the
-    /// saved launch for its next save. No process keeps its options or its
+    /// The server a live handoff replaced confirmed the conversation for
+    /// `process_id`, which the seed is bound to, so that process keeps the
+    /// pairing whatever its command line says.
+    Paired { process_id: u32 },
+    /// Nothing runs it: a pane restored without resuming its agent, or whose
+    /// directory is missing, keeps the saved launch for its next save. No process keeps its options or its
     /// mark, and a conversation reported meanwhile belongs to another launch.
     Saved,
 }
@@ -537,7 +535,7 @@ impl TerminalState {
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent: seed.agent,
             process_id: match seed.launch {
-                SeededLaunch::Paired { process_id } => process_id,
+                SeededLaunch::Paired { process_id } => Some(process_id),
                 SeededLaunch::Started | SeededLaunch::Saved => None,
             },
             options: seed.options,

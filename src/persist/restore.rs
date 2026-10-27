@@ -466,7 +466,7 @@ fn unavailable_restored_terminal(
         if let Some(seed) = restored_agent_launch(
             pane.agent_session.as_ref(),
             None,
-            crate::terminal::SeededLaunch::Paired { process_id: None },
+            crate::terminal::SeededLaunch::Saved,
             false,
         ) {
             terminal.seed_agent_launch(seed);
@@ -602,9 +602,7 @@ fn restore_tab(
                 .as_ref()
                 .map(|imported| match imported.state.agent_launch {
                     Some(crate::terminal::state::HandoffAgentLaunch::Confirmed { process_id }) => {
-                        crate::terminal::SeededLaunch::Paired {
-                            process_id: Some(process_id),
-                        }
+                        crate::terminal::SeededLaunch::Paired { process_id }
                     }
                     Some(crate::terminal::state::HandoffAgentLaunch::Saved) => {
                         crate::terminal::SeededLaunch::Saved
@@ -977,9 +975,8 @@ fn restore_plan_for_snapshot(
 /// conversation, so a save before detection reads the agent's command line
 /// keeps them. The conversation runs in the resume command this restore types
 /// (`native_restore` is its outcome) or, without one, in `saved_launch`: a
-/// handoff pane's agent, which runs on, a pane whose directory is missing,
-/// which saves its session unchanged, or nothing, when the restore does not
-/// resume the agent. Without a resume command the seed keeps the mark from
+/// handoff pane's agent, which runs on, or nothing, when the restore does not
+/// resume the agent or the pane's directory is missing. Without a resume command the seed keeps the mark from
 /// the saved session. A native restore that fell back to the bare command keeps
 /// its options unknown, so the next save does not record the bare command as
 /// the agent's launch options.
@@ -1568,7 +1565,7 @@ mod tests {
             restored_agent_launch(
                 Some(&flagged(None)),
                 None,
-                crate::terminal::SeededLaunch::Paired { process_id: None },
+                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
                 false
             ),
             Some(crate::terminal::AgentLaunchSeed {
@@ -1576,14 +1573,14 @@ mod tests {
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
                 session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Paired { process_id: None }
+                launch: crate::terminal::SeededLaunch::Paired { process_id: 4242 }
             })
         );
         assert_eq!(
             restored_agent_launch(
                 Some(&flagged(Some(placeholder_launch_options()))),
                 None,
-                crate::terminal::SeededLaunch::Paired { process_id: None },
+                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
                 false
             ),
             Some(crate::terminal::AgentLaunchSeed {
@@ -1591,14 +1588,14 @@ mod tests {
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: true,
                 session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Paired { process_id: None }
+                launch: crate::terminal::SeededLaunch::Paired { process_id: 4242 }
             })
         );
         assert_eq!(
             restored_agent_launch(
                 Some(&flagged(None)),
                 None,
-                crate::terminal::SeededLaunch::Paired { process_id: None },
+                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
                 true
             ),
             None
@@ -1623,7 +1620,7 @@ mod tests {
         // Without the mark, only saved options are seeded.
         let unflagged = launch_options_session("claude", None);
         for saved_launch in [
-            crate::terminal::SeededLaunch::Paired { process_id: None },
+            crate::terminal::SeededLaunch::Paired { process_id: 4242 },
             crate::terminal::SeededLaunch::Saved,
         ] {
             assert_eq!(
@@ -2020,6 +2017,8 @@ mod tests {
         let terminal = unavailable(pane);
         assert_eq!(terminal.launch_options_for_session("codex"), None);
         assert!(terminal.resumed_without_launch_options_for_session("codex"));
+        // No agent runs in the pane, so it shows no marker.
+        assert!(!terminal.resumed_without_launch_options());
     }
 
     #[tokio::test]
