@@ -610,6 +610,12 @@ fn restore_tab(
                             session,
                         }
                     }
+                    Some(crate::terminal::state::HandoffAgentLaunch::Assumed { process_id }) => {
+                        crate::terminal::SeededLaunch::Assumed {
+                            process_id,
+                            session,
+                        }
+                    }
                     Some(crate::terminal::state::HandoffAgentLaunch::Saved) => {
                         crate::terminal::SeededLaunch::Saved(session)
                     }
@@ -3076,6 +3082,59 @@ mod tests {
             ]),
             None,
         );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_an_assumed_pairing_bound_to_its_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let report = |terminal: &mut TerminalState, id: &str, seq: u64, start: &str| {
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id(id),
+                Some(seq),
+                Some(start.into()),
+            );
+        };
+        // A Claude started by hand reported its conversation before detection
+        // read it, so the old server assumed the pairing.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+            report(terminal, "claude-session", 1, "startup");
+            terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                4242,
+                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                None,
+            );
+        })
+        .await;
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // On the new server a child Claude in the same job resumes another
+        // conversation, and Herdr cannot tell which one reported it.
+        terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+        report(&mut terminal, "claude-child", 2, "resume");
+        terminal.sync_agent_launch_session(|| {
+            Some(crate::platform::ForegroundJob {
+                process_group_id: 4242,
+                processes: [4242, 4343]
+                    .into_iter()
+                    .map(|pid| crate::platform::ForegroundProcess {
+                        pid,
+                        name: "claude".into(),
+                        argv0: None,
+                        argv: None,
+                        cmdline: None,
+                    })
+                    .collect(),
+            })
+        });
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 

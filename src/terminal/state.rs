@@ -27,13 +27,15 @@ pub struct HookAuthority {
 
 /// How the launch record of a pane paired its saved conversation, carried by a
 /// live handoff so the next server seeds that launch the same way. Without it
-/// the pairing was assumed.
+/// no process was bound to the launch yet.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HandoffAgentLaunch {
     /// Confirmed for this process.
     Confirmed { process_id: u32 },
+    /// Assumed for this process, so another reading of it decides again.
+    Assumed { process_id: u32 },
     /// A saved launch that nothing runs.
     Saved,
 }
@@ -414,6 +416,14 @@ pub enum SeededLaunch {
         process_id: u32,
         session: crate::agent_resume::AgentSessionRef,
     },
+    /// The server a live handoff replaced assumed `session` for `process_id`,
+    /// which the seed is bound to; another reading of that process decides
+    /// again, and a conversation reported meanwhile is checked as for any
+    /// bound process.
+    Assumed {
+        process_id: u32,
+        session: crate::agent_resume::AgentSessionRef,
+    },
     /// Nothing runs it: a pane restored without resuming its agent, or whose
     /// directory is missing, keeps the saved launch for its next save. No
     /// process keeps its options or its mark, and a conversation reported
@@ -613,6 +623,17 @@ impl TerminalState {
             } => LaunchState::Bound {
                 process_id,
                 pairing: Pairing::Confirmed(session),
+                kept_seed: None,
+            },
+            SeededLaunch::Assumed {
+                process_id,
+                session,
+            } => LaunchState::Bound {
+                process_id,
+                pairing: Pairing::Assumed {
+                    session,
+                    earlier: None,
+                },
                 kept_seed: None,
             },
             SeededLaunch::Saved(session) => LaunchState::Saved(session),
@@ -840,6 +861,11 @@ impl TerminalState {
                 pairing: Pairing::Confirmed(_),
                 ..
             } => Some(HandoffAgentLaunch::Confirmed { process_id }),
+            LaunchState::Bound {
+                process_id,
+                pairing: Pairing::Assumed { .. },
+                ..
+            } => Some(HandoffAgentLaunch::Assumed { process_id }),
             LaunchState::Started(_) | LaunchState::Bound { .. } => None,
         }
     }

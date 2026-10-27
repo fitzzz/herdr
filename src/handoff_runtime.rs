@@ -29,8 +29,8 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
-    /// Absent from runtimes written before this field existed, and when the
-    /// pairing was assumed.
+    /// Absent from runtimes written before this field existed, and when no
+    /// process was bound to the pane's launch yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_launch: Option<crate::terminal::state::HandoffAgentLaunch>,
 }
