@@ -70,13 +70,35 @@ mod tests {
             serde_json::from_value(older).expect("an older runtime state should still load");
         assert_eq!(state.agent_launch, None);
 
-        let confirmed = Some(HandoffAgentLaunch::Confirmed { process_id: 4242 });
+        let confirmed = Some(HandoffAgentLaunch::Confirmed {
+            process_id: 4242,
+            process_started: Some(1234),
+        });
         let state = HandoffRuntimeState {
             agent_launch: confirmed,
             ..state
         };
         let loaded: HandoffRuntimeState =
-            serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         assert_eq!(loaded.agent_launch, confirmed);
+
+        // A launch written before the start time was carried loads with none.
+        let older_launch = serde_json::json!({"assumed": {"process_id": 4242}});
+        assert_eq!(
+            serde_json::from_value::<HandoffAgentLaunch>(older_launch).unwrap(),
+            HandoffAgentLaunch::Assumed {
+                process_id: 4242,
+                process_started: None,
+            }
+        );
+        // A launch with no start time read is written as before.
+        assert_eq!(
+            serde_json::to_value(HandoffAgentLaunch::Confirmed {
+                process_id: 4242,
+                process_started: None,
+            })
+            .unwrap(),
+            serde_json::json!({"confirmed": {"process_id": 4242}})
+        );
     }
 }

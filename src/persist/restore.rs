@@ -604,18 +604,26 @@ fn restore_tab(
             #[cfg(unix)]
             if let Some(launch) = handed_off_launch {
                 return match launch {
-                    Some(crate::terminal::state::HandoffAgentLaunch::Confirmed { process_id }) => {
-                        crate::terminal::SeededLaunch::Paired {
-                            process_id,
-                            session,
-                        }
-                    }
-                    Some(crate::terminal::state::HandoffAgentLaunch::Assumed { process_id }) => {
-                        crate::terminal::SeededLaunch::Assumed {
-                            process_id,
-                            session,
-                        }
-                    }
+                    Some(crate::terminal::state::HandoffAgentLaunch::Confirmed {
+                        process_id,
+                        process_started,
+                    }) => crate::terminal::SeededLaunch::Paired {
+                        process: crate::platform::ProcessInstance {
+                            pid: process_id,
+                            started: process_started,
+                        },
+                        session,
+                    },
+                    Some(crate::terminal::state::HandoffAgentLaunch::Assumed {
+                        process_id,
+                        process_started,
+                    }) => crate::terminal::SeededLaunch::Assumed {
+                        process: crate::platform::ProcessInstance {
+                            pid: process_id,
+                            started: process_started,
+                        },
+                        session,
+                    },
                     Some(crate::terminal::state::HandoffAgentLaunch::Saved) => {
                         crate::terminal::SeededLaunch::Saved(session)
                     }
@@ -1189,6 +1197,7 @@ fn collect_ids_inner(node: &Node, ids: &mut Vec<PaneId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::ProcessInstance;
 
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
@@ -1578,7 +1587,7 @@ mod tests {
         session: crate::agent_resume::AgentSessionRef,
     ) -> crate::terminal::SeededLaunch {
         crate::terminal::SeededLaunch::Paired {
-            process_id: 4242,
+            process: ProcessInstance::unknown_start(4242),
             session,
         }
     }
@@ -1598,7 +1607,7 @@ mod tests {
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
                 launch: crate::terminal::SeededLaunch::Paired {
-                    process_id: 4242,
+                    process: ProcessInstance::unknown_start(4242),
                     session: seeded_session("claude").unwrap()
                 }
             })
@@ -1615,7 +1624,7 @@ mod tests {
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: true,
                 launch: crate::terminal::SeededLaunch::Paired {
-                    process_id: 4242,
+                    process: ProcessInstance::unknown_start(4242),
                     session: seeded_session("claude").unwrap()
                 }
             })
@@ -2633,7 +2642,7 @@ mod tests {
             .agent_launch()
             .expect("saved options should be seeded");
         assert_eq!(launch.agent, crate::detect::Agent::Codex);
-        assert_eq!(launch.process_id(), None);
+        assert_eq!(launch.process(), None);
         assert_eq!(
             launch.options,
             crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options())
@@ -2675,7 +2684,7 @@ mod tests {
         // The bare resume process Herdr types shows no options.
         terminal.observe_agent_launch(
             crate::detect::Agent::Claude,
-            4242,
+            ProcessInstance::unknown_start(4242),
             crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
             None,
         );
@@ -2720,7 +2729,7 @@ mod tests {
     fn observe_hand_started_bypass(terminal: &mut TerminalState, resumed: Option<&str>) {
         terminal.observe_agent_launch(
             crate::detect::Agent::Claude,
-            4242,
+            ProcessInstance::unknown_start(4242),
             crate::agent_resume::AgentLaunchOptions::Known(vec![
                 "--dangerously-skip-permissions".into()
             ]),
@@ -2887,10 +2896,7 @@ mod tests {
     /// processes.
     #[cfg(unix)]
     fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
-        crate::terminal::SessionReportEvidence {
-            reporter: None,
-            foreground_agents: Some(process_ids.to_vec()),
-        }
+        crate::terminal::SessionReportEvidence::ForegroundAgents(Some(process_ids.to_vec()))
     }
 
     #[cfg(unix)]
@@ -2926,7 +2932,7 @@ mod tests {
                 // The bare resume command the restore typed.
                 terminal.observe_agent_launch(
                     crate::detect::Agent::Claude,
-                    4242,
+                    ProcessInstance::unknown_start(4242),
                     crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
                     Some("claude-session"),
                 );
@@ -2946,7 +2952,7 @@ mod tests {
             );
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
-                4242,
+                ProcessInstance::unknown_start(4242),
                 crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
                 resumed,
             );
@@ -2976,7 +2982,7 @@ mod tests {
             let mut terminal = handed_off(&snapshot_with_saved_pane_history().0, |terminal| {
                 terminal.observe_agent_launch(
                     crate::detect::Agent::Claude,
-                    4242,
+                    ProcessInstance::unknown_start(4242),
                     crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
                     resumed,
                 );
@@ -3002,7 +3008,7 @@ mod tests {
             // command line and keeps the pairing.
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
-                4242,
+                ProcessInstance::unknown_start(4242),
                 crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed,
             );
@@ -3060,7 +3066,7 @@ mod tests {
         let mut terminal = handed_off(&snapshot, |terminal| {
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
-                4242,
+                ProcessInstance::unknown_start(4242),
                 crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
                 None,
             );
@@ -3071,7 +3077,7 @@ mod tests {
         // That agent exited, and the user started another by hand.
         terminal.observe_agent_launch(
             crate::detect::Agent::Claude,
-            5151,
+            ProcessInstance::unknown_start(5151),
             crate::agent_resume::AgentLaunchOptions::Known(vec![
                 "--dangerously-skip-permissions".into()
             ]),
@@ -3101,7 +3107,7 @@ mod tests {
             terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
-                4242,
+                ProcessInstance::unknown_start(4242),
                 crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
                 None,
             );

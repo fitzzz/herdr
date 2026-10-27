@@ -1146,20 +1146,32 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
     (ret == 0 && pid > 0).then_some(pid as u32)
 }
 
-/// A process and the id of its parent.
-pub(crate) fn process_and_parent(pid: u32) -> Option<(ForegroundProcess, u32)> {
+/// A process, when it started and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     let info = process_bsdinfo(pid)?;
     let argv = process_argv(pid);
-    Some((
-        ForegroundProcess {
+    Some(super::AncestorProcess {
+        process: ForegroundProcess {
             pid,
             name: comm_from_bsdinfo(&info)?,
             argv0: process_argv0_name(pid),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
         },
-        info.pbi_ppid,
-    ))
+        started: Some(start_time_from_bsdinfo(&info)),
+        parent: info.pbi_ppid,
+    })
+}
+
+/// When a process started, in microseconds since the epoch.
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    process_bsdinfo(pid).map(|info| start_time_from_bsdinfo(&info))
+}
+
+fn start_time_from_bsdinfo(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
 }
 
 pub fn process_exists(pid: u32) -> bool {

@@ -292,37 +292,105 @@ pub fn identify_agent_process(
     (agent != Agent::Letta || is_interactive_letta_process(process)).then_some((agent, candidate))
 }
 
-/// How many processes above a reporting process are read to find its agent.
+/// How many processes at and above a reporting process are read.
 const REPORTER_ANCESTOR_LIMIT: usize = 16;
 
-/// The `agent` processes behind a report sent by process `process_id`, such
-/// as the Python process a Claude or Codex hook runs: the nearest process at
-/// or above it that runs `agent`, then each parent directly above that one
-/// that runs `agent` too (a launcher such as npm's `codex`, which starts the
-/// agent binary as its child). `process` reads a process and the id of its
-/// parent.
-pub fn reporting_agent_processes(
+/// The processes at and above `process_id`, nearest first, such as the
+/// Python process a Claude or Codex hook runs and its parents. The walk ends
+/// at the limit, at a process it cannot read, and at a parent that started
+/// after its child, whose id was reused after the real parent exited.
+/// `read` reads a process, when it started and the id of its parent.
+pub fn process_ancestry(
     process_id: u32,
-    agent: Agent,
-    mut process: impl FnMut(u32) -> Option<(crate::platform::ForegroundProcess, u32)>,
-) -> Option<Vec<u32>> {
-    let mut agent_processes = Vec::new();
+    mut read: impl FnMut(u32) -> Option<crate::platform::AncestorProcess>,
+) -> Vec<crate::platform::AncestorProcess> {
+    let mut ancestry: Vec<crate::platform::AncestorProcess> = Vec::new();
     let mut pid = process_id;
-    for _ in 0..REPORTER_ANCESTOR_LIMIT {
-        let Some((info, parent)) = process(pid) else {
+    while ancestry.len() < REPORTER_ANCESTOR_LIMIT {
+        let Some(process) = read(pid) else {
             break;
         };
-        if identify_agent_process(&info).is_some_and(|(identified, _)| identified == agent) {
-            agent_processes.push(pid);
-        } else if !agent_processes.is_empty() {
-            break;
+        if let (Some(child), Some(started)) = (
+            ancestry.last().and_then(|child| child.started),
+            process.started,
+        ) {
+            if started > child {
+                break;
+            }
         }
+        let parent = process.parent;
+        ancestry.push(process);
         if parent == 0 || parent == pid {
             break;
         }
         pid = parent;
     }
-    (!agent_processes.is_empty()).then_some(agent_processes)
+    ancestry
+}
+
+/// Which process sent a Claude or Codex conversation report, from the
+/// processes at and above the sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportSender {
+    /// The nearest process running the agent, inside the pane, and the
+    /// launchers directly above it that started it.
+    Agent(Vec<crate::platform::ProcessInstance>),
+    /// The nearest process running the agent is outside the pane, such as a
+    /// shared daemon, so the report says nothing about the pane's processes.
+    OutsidePane,
+    /// No process running the agent was read below the pane's own process:
+    /// one of them exited or could not be read before the walk reached it.
+    Unidentified,
+}
+
+/// Who sent a report for `agent`, given the processes at and above the sender
+/// (from [`process_ancestry`]) and the pane's own process, its shell or the
+/// agent it started. A parent counts as a launcher only when it runs the
+/// agent through an interpreter or wrapper, such as npm's `node .../codex.js`
+/// starting the native `codex` binary; an agent started by another agent's
+/// shell tool, which may `exec` it under the parent agent itself, names only
+/// itself.
+pub fn report_sender(
+    ancestry: &[crate::platform::AncestorProcess],
+    agent: Agent,
+    pane_process: u32,
+) -> ReportSender {
+    let pane_index = ancestry
+        .iter()
+        .position(|ancestor| ancestor.process.pid == pane_process);
+    let in_pane = match pane_index {
+        Some(index) => &ancestry[..=index],
+        None => ancestry,
+    };
+    let runs_agent = |ancestor: &&crate::platform::AncestorProcess| {
+        identify_agent_process(&ancestor.process).is_some_and(|(identified, _)| identified == agent)
+    };
+    let Some(nearest) = in_pane.iter().position(|ancestor| runs_agent(&ancestor)) else {
+        return ReportSender::Unidentified;
+    };
+    if pane_index.is_none() {
+        return ReportSender::OutsidePane;
+    }
+    let launchers = in_pane[nearest + 1..].iter().take_while(|ancestor| {
+        runs_agent(ancestor)
+            && identify_agent(
+                ancestor
+                    .process
+                    .argv0
+                    .as_deref()
+                    .unwrap_or(&ancestor.process.name),
+            )
+            .is_none()
+    });
+    ReportSender::Agent(
+        std::iter::once(&in_pane[nearest])
+            .chain(launchers)
+            .map(|ancestor| crate::platform::ProcessInstance {
+                pid: ancestor.process.pid,
+                started: ancestor.started,
+            })
+            .collect(),
+    )
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.
@@ -918,6 +986,7 @@ fn is_python_runtime(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{AncestorProcess, ProcessInstance};
 
     fn foreground_process(
         pid: u32,
@@ -933,22 +1002,33 @@ mod tests {
         }
     }
 
-    /// Reads processes from a fake table of `(pid, parent, name, argv)`.
-    fn fake_process_table<'a>(
-        table: &'a [(u32, u32, &'a str, &'a [&'a str])],
-    ) -> impl FnMut(u32) -> Option<(crate::platform::ForegroundProcess, u32)> + 'a {
-        |pid| {
+    /// The processes at and above `pid` in a fake table of `(pid, parent,
+    /// name, argv)`, with unknown start times.
+    fn ancestry_in(table: &[(u32, u32, &str, &[&str])], pid: u32) -> Vec<AncestorProcess> {
+        process_ancestry(pid, |pid| {
             table
                 .iter()
                 .find(|(entry, ..)| *entry == pid)
-                .map(|(pid, parent, name, argv)| (foreground_process(*pid, name, argv), *parent))
-        }
+                .map(|(pid, parent, name, argv)| AncestorProcess {
+                    process: foreground_process(*pid, name, argv),
+                    started: None,
+                    parent: *parent,
+                })
+        })
+    }
+
+    fn agent_processes(pids: &[u32]) -> ReportSender {
+        ReportSender::Agent(
+            pids.iter()
+                .map(|&pid| ProcessInstance { pid, started: None })
+                .collect(),
+        )
     }
 
     #[test]
-    fn reporting_agent_processes_walks_up_to_the_nearest_agent() {
-        // A Claude hook: python3 under the hook's sh under Claude, in a pane
-        // shell under the server.
+    fn report_sender_names_the_nearest_agent_inside_the_pane() {
+        // A Claude hook: python3 under the hook's sh under Claude, in the
+        // pane's shell (20) under the server.
         let claude_hook: &[(u32, u32, &str, &[&str])] = &[
             (50, 40, "python3", &["python3", "-"]),
             (
@@ -961,38 +1041,20 @@ mod tests {
             (20, 10, "bash", &["bash"]),
             (10, 1, "herdr", &["herdr", "server"]),
         ];
+        let ancestry = ancestry_in(claude_hook, 50);
         assert_eq!(
-            reporting_agent_processes(50, Agent::Claude, fake_process_table(claude_hook)),
-            Some(vec![30])
+            report_sender(&ancestry, Agent::Claude, 20),
+            agent_processes(&[30])
         );
-        // A report for another agent finds none.
+        // The pane started the agent itself, with no shell.
         assert_eq!(
-            reporting_agent_processes(50, Agent::Codex, fake_process_table(claude_hook)),
-            None
+            report_sender(&ancestry, Agent::Claude, 30),
+            agent_processes(&[30])
         );
-
-        // A nested Claude started by its parent's Bash tool reports as itself.
-        let nested: &[(u32, u32, &str, &[&str])] = &[
-            (70, 60, "python3", &["python3", "-"]),
-            (
-                60,
-                55,
-                "sh",
-                &["/bin/sh", "herdr-agent-state.sh", "session"],
-            ),
-            (55, 45, "claude", &["claude", "--resume", "placeholder-id"]),
-            (
-                45,
-                30,
-                "bash",
-                &["/bin/bash", "-c", "claude --resume placeholder-id"],
-            ),
-            (30, 20, "claude", &["claude"]),
-            (20, 1, "bash", &["bash"]),
-        ];
+        // A report for another agent names no process.
         assert_eq!(
-            reporting_agent_processes(70, Agent::Claude, fake_process_table(nested)),
-            Some(vec![55])
+            report_sender(&ancestry, Agent::Codex, 20),
+            ReportSender::Unidentified
         );
 
         // npm's `codex` launcher runs the Codex binary as its child.
@@ -1009,26 +1071,107 @@ mod tests {
             (20, 1, "bash", &["bash"]),
         ];
         assert_eq!(
-            reporting_agent_processes(90, Agent::Codex, fake_process_table(npm_codex)),
-            Some(vec![80, 75])
+            report_sender(&ancestry_in(npm_codex, 90), Agent::Codex, 20),
+            agent_processes(&[80, 75])
         );
     }
 
     #[test]
-    fn reporting_agent_processes_stops_at_its_limit_and_at_unreadable_processes() {
-        // A chain of shells deeper than the limit above the agent.
+    fn a_reporter_names_only_an_execed_child_under_a_native_parent_agent() {
+        // The parent Claude's Bash tool ran `exec claude --resume A`, so the
+        // child Claude's parent is the native parent Claude itself.
+        let execed: &[(u32, u32, &str, &[&str])] = &[
+            (70, 60, "python3", &["python3", "-"]),
+            (
+                60,
+                55,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (55, 30, "claude", &["claude", "--resume", "placeholder-a"]),
+            (30, 20, "claude", &["claude"]),
+            (20, 1, "bash", &["bash"]),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(execed, 70), Agent::Claude, 20),
+            agent_processes(&[55])
+        );
+    }
+
+    #[test]
+    fn a_hook_run_by_an_agent_outside_the_pane_names_no_reporter() {
+        // A shared Codex daemon under pid 1 runs the hook; the pane's shell
+        // is 20.
+        let daemon: &[(u32, u32, &str, &[&str])] = &[
+            (90, 85, "python3", &["python3", "-"]),
+            (
+                85,
+                80,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (
+                80,
+                1,
+                "codex",
+                &["/placeholder/bin/codex", "app-server", "--managed-daemon"],
+            ),
+            (1, 0, "systemd", &["/sbin/init"]),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(daemon, 90), Agent::Codex, 20),
+            ReportSender::OutsidePane
+        );
+    }
+
+    #[test]
+    fn a_walk_that_reaches_no_agent_below_the_pane_names_no_process() {
+        // The hook's sh exited before the server read it.
+        let exited: &[(u32, u32, &str, &[&str])] = &[(50, 40, "python3", &["python3", "-"])];
+        assert_eq!(
+            report_sender(&ancestry_in(exited, 50), Agent::Claude, 20),
+            ReportSender::Unidentified
+        );
+        // The server itself runs inside a Claude; a report sent by hand from
+        // the pane's shell does not name that Claude.
+        let by_hand: &[(u32, u32, &str, &[&str])] = &[
+            (50, 20, "herdr", &["herdr", "pane", "report-agent-session"]),
+            (20, 10, "bash", &["bash"]),
+            (10, 5, "herdr", &["herdr", "server"]),
+            (5, 1, "claude", &["claude"]),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(by_hand, 50), Agent::Claude, 20),
+            ReportSender::Unidentified
+        );
+    }
+
+    #[test]
+    fn process_ancestry_stops_at_its_limit_unreadable_processes_and_reused_parents() {
+        // A chain of shells deeper than the limit.
         let deep = (1..=20u32)
             .map(|pid| (pid + 100, pid + 101, "sh", &["sh"][..]))
-            .chain(std::iter::once((121, 1, "claude", &["claude"][..])))
             .collect::<Vec<_>>();
+        assert_eq!(ancestry_in(&deep, 101).len(), REPORTER_ANCESTOR_LIMIT);
+        // The sender exited before the server read it.
+        assert_eq!(ancestry_in(&deep, 999), Vec::new());
+        // The parent id now names a process that started after the child.
+        let read = |pid: u32| {
+            [(50, 40, 200), (40, 1, 300)]
+                .into_iter()
+                .find(|(entry, ..)| *entry == pid)
+                .map(|(pid, parent, started)| AncestorProcess {
+                    process: foreground_process(pid, "sh", &["sh"]),
+                    started: Some(started),
+                    parent,
+                })
+        };
         assert_eq!(
-            reporting_agent_processes(101, Agent::Claude, fake_process_table(&deep)),
-            None
-        );
-        // The reporter exited before the server read it.
-        assert_eq!(
-            reporting_agent_processes(999, Agent::Claude, fake_process_table(&deep)),
-            None
+            process_ancestry(50, read)
+                .iter()
+                .map(|ancestor| ancestor.process.pid)
+                .collect::<Vec<_>>(),
+            vec![50]
         );
     }
 

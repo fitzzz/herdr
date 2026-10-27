@@ -772,30 +772,43 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
     u32::try_from(stream.peer_creds().ok()?.pid()?).ok()
 }
 
-/// A process and the id of its parent.
-pub(crate) fn process_and_parent(pid: u32) -> Option<(ForegroundProcess, u32)> {
+/// A process, when it started and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
-    // After (comm): state(0) ppid(1)
-    let parent = stat
-        .get(stat.rfind(')')? + 2..)?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
     let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
         .then(|| process_argv(pid))
         .flatten();
-    Some((
-        ForegroundProcess {
+    Some(super::AncestorProcess {
+        process: ForegroundProcess {
             pid,
             name,
             argv0: None,
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
         },
-        parent,
-    ))
+        started: stat_field_after_comm(&stat, STAT_STARTTIME),
+        parent: stat_field_after_comm(&stat, STAT_PPID)?.try_into().ok()?,
+    })
+}
+
+/// When a process started, in clock ticks since boot.
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_field_after_comm(&stat, STAT_STARTTIME)
+}
+
+/// `/proc/<pid>/stat` fields counted from the state after the command name:
+/// field 4 (ppid) and field 22 (starttime).
+const STAT_PPID: usize = 1;
+const STAT_STARTTIME: usize = 19;
+
+fn stat_field_after_comm(stat: &str, index: usize) -> Option<u64> {
+    stat.get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(index)?
+        .parse()
+        .ok()
 }
 
 pub fn process_exists(pid: u32) -> bool {

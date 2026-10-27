@@ -538,6 +538,7 @@ mod tests {
     use super::*;
     use crate::app::{AppState, Mode};
     use crate::layout::NavDirection;
+    use crate::platform::ProcessInstance;
     use crate::workspace::Workspace;
 
     fn session_fixture(name: &str) -> &'static str {
@@ -1423,7 +1424,7 @@ mod tests {
         if let Some((agent, options)) = launch {
             terminal.observe_agent_launch(
                 agent,
-                4242,
+                ProcessInstance::unknown_start(4242),
                 options,
                 (!hook_authority).then_some("session-1"),
             );

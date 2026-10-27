@@ -2373,16 +2373,23 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
     stream.peer_creds().ok()?.pid()
 }
 
-/// A process and the id of its parent. A process that started after the
-/// cached snapshot, such as the CLI that sent a report, is read from a fresh
-/// one.
-pub(crate) fn process_and_parent(pid: u32) -> Option<(super::ForegroundProcess, u32)> {
+/// A process, when it started and the id of its parent. A process that
+/// started after the cached snapshot, such as the CLI that sent a report, is
+/// read from a fresh one.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     let read = |snapshot: &ProcessSnapshot| {
-        snapshot
-            .entry(pid)
-            .map(|entry| (foreground_process_from_entry(entry), entry.parent_pid))
+        snapshot.entry(pid).map(|entry| super::AncestorProcess {
+            process: foreground_process_from_entry(entry),
+            started: entry.command().creation_time,
+            parent: entry.parent_pid,
+        })
     };
     read(&cached_foreground_processes()).or_else(|| read(&fresh_foreground_processes()))
+}
+
+/// When a process started, as its creation time.
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    ProcessIdentity::open(pid)?.creation_time()
 }
 
 pub fn process_exists(pid: u32) -> bool {

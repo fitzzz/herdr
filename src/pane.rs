@@ -334,7 +334,10 @@ async fn publish_agent_launch_observed_event(
         .send(AppEvent::AgentLaunchObserved {
             pane_id,
             agent,
-            process_id,
+            process: crate::platform::ProcessInstance {
+                pid: process_id,
+                started: crate::platform::process_start_time(process_id),
+            },
             argv,
         })
         .await

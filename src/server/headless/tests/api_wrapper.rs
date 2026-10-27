@@ -15,7 +15,7 @@ fn request(server: &mut HeadlessServer, method: Method) -> serde_json::Value {
             method,
         },
         projection: None,
-        peer_process_id: None,
+        peer_ancestry: None,
         respond_to,
         response_write_complete: None,
     });

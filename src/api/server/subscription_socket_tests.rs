@@ -264,8 +264,17 @@ fn a_session_report_carries_the_process_that_sent_it() {
         "peer_process_id": 1
     }));
     let request = test.app_request();
-    // This test is the process on the other end of the connection.
-    assert_eq!(request.peer_process_id, Some(std::process::id()));
+    // This test is the process on the other end of the connection, read
+    // with its parents.
+    let ancestry = request.peer_ancestry.clone().unwrap_or_default();
+    assert_eq!(
+        ancestry.first().map(|sender| sender.process.pid),
+        Some(std::process::id())
+    );
+    assert_eq!(
+        ancestry.get(1).map(|parent| parent.process.pid),
+        ancestry.first().map(|sender| sender.parent)
+    );
     reply(request, ResponseResult::Ok {});
     assert_eq!(client.response()["id"], "report");
 
@@ -276,7 +285,7 @@ fn a_session_report_carries_the_process_that_sent_it() {
         "params": {"pane_id": "pane_1"}
     }));
     let request = test.app_request();
-    assert_eq!(request.peer_process_id, None);
+    assert_eq!(request.peer_ancestry, None);
     reply_to_probe(request);
     assert_eq!(client.response()["id"], "other-method");
 }

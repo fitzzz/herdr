@@ -456,9 +456,12 @@ fn handle_connection_with_stop(
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         method_body => {
-            let peer_process_id = matches!(method_body, Method::PaneReportAgentSession(_))
+            let peer_ancestry = matches!(method_body, Method::PaneReportAgentSession(_))
                 .then(|| crate::platform::local_stream_peer_process_id(&stream))
-                .flatten();
+                .flatten()
+                .map(|process_id| {
+                    crate::detect::process_ancestry(process_id, crate::platform::process_and_parent)
+                });
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let response = handle_request(
                 Request {
@@ -469,7 +472,7 @@ fn handle_connection_with_stop(
                 capabilities,
                 server_stop,
                 Some(response_write_rx),
-                peer_process_id,
+                peer_ancestry,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
@@ -524,7 +527,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
-    peer_process_id: Option<u32>,
+    peer_ancestry: Option<Vec<crate::platform::AncestorProcess>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
@@ -573,7 +576,7 @@ fn handle_request(
         response_write_complete,
         None,
         None,
-        peer_process_id,
+        peer_ancestry,
     )
 }
 
@@ -1065,14 +1068,14 @@ fn dispatch_to_app(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
     projection: Option<crate::api::ApiRequestProjection>,
-    peer_process_id: Option<u32>,
+    peer_ancestry: Option<Vec<crate::platform::AncestorProcess>>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         projection,
-        peer_process_id,
+        peer_ancestry,
         respond_to,
         response_write_complete,
     }) {

@@ -90,11 +90,12 @@ pub enum AppEvent {
         observed_at: Instant,
     },
     /// Process detection read the command line of a new Claude or Codex
-    /// process. `argv` is `None` where the platform does not read it.
+    /// process, read with when it started. `argv` is `None` where the
+    /// platform does not read it.
     AgentLaunchObserved {
         pane_id: PaneId,
         agent: Agent,
-        process_id: u32,
+        process: crate::platform::ProcessInstance,
         argv: Option<Vec<String>>,
     },
     /// The current Codex input screen is visible during managed startup.

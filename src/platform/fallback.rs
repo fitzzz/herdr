@@ -217,7 +217,12 @@ pub(crate) fn local_stream_peer_process_id(_stream: &crate::ipc::LocalStream) ->
 }
 
 /// Unsupported platform stub.
-pub(crate) fn process_and_parent(_pid: u32) -> Option<(super::ForegroundProcess, u32)> {
+pub(crate) fn process_and_parent(_pid: u32) -> Option<super::AncestorProcess> {
+    None
+}
+
+/// Unsupported platform stub.
+pub(crate) fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
 

@@ -45,6 +45,39 @@ pub struct ForegroundProcess {
     pub cmdline: Option<String>,
 }
 
+/// One running process, told apart from a later process given the same id by
+/// when it started. `started` is in the platform's own units and compared only
+/// on this host; it is `None` where the platform could not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessInstance {
+    pub pid: u32,
+    pub started: Option<u64>,
+}
+
+impl ProcessInstance {
+    /// A process whose start time is unknown, so it matches by id alone.
+    #[cfg(test)]
+    pub fn unknown_start(pid: u32) -> Self {
+        Self { pid, started: None }
+    }
+
+    /// Whether `other` is this process: the same id and, when both start
+    /// times are known, the same start time.
+    pub fn is(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && (self.started.is_none() || other.started.is_none() || self.started == other.started)
+    }
+}
+
+/// A process read while walking up from another, with when it started and the
+/// id of its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorProcess {
+    pub process: ForegroundProcess,
+    pub started: Option<u64>,
+    pub parent: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundJob {
     pub process_group_id: u32,

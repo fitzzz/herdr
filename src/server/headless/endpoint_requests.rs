@@ -126,7 +126,7 @@ impl HeadlessServer {
                 api::ApiRequestMessage {
                     projection: None,
                     // A client shell's peer is the client, never an agent's hook.
-                    peer_process_id: None,
+                    peer_ancestry: None,
                     request: *request,
                     respond_to,
                     response_write_complete: None,

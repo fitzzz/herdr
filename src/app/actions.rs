@@ -1445,7 +1445,7 @@ impl AppState {
             AppEvent::AgentLaunchObserved {
                 pane_id,
                 agent,
-                process_id,
+                process,
                 argv,
             } => {
                 if let Some(options) =
@@ -1457,7 +1457,7 @@ impl AppState {
                     self.update_terminal_state(pane_id, |terminal| {
                         terminal.observe_agent_launch(
                             agent,
-                            process_id,
+                            process,
                             options,
                             resumed_session.as_deref(),
                         );
@@ -2131,6 +2131,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
+    use crate::platform::ProcessInstance;
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -3332,7 +3333,7 @@ mod tests {
         state.update_terminal_state(pane_id, |terminal| {
             terminal.observe_agent_launch(
                 Agent::Claude,
-                10,
+                ProcessInstance::unknown_start(10),
                 crate::agent_resume::AgentLaunchOptions::Known(vec!["--placeholder".into()]),
                 None,
             );
@@ -3344,7 +3345,7 @@ mod tests {
         state.update_terminal_state(pane_id, |terminal| {
             terminal.observe_agent_launch(
                 Agent::Claude,
-                10,
+                ProcessInstance::unknown_start(10),
                 crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
                 None,
             );
@@ -3369,10 +3370,9 @@ mod tests {
             seq: Some(seq),
             session_ref: crate::agent_resume::AgentSessionRef::id(session),
             session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
-            evidence: crate::terminal::SessionReportEvidence {
-                reporter: None,
-                foreground_agents: Some(vec![std::process::id()]),
-            },
+            evidence: crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![
+                std::process::id(),
+            ])),
         });
     }
 
@@ -3385,7 +3385,7 @@ mod tests {
         state.handle_app_event(AppEvent::AgentLaunchObserved {
             pane_id,
             agent: Agent::Claude,
-            process_id,
+            process: ProcessInstance::unknown_start(process_id),
             argv: Some(vec![
                 "claude".into(),
                 "--permission-mode".into(),
@@ -3398,7 +3398,7 @@ mod tests {
         state.handle_app_event(AppEvent::AgentLaunchObserved {
             pane_id,
             agent: Agent::Claude,
-            process_id,
+            process: ProcessInstance::unknown_start(process_id),
             argv: Some(argv.iter().map(|arg| arg.to_string()).collect()),
         });
     }
@@ -3672,7 +3672,7 @@ mod tests {
         state.handle_app_event(AppEvent::AgentLaunchObserved {
             pane_id,
             agent: Agent::Claude,
-            process_id: 10,
+            process: ProcessInstance::unknown_start(10),
             argv: Some(vec![
                 "claude".into(),
                 "--model".into(),

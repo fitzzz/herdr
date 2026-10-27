@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 // Process-exit updates clear matching hook authority before recomputing state.
 
 use crate::detect::{Agent, AgentState};
+use crate::platform::ProcessInstance;
 use crate::terminal::TerminalId;
 
 #[path = "metadata.rs"]
@@ -32,10 +33,19 @@ pub struct HookAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HandoffAgentLaunch {
-    /// Confirmed for this process.
-    Confirmed { process_id: u32 },
+    /// Confirmed for this process. `process_started` is absent from a
+    /// runtime written before it existed, and where the start time is unknown.
+    Confirmed {
+        process_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_started: Option<u64>,
+    },
     /// Assumed for this process, so another reading of it decides again.
-    Assumed { process_id: u32 },
+    Assumed {
+        process_id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_started: Option<u64>,
+    },
     /// A saved launch that nothing runs.
     Saved,
 }
@@ -145,7 +155,7 @@ struct AgentNameOwner {
 /// started.
 fn seed_keeps_record(
     seed: &ObservedAgentLaunch,
-    process_id: u32,
+    process: &ProcessInstance,
     observed: &crate::agent_resume::AgentLaunchOptions,
     resumed_session: Option<&str>,
 ) -> bool {
@@ -153,10 +163,10 @@ fn seed_keeps_record(
     match &seed.state {
         LaunchState::Saved(_) => return false,
         LaunchState::Bound {
-            process_id: bound,
+            process: bound,
             kept_seed,
             ..
-        } if *bound != process_id || kept_seed.is_none() => return false,
+        } if !bound.is(process) || kept_seed.is_none() => return false,
         LaunchState::Started(_) | LaunchState::Bound { .. } => {}
     }
     if matches!(
@@ -253,7 +263,7 @@ enum LaunchState {
     Saved(crate::agent_resume::AgentSessionRef),
     /// Detection read this process, or a live handoff bound the seed to it.
     Bound {
-        process_id: u32,
+        process: ProcessInstance,
         pairing: Pairing,
         /// While the record still holds a seed's options for this process,
         /// the rank of the reading they were kept through, so a better
@@ -315,7 +325,7 @@ impl Pairing {
     }
 }
 
-/// The conversation the launch record of `process_id` owns, given the record
+/// The conversation the launch record of `process` owns, given the record
 /// it replaces, the pane's current conversation, whether a live agent
 /// reported it (rather than a restore leaving it) and what the server could
 /// tell about which process did, and what the process's command line says.
@@ -325,23 +335,23 @@ fn session_for_process(
     current_session: Option<&crate::agent_resume::AgentSessionRef>,
     current_reported: bool,
     current_report: Option<&SessionReportEvidence>,
-    process_id: u32,
+    process: &ProcessInstance,
     reading: ResumeReading,
 ) -> Pairing {
     // The agent's own report names the conversation its process runs.
-    let reporter = current_report.and_then(|report| report.reporter.as_deref());
+    let reporter = match current_report {
+        Some(SessionReportEvidence::Reporter(reporter)) => Some(reporter),
+        _ => None,
+    };
     if let (Some(session), Some(reporter)) = (current_session, reporter) {
-        if reporter.contains(&process_id) {
+        if reporter.iter().any(|reporter| reporter.is(process)) {
             return Pairing::Confirmed(session.clone());
         }
     }
     // Another reading of the same process, or the seed of the launch that
     // started it.
     let same_launch = previous.filter(|previous| {
-        previous.agent == agent
-            && previous
-                .process_id()
-                .is_none_or(|bound| bound == process_id)
+        previous.agent == agent && previous.process().is_none_or(|bound| bound.is(process))
     });
     if let Some(
         LaunchState::Started(Pairing::Confirmed(session))
@@ -366,10 +376,10 @@ fn session_for_process(
         .filter(|session| reporter.is_none() || Some(*session) != current_session);
     // A conversation a live agent reported that no earlier process owned: a
     // fresh agent whose report arrived before detection read it. Not when
-    // another process reported it, or when another Claude or Codex process
-    // in the pane's foreground job could have.
+    // another process reported it, or when the server cannot tell whether
+    // another one did.
     let reported_elsewhere =
-        reporter.is_some() || current_report.is_some_and(SessionReportEvidence::shared_job);
+        reporter.is_some() || current_report.is_some_and(SessionReportEvidence::undecided);
     let reported = current_session
         .filter(|session| current_reported && earlier != Some(*session) && !reported_elsewhere);
     let (session, confirmed) = match reading {
@@ -405,28 +415,40 @@ fn session_for_process(
 
 /// What the server knew, as a Claude or Codex conversation report arrived,
 /// about which process sent it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionReportEvidence {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionReportEvidence {
     /// The reporter: the nearest process running the report's agent above
-    /// the process that sent the report, with the processes directly above
-    /// it that run the same agent (a launcher that started it). `None` when
-    /// the server could not tell, such as for a report that did not come
-    /// over the local API socket.
-    pub reporter: Option<Vec<u32>>,
-    /// When the reporter is unknown, the Claude and Codex processes in the
-    /// pane's foreground job, when the job could be read.
-    pub foreground_agents: Option<Vec<u32>>,
+    /// the process that sent the report, inside the pane, with the launchers
+    /// directly above it that started it.
+    Reporter(Vec<ProcessInstance>),
+    /// The server read the process that sent the report but found no process
+    /// running the agent between it and the pane's own process, such as when
+    /// one of them exited first, so it cannot tell who reported.
+    Unidentified,
+    /// The server could not read the process that sent the report, such as
+    /// for a report that did not come over the local API socket, or that
+    /// process runs the agent outside the pane: the Claude and Codex
+    /// processes in the pane's foreground job, when the job could be read.
+    ForegroundAgents(Option<Vec<u32>>),
+}
+
+impl Default for SessionReportEvidence {
+    fn default() -> Self {
+        Self::ForegroundAgents(None)
+    }
 }
 
 impl SessionReportEvidence {
-    /// The reporter is unknown and the pane's foreground job runs more than
-    /// one Claude or Codex process, so any of them could have reported.
-    fn shared_job(&self) -> bool {
-        self.reporter.is_none()
-            && self
-                .foreground_agents
-                .as_ref()
-                .is_some_and(|agents| agents.len() > 1)
+    /// The server cannot tell which process reported: it named none, or the
+    /// pane's foreground job runs more than one Claude or Codex process.
+    fn undecided(&self) -> bool {
+        match self {
+            Self::Reporter(_) => false,
+            Self::Unidentified => true,
+            Self::ForegroundAgents(agents) => {
+                agents.as_ref().is_some_and(|agents| agents.len() > 1)
+            }
+        }
     }
 }
 
@@ -451,19 +473,19 @@ pub enum SeededLaunch {
     Started {
         session: Option<crate::agent_resume::AgentSessionRef>,
     },
-    /// The server a live handoff replaced confirmed `session` for
-    /// `process_id`, which the seed is bound to, so that process keeps the
-    /// pairing whatever its command line says.
+    /// The server a live handoff replaced confirmed `session` for `process`,
+    /// which the seed is bound to, so that process keeps the pairing whatever
+    /// its command line says.
     Paired {
-        process_id: u32,
+        process: ProcessInstance,
         session: crate::agent_resume::AgentSessionRef,
     },
-    /// The server a live handoff replaced assumed `session` for `process_id`,
+    /// The server a live handoff replaced assumed `session` for `process`,
     /// which the seed is bound to; another reading of that process decides
     /// again, and a conversation reported meanwhile is checked as for any
     /// bound process.
     Assumed {
-        process_id: u32,
+        process: ProcessInstance,
         session: crate::agent_resume::AgentSessionRef,
     },
     /// Nothing runs it: a pane restored without resuming its agent, or whose
@@ -491,9 +513,9 @@ pub struct ObservedAgentLaunch {
 impl ObservedAgentLaunch {
     /// The agent process whose command line was read; `None` until detection
     /// binds a record seeded by restore or `herdr agent start` to it.
-    pub fn process_id(&self) -> Option<u32> {
+    pub fn process(&self) -> Option<ProcessInstance> {
         match self.state {
-            LaunchState::Bound { process_id, .. } => Some(process_id),
+            LaunchState::Bound { process, .. } => Some(process),
             LaunchState::Started(_) | LaunchState::Saved(_) => None,
         }
     }
@@ -664,19 +686,13 @@ impl TerminalState {
             SeededLaunch::Started { session: None } => {
                 LaunchState::Started(Pairing::Unpaired { earlier: None })
             }
-            SeededLaunch::Paired {
-                process_id,
-                session,
-            } => LaunchState::Bound {
-                process_id,
+            SeededLaunch::Paired { process, session } => LaunchState::Bound {
+                process,
                 pairing: Pairing::Confirmed(session),
                 kept_seed: None,
             },
-            SeededLaunch::Assumed {
-                process_id,
-                session,
-            } => LaunchState::Bound {
-                process_id,
+            SeededLaunch::Assumed { process, session } => LaunchState::Bound {
+                process,
                 pairing: Pairing::Assumed {
                     session,
                     earlier: None,
@@ -700,7 +716,7 @@ impl TerminalState {
     pub fn observe_agent_launch(
         &mut self,
         agent: Agent,
-        process_id: u32,
+        process: ProcessInstance,
         options: crate::agent_resume::AgentLaunchOptions,
         resumed_session: Option<&str>,
     ) {
@@ -714,11 +730,11 @@ impl TerminalState {
         // process; that replaces a record that could not read or place it.
         if current.is_some_and(|current| match current.state {
             LaunchState::Bound {
-                process_id: bound,
+                process: bound,
                 kept_seed,
                 ..
             } => {
-                bound == process_id
+                bound.is(&process)
                     && rank <= kept_seed.unwrap_or_else(|| ReadingRank::of(&current.options))
             }
             LaunchState::Started(_) | LaunchState::Saved(_) => false,
@@ -727,7 +743,7 @@ impl TerminalState {
         }
         let reading = ResumeReading::of(&options, resumed_session);
         let (options, resumed_without_options, kept_seed) = match current {
-            Some(current) if seed_keeps_record(current, process_id, &options, resumed_session) => (
+            Some(current) if seed_keeps_record(current, &process, &options, resumed_session) => (
                 current.options.clone(),
                 current.resumed_without_options,
                 Some(rank),
@@ -749,7 +765,7 @@ impl TerminalState {
                 .is_some_and(|authority| authority.session_ref.is_some())
                 || self.persisted_agent_session_reported,
             current_report,
-            process_id,
+            &process,
             reading,
         );
         let seen_session = current_session.cloned();
@@ -759,7 +775,7 @@ impl TerminalState {
             resumed_without_options,
             seen_session,
             state: LaunchState::Bound {
-                process_id,
+                process,
                 pairing,
                 kept_seed,
             },
@@ -783,13 +799,15 @@ impl TerminalState {
     /// process, that is the record bound to it (a conversation change inside
     /// it, such as Claude `/clear`); a record holding another process or not
     /// yet bound keeps its pairing, and the reporter owns the conversation
-    /// when detection binds it. Otherwise it is a launch not yet bound to a
-    /// process, when the pane's foreground job runs at most one Claude or
-    /// Codex process, or the recorded process when the job runs it and no
-    /// other. With more than one in the job, or the bound process's job
-    /// unreadable, the report stays undecided, so a repeated report decides
-    /// again. A conversation reported beside a saved launch that nothing runs
-    /// belongs to another launch.
+    /// when detection binds it. When the server read the sender but found no
+    /// agent process for it, the report stays undecided, so a repeated report
+    /// decides again. When it could not read the sender, or the sender runs
+    /// the agent outside the pane, it is a launch not yet bound to a process,
+    /// when the pane's foreground job runs at most one Claude or Codex
+    /// process, or the recorded process when the job runs it and no other;
+    /// with more than one in the job, or the bound process's job unreadable,
+    /// the report stays undecided too. A conversation reported beside a saved
+    /// launch that nothing runs belongs to another launch.
     pub fn sync_agent_launch_session(&mut self, evidence: &SessionReportEvidence) {
         let Some(session) = self.current_session_ref().cloned() else {
             return;
@@ -798,21 +816,26 @@ impl TerminalState {
         let Some(launch) = self.agent_launch.as_mut() else {
             return;
         };
-        let pairs = match (evidence.reporter.as_deref(), &launch.state) {
+        let pairs = match (evidence, &launch.state) {
             (_, LaunchState::Saved(_)) => false,
-            (Some(reporter), LaunchState::Bound { process_id, .. }) => {
-                reporter.contains(process_id)
+            (SessionReportEvidence::Reporter(reporter), LaunchState::Bound { process, .. }) => {
+                reporter.iter().any(|reporter| reporter.is(process))
             }
-            (Some(_), LaunchState::Started(_)) => false,
-            (None, _) if launch.seen_session.as_ref() == Some(&session) => return,
-            (None, _) if evidence.shared_job() => return,
-            (None, LaunchState::Bound { process_id, .. }) => {
-                match evidence.foreground_agents.as_deref() {
-                    Some([agent_process]) => agent_process == process_id,
-                    Some(_) | None => return,
-                }
+            (SessionReportEvidence::Reporter(_), LaunchState::Started(_)) => false,
+            (SessionReportEvidence::Unidentified, _) => return,
+            (SessionReportEvidence::ForegroundAgents(_), _)
+                if launch.seen_session.as_ref() == Some(&session) || evidence.undecided() =>
+            {
+                return
             }
-            (None, LaunchState::Started(_)) => true,
+            (
+                SessionReportEvidence::ForegroundAgents(agents),
+                LaunchState::Bound { process, .. },
+            ) => match agents.as_deref() {
+                Some([agent_process]) => *agent_process == process.pid,
+                Some(_) | None => return,
+            },
+            (SessionReportEvidence::ForegroundAgents(_), LaunchState::Started(_)) => true,
         };
         launch.seen_session = Some(session.clone());
         if !pairs {
@@ -906,15 +929,21 @@ impl TerminalState {
         match self.launch_for_current_session()?.state {
             LaunchState::Saved(_) => Some(HandoffAgentLaunch::Saved),
             LaunchState::Bound {
-                process_id,
+                process,
                 pairing: Pairing::Confirmed(_),
                 ..
-            } => Some(HandoffAgentLaunch::Confirmed { process_id }),
+            } => Some(HandoffAgentLaunch::Confirmed {
+                process_id: process.pid,
+                process_started: process.started,
+            }),
             LaunchState::Bound {
-                process_id,
+                process,
                 pairing: Pairing::Assumed { .. },
                 ..
-            } => Some(HandoffAgentLaunch::Assumed { process_id }),
+            } => Some(HandoffAgentLaunch::Assumed {
+                process_id: process.pid,
+                process_started: process.started,
+            }),
             LaunchState::Started(_) | LaunchState::Bound { .. } => None,
         }
     }
@@ -3194,7 +3223,12 @@ mod tests {
     #[test]
     fn agent_launch_observation_replaces_records_for_new_processes() {
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--bypass"]),
+            None,
+        );
         let first_revision = terminal.agent_launch_revision();
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3202,7 +3236,12 @@ mod tests {
         );
 
         // The same process observed again changes nothing.
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&[]),
+            None,
+        );
         assert_eq!(terminal.agent_launch_revision(), first_revision);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3210,7 +3249,12 @@ mod tests {
         );
 
         // A replacement Claude process in a new process group replaces them.
-        terminal.observe_agent_launch(Agent::Claude, 11, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(11),
+            known_options(&[]),
+            None,
+        );
         assert_ne!(terminal.agent_launch_revision(), first_revision);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -3218,7 +3262,12 @@ mod tests {
         );
 
         // A different agent replaces them too, and they never apply to Claude.
-        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--search"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(11),
+            known_options(&["--search"]),
+            None,
+        );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         assert_eq!(
             terminal.launch_options_for_session("codex"),
@@ -3231,17 +3280,20 @@ mod tests {
         let mut terminal = test_terminal();
         terminal.observe_agent_launch(
             Agent::Claude,
-            100,
+            ProcessInstance::unknown_start(100),
             known_options(&["--placeholder-a"]),
             None,
         );
         terminal.observe_agent_launch(
             Agent::Claude,
-            101,
+            ProcessInstance::unknown_start(101),
             known_options(&["--placeholder-b"]),
             None,
         );
-        assert_eq!(terminal.agent_launch().unwrap().process_id(), Some(101));
+        assert_eq!(
+            terminal.agent_launch().unwrap().process(),
+            Some(ProcessInstance::unknown_start(101))
+        );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-b".to_string()])
@@ -3258,12 +3310,17 @@ mod tests {
             resumed_without_options: true,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(100),
+            known_options(&[]),
+            None,
+        );
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(
             Agent::Claude,
-            101,
+            ProcessInstance::unknown_start(101),
             known_options(&["--placeholder-b"]),
             None,
         );
@@ -3288,14 +3345,14 @@ mod tests {
         });
         terminal.observe_agent_launch(
             Agent::Claude,
-            100,
+            ProcessInstance::unknown_start(100),
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::UnrecognizedCommand,
             ),
             None,
         );
         let record = terminal.agent_launch().unwrap();
-        assert_eq!(record.process_id(), Some(100));
+        assert_eq!(record.process(), Some(ProcessInstance::unknown_start(100)));
         assert_eq!(record.options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
     }
@@ -3328,12 +3385,12 @@ mod tests {
         let mut terminal = seeded();
         terminal.observe_agent_launch(
             Agent::Claude,
-            100,
+            ProcessInstance::unknown_start(100),
             known_options(&["--placeholder-wrapper"]),
             Some("placeholder-session"),
         );
         let record = terminal.agent_launch().unwrap();
-        assert_eq!(record.process_id(), Some(100));
+        assert_eq!(record.process(), Some(ProcessInstance::unknown_start(100)));
         assert_eq!(record.options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
         assert_eq!(terminal.launch_options_for_session("claude"), None);
@@ -3345,7 +3402,7 @@ mod tests {
             let mut terminal = seeded();
             terminal.observe_agent_launch(
                 Agent::Claude,
-                100,
+                ProcessInstance::unknown_start(100),
                 known_options(&["--placeholder-wrapper"]),
                 resumed,
             );
@@ -3378,7 +3435,7 @@ mod tests {
             seen_session: None,
             state: match process_id {
                 Some(process_id) => LaunchState::Bound {
-                    process_id,
+                    process: ProcessInstance::unknown_start(process_id),
                     pairing,
                     kept_seed: None,
                 },
@@ -3499,13 +3556,18 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                seed_keeps_record(seed, 10, observed, resumed),
+                seed_keeps_record(seed, &ProcessInstance::unknown_start(10), observed, resumed),
                 keeps,
                 "{case}"
             );
         }
         // A seed kept through one process is bound to it.
-        assert!(!seed_keeps_record(&kept_through_launcher, 11, &empty, None));
+        assert!(!seed_keeps_record(
+            &kept_through_launcher,
+            &ProcessInstance::unknown_start(11),
+            &empty,
+            None
+        ));
     }
 
     #[test]
@@ -3866,7 +3928,7 @@ mod tests {
                     Some(&current),
                     reported,
                     None,
-                    process_id,
+                    &ProcessInstance::unknown_start(process_id),
                     reading
                 ),
                 match (expected.map(id), is_confirmed) {
@@ -3883,19 +3945,28 @@ mod tests {
             );
         }
         assert_eq!(
-            session_for_process(None, Agent::Claude, None, false, None, 10, Nothing),
+            session_for_process(
+                None,
+                Agent::Claude,
+                None,
+                false,
+                None,
+                &ProcessInstance::unknown_start(10),
+                Nothing
+            ),
             Pairing::Unpaired { earlier: None },
             "no conversation yet"
         );
         // A report whose sender the server read.
-        let reported_by = |reporter: &[u32]| SessionReportEvidence {
-            reporter: Some(reporter.to_vec()),
-            foreground_agents: None,
+        let reported_by = |reporter: &[u32]| {
+            SessionReportEvidence::Reporter(
+                reporter
+                    .iter()
+                    .map(|&pid| ProcessInstance::unknown_start(pid))
+                    .collect(),
+            )
         };
-        let beside_another_agent = SessionReportEvidence {
-            reporter: None,
-            foreground_agents: Some(vec![10, 12]),
-        };
+        let beside_another_agent = SessionReportEvidence::ForegroundAgents(Some(vec![10, 12]));
         for (case, previous, report, reading, expected) in [
             (
                 "reported by this process, record of another",
@@ -3950,7 +4021,7 @@ mod tests {
                     Some(&current),
                     true,
                     Some(&report),
-                    11,
+                    &ProcessInstance::unknown_start(11),
                     reading
                 ),
                 expected,
@@ -3966,7 +4037,7 @@ mod tests {
                 Some(&current),
                 false,
                 None,
-                10,
+                &ProcessInstance::unknown_start(10),
                 Nothing
             )
             .session(),
@@ -3998,7 +4069,12 @@ mod tests {
                     .unwrap();
             let resumed =
                 crate::agent_resume::resumed_session_from_process_argv(Agent::Claude, argv);
-            terminal.observe_agent_launch(Agent::Claude, 100, options, resumed.as_deref());
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance::unknown_start(100),
+                options,
+                resumed.as_deref(),
+            );
         }
     }
 
@@ -4088,14 +4164,29 @@ mod tests {
             crate::agent_resume::LaunchOptionsUnavailable::UnsupportedOption,
         );
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Claude, 100, unsupported.clone(), None);
-        terminal.observe_agent_launch(Agent::Claude, 100, known_options(&["--placeholder"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(100),
+            unsupported.clone(),
+            None,
+        );
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(100),
+            known_options(&["--placeholder"]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder".to_string()])
         );
         // A later unsupported reading tells less and changes nothing.
-        terminal.observe_agent_launch(Agent::Claude, 100, unsupported, None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(100),
+            unsupported,
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder".to_string()])
@@ -4118,7 +4209,7 @@ mod tests {
         for _ in 0..2 {
             terminal.observe_agent_launch(
                 Agent::Claude,
-                100,
+                ProcessInstance::unknown_start(100),
                 crate::agent_resume::launch_options_from_process_argv(
                     Agent::Claude,
                     Some(&launcher),
@@ -4132,7 +4223,7 @@ mod tests {
         // An unreadable read of it later tells less and changes nothing.
         terminal.observe_agent_launch(
             Agent::Claude,
-            100,
+            ProcessInstance::unknown_start(100),
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
             ),
@@ -4156,7 +4247,7 @@ mod tests {
         for _ in 0..2 {
             terminal.observe_agent_launch(
                 Agent::Claude,
-                100,
+                ProcessInstance::unknown_start(100),
                 crate::agent_resume::launch_options_from_process_argv(
                     Agent::Claude,
                     Some(&launcher),
@@ -4198,7 +4289,7 @@ mod tests {
         .map(String::from);
         terminal.observe_agent_launch(
             Agent::Claude,
-            100,
+            ProcessInstance::unknown_start(100),
             crate::agent_resume::launch_options_from_process_argv(Agent::Claude, Some(&argv))
                 .unwrap(),
             crate::agent_resume::resumed_session_from_process_argv(Agent::Claude, &argv).as_deref(),
@@ -4261,16 +4352,36 @@ mod tests {
             )
         };
         let mut terminal = test_terminal();
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(30),
+            unreadable(),
+            None,
+        );
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(30),
+            unreadable(),
+            None,
+        );
         assert_eq!(terminal.agent_launch().unwrap().options, unreadable());
-        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--placeholder"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(30),
+            known_options(&["--placeholder"]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder".to_string()])
         );
         // A readable record is never downgraded by a later unreadable read.
-        terminal.observe_agent_launch(Agent::Codex, 30, unreadable(), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(30),
+            unreadable(),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder".to_string()])
@@ -4287,8 +4398,18 @@ mod tests {
             resumed_without_options: true,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Claude, 40, unreadable(), None);
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            unreadable(),
+            None,
+        );
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
     }
@@ -4307,21 +4428,21 @@ mod tests {
         // Where the command line cannot be read, the seeded options stay.
         terminal.observe_agent_launch(
             Agent::Codex,
-            20,
+            ProcessInstance::unknown_start(20),
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
             ),
             None,
         );
         let launch = terminal.agent_launch().unwrap();
-        assert_eq!(launch.process_id(), Some(20));
+        assert_eq!(launch.process(), Some(ProcessInstance::unknown_start(20)));
         assert_eq!(launch.options, known_options(&["--seeded"]));
         assert_eq!(terminal.agent_launch_revision(), seeded_revision);
 
         // Once bound, a later process does not inherit them.
         terminal.observe_agent_launch(
             Agent::Codex,
-            21,
+            ProcessInstance::unknown_start(21),
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
             ),
@@ -4337,7 +4458,12 @@ mod tests {
             resumed_without_options: false,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(30),
+            known_options(&["--observed"]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--observed".to_string()])
@@ -4358,9 +4484,14 @@ mod tests {
             resumed_without_options: true,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
         let launch = terminal.agent_launch().unwrap();
-        assert_eq!(launch.process_id(), Some(40));
+        assert_eq!(launch.process(), Some(ProcessInstance::unknown_start(40)));
         assert_eq!(launch.options, not_recorded);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
 
@@ -4372,7 +4503,12 @@ mod tests {
             resumed_without_options: true,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(41),
+            known_options(&[]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec![
@@ -4389,7 +4525,12 @@ mod tests {
             resumed_without_options: true,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(42),
+            known_options(&["--other"]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--other".to_string()])
@@ -4408,7 +4549,12 @@ mod tests {
             resumed_without_options: false,
             launch: SeededLaunch::Started { session: None },
         });
-        terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(50),
+            known_options(&[]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(Vec::new())
@@ -4446,20 +4592,38 @@ mod tests {
         });
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
-        assert_eq!(terminal.agent_launch().unwrap().process_id(), Some(40));
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
+        assert_eq!(
+            terminal.agent_launch().unwrap().process(),
+            Some(ProcessInstance::unknown_start(40))
+        );
         assert!(terminal.resumed_without_launch_options());
         assert!(terminal.resumed_without_launch_options_for_session("claude"));
         assert!(!terminal.resumed_without_launch_options_for_session("codex"));
 
         // Another process clears it.
-        terminal.observe_agent_launch(Agent::Claude, 41, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(41),
+            known_options(&[]),
+            None,
+        );
         assert!(!terminal.resumed_without_launch_options());
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
 
         // So does the agent exiting.
         let mut terminal = fallback();
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
         terminal.set_detected_state_with_visible_blocker(
             Some(Agent::Claude),
             AgentState::Idle,
@@ -4474,7 +4638,12 @@ mod tests {
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         assert!(!terminal.resumed_without_launch_options());
         let mut terminal = fallback();
-        terminal.observe_agent_launch(Agent::Codex, 40, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
         assert!(!terminal.resumed_without_launch_options());
 
         // A kept restore or `herdr agent start` seed never sets it.
@@ -4486,7 +4655,12 @@ mod tests {
             launch: SeededLaunch::Started { session: None },
         });
         assert!(!terminal.resumed_without_launch_options());
-        terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(40),
+            known_options(&[]),
+            None,
+        );
         assert!(!terminal.resumed_without_launch_options());
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
     }
@@ -4495,7 +4669,12 @@ mod tests {
     fn agent_launch_is_cleared_when_the_agent_exits_or_changes() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--bypass"]),
+            None,
+        );
         terminal.set_detected_state_with_visible_blocker(
             Some(Agent::Claude),
             AgentState::Idle,
@@ -4507,7 +4686,12 @@ mod tests {
 
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-        terminal.observe_agent_launch(Agent::Claude, 10, known_options(&["--bypass"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--bypass"]),
+            None,
+        );
         let revision = terminal.agent_launch_revision();
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
         assert!(terminal.agent_launch().is_none());
@@ -8243,7 +8427,12 @@ mod tests {
             Some("startup".into()),
         );
         assert!(terminal.persisted_agent_session_reported);
-        terminal.observe_agent_launch(Agent::Codex, 10, known_options(&["--placeholder"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--placeholder"]),
+            None,
+        );
         terminal.agent_launch_restore = Some(crate::agent_resume::LaunchOptionsRestore::Kept);
 
         terminal.clear_agent_runtime_identity_after_respawn();
@@ -8467,10 +8656,7 @@ mod tests {
     /// The report evidence of a pane whose foreground job runs these Claude or
     /// Codex processes.
     fn foreground_agents(process_ids: &[u32]) -> SessionReportEvidence {
-        SessionReportEvidence {
-            reporter: None,
-            foreground_agents: Some(process_ids.to_vec()),
-        }
+        SessionReportEvidence::ForegroundAgents(Some(process_ids.to_vec()))
     }
 
     /// The agent's own hook reports conversation `id` at session start.
@@ -8491,7 +8677,12 @@ mod tests {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(agent), AgentState::Idle);
         report_session(&mut terminal, label, &format!("{label}-a"), 1, "startup");
-        terminal.observe_agent_launch(agent, 10, known_options(&["--placeholder-a"]), None);
+        terminal.observe_agent_launch(
+            agent,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--placeholder-a"]),
+            None,
+        );
         terminal.sync_agent_launch_session(&foreground_agents(&[10]));
         assert_eq!(
             terminal.launch_options_for_session(label),
@@ -8510,15 +8701,207 @@ mod tests {
         reporter: Option<u32>,
         job: &[(u32, &str)],
     ) {
+        let evidence = match reporter {
+            Some(reporter) => {
+                SessionReportEvidence::Reporter(vec![ProcessInstance::unknown_start(reporter)])
+            }
+            None => SessionReportEvidence::ForegroundAgents(Some(
+                job.iter().map(|(process_id, _)| *process_id).collect(),
+            )),
+        };
+        report_with(terminal, agent, id, (seq, start), &evidence);
+    }
+
+    /// Conversation `id` is reported with this evidence of its sender.
+    fn report_with(
+        terminal: &mut TerminalState,
+        agent: &str,
+        id: &str,
+        (seq, start): (u64, &str),
+        evidence: &SessionReportEvidence,
+    ) {
         report_session(terminal, agent, id, seq, start);
-        let reporter = reporter.map(|process_id| vec![process_id]);
-        let foreground_agents = reporter
-            .is_none()
-            .then(|| job.iter().map(|(process_id, _)| *process_id).collect());
-        terminal.sync_agent_launch_session(&SessionReportEvidence {
-            reporter,
-            foreground_agents,
-        });
+        terminal.sync_agent_launch_session(evidence);
+    }
+
+    #[test]
+    fn a_reused_reporter_process_id_is_not_confirmed() {
+        let reporter = ProcessInstance {
+            pid: 20,
+            started: Some(100),
+        };
+        for (later, confirmed) in [(Some(200), false), (Some(100), true), (None, true)] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            report_with(
+                &mut terminal,
+                "claude",
+                "claude-b",
+                (1, "startup"),
+                &SessionReportEvidence::Reporter(vec![reporter]),
+            );
+            // Process 20 exits unobserved, and a later Claude that starts a
+            // conversation of its own gets the same process id, with another
+            // start time; the same start time, or none read, is the reporter.
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance {
+                    pid: 20,
+                    started: later,
+                },
+                known_options(&["--placeholder-x"]),
+                None,
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                confirmed.then(|| vec!["--placeholder-x".to_string()]),
+                "started {later:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_process_id_reused_by_a_reporter_is_not_confirmed() {
+        let bound = ProcessInstance {
+            pid: 10,
+            started: Some(100),
+        };
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            bound,
+            known_options(&["--placeholder-a"]),
+            None,
+        );
+        report_with(
+            &mut terminal,
+            "claude",
+            "claude-a",
+            (1, "startup"),
+            &SessionReportEvidence::Reporter(vec![bound]),
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder-a".into()])
+        );
+        // A process with the bound process's id but another start time
+        // reports a conversation change.
+        report_with(
+            &mut terminal,
+            "claude",
+            "claude-b",
+            (2, "clear"),
+            &SessionReportEvidence::Reporter(vec![ProcessInstance {
+                pid: 10,
+                started: Some(200),
+            }]),
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[test]
+    fn a_handed_off_pairing_is_not_kept_by_a_process_that_reused_its_id() {
+        let handed_off = ProcessInstance {
+            pid: 4242,
+            started: Some(100),
+        };
+        for (observed, kept) in [(Some(200), false), (Some(100), true)] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            report_session(&mut terminal, "claude", "claude-a", 1, "startup");
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: known_options(&["--placeholder-a"]),
+                resumed_without_options: false,
+                launch: SeededLaunch::Paired {
+                    process: handed_off,
+                    session: crate::agent_resume::AgentSessionRef::id("claude-a").unwrap(),
+                },
+            });
+            // Detection reads process 4242 after the handoff, started fresh.
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance {
+                    pid: 4242,
+                    started: observed,
+                },
+                known_options(&["--placeholder-x"]),
+                None,
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                kept.then(|| vec!["--placeholder-a".to_string()]),
+                "started {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_whose_walk_failed_is_not_paired_with_the_job() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
+        // A Claude nested through the parent's Bash tool runs in its own
+        // session, so the job shows only the parent, and its hook exited
+        // before the server read the chain up to it.
+        report_with(
+            &mut terminal,
+            "claude",
+            "claude-c",
+            (2, "resume"),
+            &SessionReportEvidence::Unidentified,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+        // The report stayed undecided: the parent itself reporting it again
+        // pairs it.
+        report_from(
+            &mut terminal,
+            "claude",
+            "claude-c",
+            (3, "compact"),
+            None,
+            &[(10, "claude")],
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder-a".into()])
+        );
+
+        // Reported first, the conversation is not taken by the next process.
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        report_with(
+            &mut terminal,
+            "claude",
+            "claude-c",
+            (1, "startup"),
+            &SessionReportEvidence::Unidentified,
+        );
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--placeholder-a"]),
+            None,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[test]
+    fn a_conversation_reported_from_outside_the_pane_is_paired_by_the_foreground_job() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Codex);
+        // A shared Codex daemon outside the pane sent the report, so the
+        // pane's foreground job, running its one Codex, decides.
+        report_from(
+            &mut terminal,
+            "codex",
+            "codex-b",
+            (2, "clear"),
+            None,
+            &[(10, "codex")],
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--placeholder-a".into()])
+        );
     }
 
     #[test]
@@ -8564,7 +8947,7 @@ mod tests {
             let observe_parent = |terminal: &mut TerminalState| {
                 terminal.observe_agent_launch(
                     Agent::Claude,
-                    10,
+                    ProcessInstance::unknown_start(10),
                     known_options(&["--placeholder-a"]),
                     None,
                 )
@@ -8604,7 +8987,12 @@ mod tests {
             None,
             &[(10, "codex"), (11, "codex")],
         );
-        terminal.observe_agent_launch(Agent::Codex, 10, known_options(&["--placeholder-a"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(10),
+            known_options(&["--placeholder-a"]),
+            None,
+        );
         assert_eq!(terminal.launch_options_for_session("codex"), None);
     }
 
@@ -8622,7 +9010,12 @@ mod tests {
         );
         // Process 20 exits before detection reads it; the next one starts a
         // new conversation of its own.
-        terminal.observe_agent_launch(Agent::Claude, 30, known_options(&["--placeholder-x"]), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(30),
+            known_options(&["--placeholder-x"]),
+            None,
+        );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
@@ -8682,7 +9075,12 @@ mod tests {
         terminal.sync_agent_launch_session(&foreground_agents(&[11]));
         assert_eq!(terminal.launch_options_for_session("codex"), None);
         // Detection reads the second Codex, which takes its conversation.
-        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--placeholder-b"]), None);
+        terminal.observe_agent_launch(
+            Agent::Codex,
+            ProcessInstance::unknown_start(11),
+            known_options(&["--placeholder-b"]),
+            None,
+        );
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder-b".into()])
@@ -8699,7 +9097,7 @@ mod tests {
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         terminal.observe_agent_launch(
             Agent::Claude,
-            11,
+            ProcessInstance::unknown_start(11),
             known_options(&["--placeholder-b"]),
             Some("claude-c"),
         );
