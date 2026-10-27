@@ -324,7 +324,12 @@ impl App {
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
-        let mut pane_updates = self.state.handle_app_event(ev);
+        let runtimes = &self.terminal_runtimes;
+        let mut pane_updates = self
+            .state
+            .handle_app_event_with_foreground_jobs(ev, &|terminal_id| {
+                crate::detect::foreground_job(runtimes.get(terminal_id)?.child_pid()?)
+            });
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }

@@ -2790,7 +2790,7 @@ mod tests {
                 Some(1),
                 Some("startup".into()),
             );
-            terminal.sync_agent_launch_session(|_| true);
+            terminal.sync_agent_launch_session(|| None);
         });
         assert_eq!(saved.value, "fresh-session");
         assert_eq!(saved.launch_options, None);
@@ -2853,6 +2853,21 @@ mod tests {
         drop(restored_runtimes);
         drop(runtimes);
         restored_terminals.into_values().next().unwrap()
+    }
+
+    /// The foreground job of a pane whose only process is Claude `process_id`.
+    #[cfg(unix)]
+    fn foreground_claude_job(process_id: u32) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: process_id,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: process_id,
+                name: "claude".into(),
+                argv0: None,
+                argv: None,
+                cmdline: None,
+            }],
+        }
     }
 
     #[cfg(unix)]
@@ -2942,7 +2957,7 @@ mod tests {
                     resumed,
                 );
                 set_claude_session(terminal);
-                terminal.sync_agent_launch_session(|_| true);
+                terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
             })
             .await;
             assert!(terminal.pending_agent_resume_plan.is_none());
@@ -3025,7 +3040,7 @@ mod tests {
                 None,
             );
             set_claude_session(terminal);
-            terminal.sync_agent_launch_session(|_| true);
+            terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
         })
         .await;
         // That agent exited, and the user started another by hand.

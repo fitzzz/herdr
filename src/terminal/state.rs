@@ -701,12 +701,19 @@ impl TerminalState {
     }
 
     /// Pairs a newly reported conversation with the launch record, confirmed,
-    /// when it is the same launch: a launch not yet bound to a process, or a
-    /// process that is still running (a conversation change inside it, such
-    /// as Claude `/clear`). A conversation reported after the recorded process
-    /// exited, or beside a saved launch that nothing runs, belongs to another
-    /// process, which detection binds next.
-    pub fn sync_agent_launch_session(&mut self, process_running: impl FnOnce(u32) -> bool) {
+    /// when it is the same launch: a launch not yet bound to a process, or the
+    /// recorded process when the pane's foreground job, read when the report
+    /// arrives, runs it and no other Claude or Codex process (a conversation
+    /// change inside it, such as Claude `/clear`). Otherwise the report may
+    /// come from another process (an agent started beside a suspended one, a
+    /// child agent, or one that replaced an exited process), so the record
+    /// keeps its pairing and the process detection binds next decides. A
+    /// conversation reported beside a saved launch that nothing runs belongs
+    /// to another launch.
+    pub fn sync_agent_launch_session(
+        &mut self,
+        foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
+    ) {
         let Some(session) = self.current_session_ref() else {
             return;
         };
@@ -722,9 +729,23 @@ impl TerminalState {
             return;
         };
         launch.seen_session = Some(session.clone());
+        if let LaunchState::Bound { process_id, .. } = launch.state {
+            let reported_by_process = foreground_job().is_some_and(|job| {
+                let mut agents = job.processes.iter().filter(|process| {
+                    matches!(
+                        crate::detect::identify_agent_process(process),
+                        Some((Agent::Claude | Agent::Codex, _))
+                    )
+                });
+                agents.next().is_some_and(|agent| agent.pid == process_id)
+                    && agents.next().is_none()
+            });
+            if !reported_by_process {
+                return;
+            }
+        }
         let pairing = match &mut launch.state {
             LaunchState::Saved(_) => return,
-            LaunchState::Bound { process_id, .. } if !process_running(*process_id) => return,
             LaunchState::Started(pairing) | LaunchState::Bound { pairing, .. } => pairing,
         };
         let changed = pairing.session() != Some(&session);
@@ -8297,6 +8318,111 @@ mod tests {
         assert_eq!(
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
+        );
+    }
+
+    /// A foreground job of `(process id, program)` processes, led by the first.
+    fn foreground_job_of(processes: &[(u32, &str)]) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: processes.first().map_or(0, |(pid, _)| *pid),
+            processes: processes
+                .iter()
+                .map(|(pid, name)| crate::platform::ForegroundProcess {
+                    pid: *pid,
+                    name: (*name).into(),
+                    argv0: None,
+                    argv: None,
+                    cmdline: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The agent's own hook reports conversation `id` at session start.
+    fn report_session(terminal: &mut TerminalState, agent: &str, id: &str, seq: u64, start: &str) {
+        terminal.set_agent_session_ref_for_session_start(
+            format!("herdr:{agent}"),
+            agent.into(),
+            crate::agent_resume::AgentSessionRef::id(id),
+            Some(seq),
+            Some(start.into()),
+        );
+    }
+
+    /// A terminal whose `agent` process 10 runs conversation `<agent>-a`,
+    /// launched with `--placeholder-a`, paired by its report.
+    fn agent_running_its_reported_conversation(agent: Agent) -> TerminalState {
+        let label = crate::detect::agent_label(agent);
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(agent), AgentState::Idle);
+        report_session(&mut terminal, label, &format!("{label}-a"), 1, "startup");
+        terminal.observe_agent_launch(agent, 10, known_options(&["--placeholder-a"]), None);
+        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(10, label)])));
+        assert_eq!(
+            terminal.launch_options_for_session(label),
+            Some(vec!["--placeholder-a".into()])
+        );
+        terminal
+    }
+
+    #[test]
+    fn a_report_from_a_second_codex_beside_a_suspended_one_is_not_paired_with_it() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Codex);
+        // Ctrl-Z stops the first Codex, and a second one starts in the
+        // foreground and reports its new conversation.
+        report_session(&mut terminal, "codex", "codex-b", 2, "startup");
+        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(11, "codex")])));
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
+        // Detection reads the second Codex, which takes its conversation.
+        terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--placeholder-b"]), None);
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--placeholder-b".into()])
+        );
+    }
+
+    #[test]
+    fn a_report_from_a_claude_resumed_beside_a_suspended_one_is_not_paired_with_it() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
+        // `claude --resume claude-c` runs in the foreground while the first
+        // Claude is stopped.
+        report_session(&mut terminal, "claude", "claude-c", 2, "resume");
+        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(11, "claude")])));
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            11,
+            known_options(&["--placeholder-b"]),
+            Some("claude-c"),
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder-b".into()])
+        );
+    }
+
+    #[test]
+    fn a_report_from_a_child_agent_in_the_same_job_is_not_paired_with_its_parent() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
+        // The first Claude runs another Claude in its own process group, and
+        // that one resumes another conversation.
+        report_session(&mut terminal, "claude", "claude-c", 2, "resume");
+        terminal.sync_agent_launch_session(|| {
+            Some(foreground_job_of(&[(10, "claude"), (12, "claude")]))
+        });
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[test]
+    fn a_conversation_change_inside_the_only_agent_of_the_job_keeps_its_options() {
+        let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
+        // `/clear`, with a tool the agent runs in the same job.
+        report_session(&mut terminal, "claude", "claude-b", 2, "clear");
+        terminal
+            .sync_agent_launch_session(|| Some(foreground_job_of(&[(10, "claude"), (13, "node")])));
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(vec!["--placeholder-a".into()])
         );
     }
 }

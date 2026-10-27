@@ -261,24 +261,17 @@ pub fn identify_agent_process_in_job(
         .enumerate()
         .find(|(_, process)| process.pid == job.process_group_id)
     {
-        let candidate = normalized_process_name(process);
-        if let Some(agent) = identify_agent(&candidate) {
-            if agent != Agent::Letta || is_interactive_letta_process(process) {
-                return Some((agent, candidate, index));
-            }
+        if let Some((agent, candidate)) = identify_agent_process(process) {
+            return Some((agent, candidate, index));
         }
     }
 
     let mut best: Option<(u8, Agent, String, usize)> = None;
 
     for (index, process) in job.processes.iter().enumerate() {
-        let candidate = normalized_process_name(process);
-        let Some(agent) = identify_agent(&candidate) else {
+        let Some((agent, candidate)) = identify_agent_process(process) else {
             continue;
         };
-        if agent == Agent::Letta && !is_interactive_letta_process(process) {
-            continue;
-        }
         let score = process_priority(process, &candidate);
 
         match &best {
@@ -288,6 +281,15 @@ pub fn identify_agent_process_in_job(
     }
 
     best.map(|(_, agent, name, index)| (agent, name, index))
+}
+
+/// The agent one foreground process runs, and the name it was identified by.
+pub fn identify_agent_process(
+    process: &crate::platform::ForegroundProcess,
+) -> Option<(Agent, String)> {
+    let candidate = normalized_process_name(process);
+    let agent = identify_agent(&candidate)?;
+    (agent != Agent::Letta || is_interactive_letta_process(process)).then_some((agent, candidate))
 }
 
 /// Detect the state of an agent from the live terminal tail snapshot.
