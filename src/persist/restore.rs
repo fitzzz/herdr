@@ -3141,7 +3141,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn live_handoff_keeps_an_assumed_pairing_bound_to_its_process() {
+    async fn live_handoff_keeps_a_confirmed_pairing_bound_to_its_process() {
         let (snapshot, _) = snapshot_with_saved_pane_history();
         let report = |terminal: &mut TerminalState, id: &str, seq: u64, start: &str| {
             terminal.set_agent_session_ref_for_session_start(
@@ -3152,8 +3152,9 @@ mod tests {
                 Some(start.into()),
             );
         };
-        // A Claude started by hand reported its conversation before detection
-        // read it, so the old server assumed the pairing.
+        // A Claude started by hand reported its conversation as the lone agent
+        // in the job before detection read it, so the old server confirmed
+        // the pairing.
         let mut terminal = handed_off(&snapshot, |terminal| {
             terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
             report(terminal, "claude-session", 1, "startup");
@@ -3175,6 +3176,65 @@ mod tests {
         terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
         report(&mut terminal, "claude-child", 2, "resume");
         terminal.sync_agent_launch_session(&foreground_claude(&[4242, 4343]));
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_an_assumed_pairing_bound_to_its_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let unreadable = || {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            )
+        };
+        // The old server's restore typed the resume command with the saved
+        // options, and detection found its process before any report but
+        // could not read its command line, so the old server kept the seed's
+        // options and assumed the pairing.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            set_claude_session(terminal);
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options(),
+                ),
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: crate::agent_resume::AgentSessionRef::id("claude-session"),
+                },
+            });
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                unreadable(),
+                None,
+            );
+        })
+        .await;
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // The new server cannot read it either.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            unreadable(),
+            None,
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // Then it reads a command line that starts a new conversation, so the
+        // restored one no longer pairs with that process.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            crate::agent_resume::AgentLaunchOptions::Known(vec!["--placeholder-new".into()]),
+            None,
+        );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 

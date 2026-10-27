@@ -806,13 +806,15 @@ impl TerminalState {
                     kept_seed: None,
                 }
             }
+            // The reading the old server assumed it on is not handed off, so
+            // any readable command line of the process decides again.
             SeededLaunch::Assumed { process, session } => LaunchState::Bound {
                 process,
                 pairing: Pairing::Assumed {
                     session,
                     earlier: None,
                 },
-                kept_seed: None,
+                kept_seed: Some(ReadingRank::Unreadable),
             },
             SeededLaunch::Saved(session) => LaunchState::Saved(session),
         };
