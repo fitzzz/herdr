@@ -433,6 +433,27 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_launcher_survives_snapshot_and_actual_deferred_restore() {
+        restore_codex_through_launcher(None, serde_json::json!(["resume", "same-uuid"])).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_launcher_restore_carries_saved_launch_options() {
+        let options = vec!["-c".to_string(), "model_reasoning_effort='low'".to_string()];
+        restore_codex_through_launcher(
+            Some(options),
+            serde_json::json!(["resume", "same-uuid", "-c", "model_reasoning_effort='low'"]),
+        )
+        .await;
+    }
+
+    /// Restores a launcher-bound Codex pane through a real shell and checks
+    /// the arguments the launcher received.
+    #[cfg(unix)]
+    async fn restore_codex_through_launcher(
+        launch_options: Option<Vec<String>>,
+        expected_args: serde_json::Value,
+    ) {
         let temp = crate::agent_launcher::TestDirectory::new();
         let receipt = temp.path().join("receipt.json");
         let mut original = test_app();
@@ -469,6 +490,12 @@ mod tests {
             Some(0),
             0,
         );
+        let mut snapshot = snapshot;
+        for pane in snapshot.workspaces[0].tabs[0].panes.values_mut() {
+            if let Some(session) = pane.agent_session.as_mut() {
+                session.launch_options = launch_options.clone();
+            }
+        }
         assert_eq!(snapshot.version, 4);
         let bytes = serde_json::to_vec(&snapshot).unwrap();
         let snapshot = serde_json::from_slice(&bytes).unwrap();
@@ -507,7 +534,7 @@ mod tests {
             applied.argv,
             binding
                 .launcher
-                .argv(&["resume".into(), "same-uuid".into()])
+                .argv(&serde_json::from_value::<Vec<String>>(expected_args.clone()).unwrap())
         );
         assert!(
             !applied.observed,
@@ -521,10 +548,7 @@ mod tests {
         }
         let result: serde_json::Value =
             serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
-        assert_eq!(
-            result,
-            serde_json::json!([["resume", "same-uuid"], "assigned"])
-        );
+        assert_eq!(result, serde_json::json!([expected_args, "assigned"]));
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
