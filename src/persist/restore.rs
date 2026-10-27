@@ -597,20 +597,29 @@ fn restore_tab(
             .and_then(|imported| imported.state.agent_state.clone());
         // The handoff pane's agent runs on, paired as the old server left it.
         #[cfg(unix)]
-        let handed_off_launch =
-            imported_runtime
-                .as_ref()
-                .map(|imported| match imported.state.agent_launch {
+        let handed_off_launch = imported_runtime
+            .as_ref()
+            .map(|imported| imported.state.agent_launch);
+        let saved_launch = |session| {
+            #[cfg(unix)]
+            if let Some(launch) = handed_off_launch {
+                return match launch {
                     Some(crate::terminal::state::HandoffAgentLaunch::Confirmed { process_id }) => {
-                        crate::terminal::SeededLaunch::Paired { process_id }
+                        crate::terminal::SeededLaunch::Paired {
+                            process_id,
+                            session,
+                        }
                     }
                     Some(crate::terminal::state::HandoffAgentLaunch::Saved) => {
-                        crate::terminal::SeededLaunch::Saved
+                        crate::terminal::SeededLaunch::Saved(session)
                     }
-                    None => crate::terminal::SeededLaunch::Started,
-                });
-        #[cfg(not(unix))]
-        let handed_off_launch = None;
+                    None => crate::terminal::SeededLaunch::Started {
+                        session: Some(session),
+                    },
+                };
+            }
+            crate::terminal::SeededLaunch::Saved(session)
+        };
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -621,7 +630,7 @@ fn restore_tab(
             startup
                 .launch_options_restore
                 .filter(|_| pending_native_agent_restore.is_some()),
-            handed_off_launch.unwrap_or(crate::terminal::SeededLaunch::Saved),
+            saved_launch,
             startup.duplicate_agent_session,
         );
         if let Some(plan) = pending_native_agent_restore {
@@ -983,7 +992,7 @@ fn restore_plan_for_snapshot(
 fn restored_agent_launch(
     session: Option<&PaneAgentSessionSnapshot>,
     native_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
-    saved_launch: crate::terminal::SeededLaunch,
+    saved_launch: impl FnOnce(crate::agent_resume::AgentSessionRef) -> crate::terminal::SeededLaunch,
     duplicate_agent_session: bool,
 ) -> Option<crate::terminal::AgentLaunchSeed> {
     if duplicate_agent_session {
@@ -1012,10 +1021,14 @@ fn restored_agent_launch(
         agent,
         options,
         resumed_without_options,
-        session: Some(persisted_agent_session_from_snapshot(session)?.session_ref),
-        launch: match native_restore {
-            Some(_) => crate::terminal::SeededLaunch::Started,
-            None => saved_launch,
+        launch: match (
+            native_restore,
+            persisted_agent_session_from_snapshot(session)?.session_ref,
+        ) {
+            (Some(_), session) => crate::terminal::SeededLaunch::Started {
+                session: Some(session),
+            },
+            (None, session) => saved_launch(session),
         },
     })
 }
@@ -1513,8 +1526,7 @@ mod tests {
                     placeholder_launch_options()
                 ),
                 resumed_without_options: false,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Saved
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
             })
         );
 
@@ -1547,10 +1559,22 @@ mod tests {
                     placeholder_launch_options()
                 ),
                 resumed_without_options: false,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Started
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: seeded_session("claude")
+                }
             })
         );
+    }
+
+    /// The seed of a live handoff whose old server confirmed the conversation
+    /// for process 4242.
+    fn handed_off_to_4242(
+        session: crate::agent_resume::AgentSessionRef,
+    ) -> crate::terminal::SeededLaunch {
+        crate::terminal::SeededLaunch::Paired {
+            process_id: 4242,
+            session,
+        }
     }
 
     #[test]
@@ -1562,42 +1586,36 @@ mod tests {
             ..launch_options_session("claude", launch_options)
         };
         assert_eq!(
-            restored_agent_launch(
-                Some(&flagged(None)),
-                None,
-                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
-                false
-            ),
+            restored_agent_launch(Some(&flagged(None)), None, handed_off_to_4242, false),
             Some(crate::terminal::AgentLaunchSeed {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Paired { process_id: 4242 }
+                launch: crate::terminal::SeededLaunch::Paired {
+                    process_id: 4242,
+                    session: seeded_session("claude").unwrap()
+                }
             })
         );
         assert_eq!(
             restored_agent_launch(
                 Some(&flagged(Some(placeholder_launch_options()))),
                 None,
-                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
+                handed_off_to_4242,
                 false
             ),
             Some(crate::terminal::AgentLaunchSeed {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: true,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Paired { process_id: 4242 }
+                launch: crate::terminal::SeededLaunch::Paired {
+                    process_id: 4242,
+                    session: seeded_session("claude").unwrap()
+                }
             })
         );
         assert_eq!(
-            restored_agent_launch(
-                Some(&flagged(None)),
-                None,
-                crate::terminal::SeededLaunch::Paired { process_id: 4242 },
-                true
-            ),
+            restored_agent_launch(Some(&flagged(None)), None, handed_off_to_4242, true),
             None
         );
         // A pane restored without resuming its agent keeps the mark for the
@@ -1613,21 +1631,24 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Saved
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
             })
         );
         // Without the mark, only saved options are seeded.
         let unflagged = launch_options_session("claude", None);
-        for saved_launch in [
-            crate::terminal::SeededLaunch::Paired { process_id: 4242 },
-            crate::terminal::SeededLaunch::Saved,
-        ] {
-            assert_eq!(
-                restored_agent_launch(Some(&unflagged), None, saved_launch, false),
-                None
-            );
-        }
+        assert_eq!(
+            restored_agent_launch(Some(&unflagged), None, handed_off_to_4242, false),
+            None
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&unflagged),
+                None,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1649,8 +1670,9 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
-                session: seeded_session("claude"),
-                launch: crate::terminal::SeededLaunch::Started
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: seeded_session("claude")
+                }
             })
         );
         assert_eq!(
@@ -1686,8 +1708,9 @@ mod tests {
                     agent: crate::detect::Agent::Codex,
                     options: AgentLaunchOptions::Known(placeholder_launch_options()),
                     resumed_without_options: bare_resume,
-                    session: seeded_session("codex"),
-                    launch: crate::terminal::SeededLaunch::Started
+                    launch: crate::terminal::SeededLaunch::Started {
+                        session: seeded_session("codex")
+                    }
                 }),
                 "{outcome:?}"
             );
@@ -1713,8 +1736,7 @@ mod tests {
                 agent: crate::detect::Agent::Codex,
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: false,
-                session: seeded_session("codex"),
-                launch: crate::terminal::SeededLaunch::Saved
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("codex").unwrap())
             })
         );
     }
@@ -2895,8 +2917,9 @@ mod tests {
                         agent: crate::detect::Agent::Claude,
                         options: not_recorded,
                         resumed_without_options: true,
-                        session: crate::agent_resume::AgentSessionRef::id("claude-session"),
-                        launch: crate::terminal::SeededLaunch::Started,
+                        launch: crate::terminal::SeededLaunch::Started {
+                            session: crate::agent_resume::AgentSessionRef::id("claude-session"),
+                        },
                     });
                 }
                 // The bare resume command the restore typed.
@@ -3007,8 +3030,9 @@ mod tests {
                             placeholder_launch_options(),
                         ),
                         resumed_without_options: false,
-                        session: seeded_session("claude"),
-                        launch: crate::terminal::SeededLaunch::Started,
+                        launch: crate::terminal::SeededLaunch::Started {
+                            session: seeded_session("claude"),
+                        },
                     });
                 }
             })

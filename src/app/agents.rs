@@ -226,10 +226,11 @@ impl App {
                 agent: kind,
                 options,
                 resumed_without_options: false,
-                session: persisted_agent_session
-                    .as_ref()
-                    .map(|session| session.session_ref.clone()),
-                launch: crate::terminal::SeededLaunch::Started,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: persisted_agent_session
+                        .as_ref()
+                        .map(|session| session.session_ref.clone()),
+                },
             });
         }
         if let Some(session) = persisted_agent_session {

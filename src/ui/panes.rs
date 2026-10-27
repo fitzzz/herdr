@@ -1048,8 +1048,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options,
-                session: None,
-                launch: crate::terminal::SeededLaunch::Started,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
             });
             app.terminals.insert(terminal_id, terminal_state);
             let mut terminal =
@@ -1360,8 +1359,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options: true,
-                session: None,
-                launch: crate::terminal::SeededLaunch::Started,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
             });
             let area = Rect::new(0, 0, 40, 8);
             let render = |app: &mut AppState| {
@@ -1425,8 +1423,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options: true,
-                session: None,
-                launch: crate::terminal::SeededLaunch::Started,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
             });
         let area = Rect::new(0, 0, 40, 8);
         app.view.pane_infos = compute_pane_infos(

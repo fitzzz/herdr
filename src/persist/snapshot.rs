@@ -1528,8 +1528,9 @@ mod tests {
                         crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                     ),
                     resumed_without_options: flagged,
-                    session: crate::agent_resume::AgentSessionRef::id("session-1"),
-                    launch: crate::terminal::SeededLaunch::Started,
+                    launch: crate::terminal::SeededLaunch::Started {
+                        session: crate::agent_resume::AgentSessionRef::id("session-1"),
+                    },
                 });
             capture_from_state(&state).workspaces[0].tabs[0].panes[&root.raw()]
                 .agent_session

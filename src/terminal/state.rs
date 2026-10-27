@@ -394,27 +394,31 @@ pub struct AgentLaunchSeed {
     pub options: crate::agent_resume::AgentLaunchOptions,
     /// The restore fell back to the bare resume command.
     pub resumed_without_options: bool,
-    /// The conversation this launch runs: the one a restore resumes, hands
-    /// off or keeps, or the one `herdr agent start` arguments name.
-    pub session: Option<crate::agent_resume::AgentSessionRef>,
     pub launch: SeededLaunch,
 }
 
-/// What runs the conversation a seed names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What runs the conversation a seed names, and that conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeededLaunch {
     /// Herdr typed it: a restore's resume command or `herdr agent start`. The
     /// process it binds to is paired with the conversation on evidence only.
-    Started,
-    /// The server a live handoff replaced confirmed the conversation for
+    /// `session` is the one the restore resumes, or the one `herdr agent
+    /// start` arguments name.
+    Started {
+        session: Option<crate::agent_resume::AgentSessionRef>,
+    },
+    /// The server a live handoff replaced confirmed `session` for
     /// `process_id`, which the seed is bound to, so that process keeps the
     /// pairing whatever its command line says.
-    Paired { process_id: u32 },
+    Paired {
+        process_id: u32,
+        session: crate::agent_resume::AgentSessionRef,
+    },
     /// Nothing runs it: a pane restored without resuming its agent, or whose
     /// directory is missing, keeps the saved launch for its next save. No
     /// process keeps its options or its mark, and a conversation reported
     /// meanwhile belongs to another launch.
-    Saved,
+    Saved(crate::agent_resume::AgentSessionRef),
 }
 
 /// The launch options of the Claude or Codex process running in a pane, kept
@@ -593,25 +597,25 @@ impl TerminalState {
     /// Records the options a session restore or `herdr agent start` launched
     /// the agent with, before detection sees its process.
     pub fn seed_agent_launch(&mut self, seed: AgentLaunchSeed) {
-        let state = match (seed.launch, seed.session) {
-            (SeededLaunch::Started, Some(session)) => LaunchState::Started(Pairing::Assumed {
+        let state = match seed.launch {
+            SeededLaunch::Started {
+                session: Some(session),
+            } => LaunchState::Started(Pairing::Assumed {
                 session,
                 earlier: None,
             }),
-            (SeededLaunch::Started, None) => {
+            SeededLaunch::Started { session: None } => {
                 LaunchState::Started(Pairing::Unpaired { earlier: None })
             }
-            (SeededLaunch::Paired { process_id }, session) => LaunchState::Bound {
+            SeededLaunch::Paired {
                 process_id,
-                pairing: session.map_or(Pairing::Unpaired { earlier: None }, Pairing::Confirmed),
+                session,
+            } => LaunchState::Bound {
+                process_id,
+                pairing: Pairing::Confirmed(session),
                 kept_seed: None,
             },
-            (SeededLaunch::Saved, Some(session)) => LaunchState::Saved(session),
-            // A saved launch without a conversation has nothing to save.
-            (SeededLaunch::Saved, None) => {
-                self.set_agent_launch(None);
-                return;
-            }
+            SeededLaunch::Saved(session) => LaunchState::Saved(session),
         };
         let seen_session = self.current_session_ref().cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
@@ -3176,8 +3180,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Claude, 100, known_options(&[]), None);
         assert_eq!(terminal.agent_launch().unwrap().options, not_recorded);
@@ -3205,8 +3208,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
             Agent::Claude,
@@ -3239,8 +3241,9 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded.clone(),
                 resumed_without_options: true,
-                session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
-                launch: SeededLaunch::Started,
+                launch: SeededLaunch::Started {
+                    session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+                },
             });
             terminal
         };
@@ -3872,8 +3875,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         observe_launcher_then_agent(&mut terminal, None);
         assert_eq!(
@@ -3892,8 +3894,9 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
-            session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started {
+                session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+            },
         });
         observe_launcher_then_agent(&mut terminal, Some("placeholder-session"));
         assert_eq!(
@@ -3915,8 +3918,9 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder-seeded"]),
             resumed_without_options: false,
-            session: crate::agent_resume::AgentSessionRef::id("placeholder-a"),
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started {
+                session: crate::agent_resume::AgentSessionRef::id("placeholder-a"),
+            },
         });
         // The launcher is paired with A by assumption; the agent it execs
         // resumes B, so its options wait for B.
@@ -3999,8 +4003,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         for _ in 0..2 {
             terminal.observe_agent_launch(
@@ -4032,8 +4035,9 @@ mod tests {
                 crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
             ),
             resumed_without_options: true,
-            session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started {
+                session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+            },
         });
         let argv = [
             "claude",
@@ -4068,8 +4072,9 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded.clone(),
                 resumed_without_options: true,
-                session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
-                launch: SeededLaunch::Started,
+                launch: SeededLaunch::Started {
+                    session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
+                },
             });
         };
 
@@ -4132,8 +4137,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Claude, 40, unreadable(), None);
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
@@ -4148,8 +4152,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         let seeded_revision = terminal.agent_launch_revision();
 
@@ -4184,8 +4187,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Codex, 30, known_options(&["--observed"]), None);
         assert_eq!(
@@ -4206,8 +4208,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         let launch = terminal.agent_launch().unwrap();
@@ -4221,8 +4222,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Codex, 41, known_options(&[]), None);
         assert_eq!(
@@ -4239,8 +4239,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded,
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Claude, 42, known_options(&["--other"]), None);
         assert_eq!(
@@ -4259,8 +4258,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: false,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(Agent::Claude, 50, known_options(&[]), None);
         assert_eq!(
@@ -4283,8 +4281,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded(),
                 resumed_without_options: true,
-                session: None,
-                launch: SeededLaunch::Started,
+                launch: SeededLaunch::Started { session: None },
             });
             terminal
         };
@@ -4297,8 +4294,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded(),
             resumed_without_options: true,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
@@ -4339,8 +4335,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder"]),
             resumed_without_options: false,
-            session: None,
-            launch: SeededLaunch::Started,
+            launch: SeededLaunch::Started { session: None },
         });
         assert!(!terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
