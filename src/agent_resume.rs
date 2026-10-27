@@ -743,12 +743,6 @@ fn next_launch_arg<'a>(
     }
 }
 
-/// The launch options in a Claude command line. Commander parses options
-/// anywhere; the first operand is a subcommand or the one-time prompt, and
-/// every later operand is dropped with it. A variadic option such as
-/// `--add-dir a b` takes every following argument up to the next one that
-/// starts with `-`, so a prompt typed after it is one of its values to Claude
-/// too, and is kept as such.
 /// Why the parser stopped reading a command line, and the argument it
 /// stopped at.
 #[derive(Debug)]
@@ -766,6 +760,12 @@ struct ClaudeLaunch {
     fork: bool,
 }
 
+/// The launch options in a Claude command line. Commander parses options
+/// anywhere; the first operand is a subcommand or the one-time prompt, and
+/// every later operand is dropped with it. A variadic option such as
+/// `--add-dir a b` takes every following argument up to the next one that
+/// starts with `-`, so a prompt typed after it is one of its values to Claude
+/// too, and is kept as such.
 fn parse_claude_args(args: &[String]) -> Result<ClaudeLaunch, ArgsRejected> {
     let mut launch = ClaudeLaunch::default();
     let mut operands = 0;
