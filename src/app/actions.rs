@@ -163,13 +163,6 @@ pub fn notification_context(
     context
 }
 
-/// Reads the foreground job of a terminal's shell, so a reported conversation
-/// is paired with the agent process recorded there only when that process is
-/// the only Claude or Codex process in the job. Only `App` holds the runtimes
-/// it reads.
-pub(crate) type ForegroundJobReader<'a> =
-    &'a dyn Fn(&crate::terminal::TerminalId) -> Option<crate::platform::ForegroundJob>;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneStateUpdate {
     pub pane_id: PaneId,
@@ -1378,16 +1371,7 @@ impl AppState {
         changed
     }
 
-    #[cfg(test)]
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
-        self.handle_app_event_with_foreground_jobs(event, &|_| None)
-    }
-
-    pub fn handle_app_event_with_foreground_jobs(
-        &mut self,
-        event: AppEvent,
-        foreground_job: ForegroundJobReader<'_>,
-    ) -> Vec<PaneStateUpdate> {
         match event {
             AppEvent::PaneDied { pane_id, .. } => {
                 self.handle_pane_died(pane_id);
@@ -1453,7 +1437,7 @@ impl AppState {
                 agent,
                 observed_at,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     Some(terminal.set_detected_agent_process_at(agent, observed_at))
                 })
                 .into_iter()
@@ -1470,7 +1454,7 @@ impl AppState {
                     let resumed_session = argv.as_deref().and_then(|argv| {
                         crate::agent_resume::resumed_session_from_process_argv(agent, argv)
                     });
-                    self.update_terminal_state(pane_id, foreground_job, |terminal| {
+                    self.update_terminal_state(pane_id, |terminal| {
                         terminal.observe_agent_launch(
                             agent,
                             process_id,
@@ -1483,7 +1467,7 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::CodexPromptObserved { pane_id, ready } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     terminal.observe_codex_prompt_ready(ready)
                 })
                 .into_iter()
@@ -1497,7 +1481,7 @@ impl AppState {
                 process_exited,
                 observed_at,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     Some(terminal.set_detected_state_with_screen_signals_at(
                         agent,
                         state,
@@ -1520,13 +1504,13 @@ impl AppState {
                 session_ref,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
-                    self.update_terminal_state(pane_id, foreground_job, |terminal| {
+                    self.update_terminal_state(pane_id, |terminal| {
                         terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
                     })
                     .into_iter()
                     .collect()
                 } else {
-                    self.update_terminal_state(pane_id, foreground_job, |terminal| {
+                    self.update_terminal_state(pane_id, |terminal| {
                         terminal.set_hook_authority_with_session_ref(
                             source,
                             agent_label,
@@ -1547,7 +1531,7 @@ impl AppState {
                 seq,
                 argv,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     terminal.record_reported_resume(&source, &agent_label, seq, argv);
                     None
                 })
@@ -1557,7 +1541,7 @@ impl AppState {
                 pane_id,
                 observed_at,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     terminal.clear_self_reported_agent(observed_at)
                 })
                 .into_iter()
@@ -1569,15 +1553,18 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                evidence,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                .update_terminal_state(pane_id, |terminal| {
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    );
+                    terminal.sync_agent_launch_session(&evidence);
+                    mutation
                 })
                 .into_iter()
                 .collect(),
@@ -1595,7 +1582,7 @@ impl AppState {
                 seq,
                 ttl,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
                         source,
                         agent_label,
@@ -1617,7 +1604,7 @@ impl AppState {
                 source,
                 seq,
             } => self
-                .update_terminal_state(pane_id, foreground_job, |terminal| {
+                .update_terminal_state(pane_id, |terminal| {
                     terminal.clear_hook_authority_with_mutation(source.as_deref(), seq)
                 })
                 .into_iter()
@@ -1632,7 +1619,7 @@ impl AppState {
                 if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
                     Vec::new()
                 } else {
-                    self.update_terminal_state(pane_id, foreground_job, |terminal| {
+                    self.update_terminal_state(pane_id, |terminal| {
                         terminal.release_agent_with_mutation(&source, &agent_label, seq)
                     })
                     .into_iter()
@@ -1678,23 +1665,17 @@ impl AppState {
         }
     }
 
-    fn update_terminal_state<F>(
-        &mut self,
-        pane_id: PaneId,
-        foreground_job: ForegroundJobReader<'_>,
-        update: F,
-    ) -> Option<PaneStateUpdate>
+    fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {
-        self.update_terminal_state_with_completion_policy(pane_id, false, foreground_job, update)
+        self.update_terminal_state_with_completion_policy(pane_id, false, update)
     }
 
     fn update_terminal_state_with_completion_policy<F>(
         &mut self,
         pane_id: PaneId,
         force_suppress_completion: bool,
-        foreground_job: ForegroundJobReader<'_>,
         update: F,
     ) -> Option<PaneStateUpdate>
     where
@@ -1725,7 +1706,6 @@ impl AppState {
             let launch_revision = terminal.agent_launch_revision();
             let mutation = update(terminal);
             terminal.reconcile_reported_resume();
-            terminal.sync_agent_launch_session(|| foreground_job(&terminal_id));
             // Resume-only and launch-option-only changes return no mutation but
             // must still be saved.
             if terminal.reported_resume_revision() != resume_revision
@@ -1821,11 +1801,9 @@ impl AppState {
         suppress_completion: bool,
     ) -> Option<PaneStateUpdate> {
         let observed_at = std::time::Instant::now();
-        // The agent process exited, so no conversation pairs with it.
         let update = self.update_terminal_state_with_completion_policy(
             pane_id,
             suppress_completion,
-            &|_| None,
             |terminal| {
                 let agent = terminal.effective_known_agent().or(terminal.detected_agent);
                 if agent.is_none() && !terminal.full_lifecycle_hook_authority_active() {
@@ -3293,6 +3271,7 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                evidence: Default::default(),
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
@@ -3345,7 +3324,7 @@ mod tests {
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         state.session_dirty = false;
 
-        state.update_terminal_state(pane_id, &|_| None, |terminal| {
+        state.update_terminal_state(pane_id, |terminal| {
             terminal.observe_agent_launch(
                 Agent::Claude,
                 10,
@@ -3357,7 +3336,7 @@ mod tests {
         assert!(state.session_dirty);
 
         state.session_dirty = false;
-        state.update_terminal_state(pane_id, &|_| None, |terminal| {
+        state.update_terminal_state(pane_id, |terminal| {
             terminal.observe_agent_launch(
                 Agent::Claude,
                 10,
@@ -3378,27 +3357,17 @@ mod tests {
     /// Claude reports `session`. The pane's foreground job runs one Claude,
     /// process `std::process::id()`.
     fn report_claude_session(state: &mut AppState, pane_id: PaneId, seq: u64, session: &str) {
-        let foreground_claude = crate::platform::ForegroundJob {
-            process_group_id: std::process::id(),
-            processes: vec![crate::platform::ForegroundProcess {
-                pid: std::process::id(),
-                name: "claude".into(),
-                argv0: None,
-                argv: None,
-                cmdline: None,
-            }],
-        };
-        state.handle_app_event_with_foreground_jobs(
-            AppEvent::AgentSessionReported {
-                pane_id,
-                source: "herdr:claude".into(),
-                agent_label: "claude".into(),
-                seq: Some(seq),
-                session_ref: crate::agent_resume::AgentSessionRef::id(session),
-                session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:claude".into(),
+            agent_label: "claude".into(),
+            seq: Some(seq),
+            session_ref: crate::agent_resume::AgentSessionRef::id(session),
+            session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
+            evidence: crate::terminal::SessionReportEvidence {
+                foreground_agents: Some(vec![std::process::id()]),
             },
-            &|_| Some(foreground_claude.clone()),
-        );
+        });
     }
 
     fn observe_claude_process(

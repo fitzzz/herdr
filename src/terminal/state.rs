@@ -388,6 +388,15 @@ fn session_for_process(
     }
 }
 
+/// What the server knew, as a Claude or Codex conversation report arrived,
+/// about which process sent it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionReportEvidence {
+    /// The Claude and Codex processes in the pane's foreground job, when the
+    /// job could be read.
+    pub foreground_agents: Option<Vec<u32>>,
+}
+
 /// The options a session restore or `herdr agent start` launched an agent
 /// with, seeded before detection sees its process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,10 +744,7 @@ impl TerminalState {
     /// keeps its pairing and the process detection binds next decides. A
     /// conversation reported beside a saved launch that nothing runs belongs
     /// to another launch.
-    pub fn sync_agent_launch_session(
-        &mut self,
-        foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
-    ) {
+    pub fn sync_agent_launch_session(&mut self, evidence: &SessionReportEvidence) {
         let Some(session) = self.current_session_ref() else {
             return;
         };
@@ -755,17 +761,7 @@ impl TerminalState {
         };
         launch.seen_session = Some(session.clone());
         if let LaunchState::Bound { process_id, .. } = launch.state {
-            let reported_by_process = foreground_job().is_some_and(|job| {
-                let mut agents = job.processes.iter().filter(|process| {
-                    matches!(
-                        crate::detect::identify_agent_process(process),
-                        Some((Agent::Claude | Agent::Codex, _))
-                    )
-                });
-                agents.next().is_some_and(|agent| agent.pid == process_id)
-                    && agents.next().is_none()
-            });
-            if !reported_by_process {
+            if evidence.foreground_agents.as_deref() != Some(&[process_id]) {
                 return;
             }
         }
@@ -8342,20 +8338,11 @@ mod tests {
         );
     }
 
-    /// A foreground job of `(process id, program)` processes, led by the first.
-    fn foreground_job_of(processes: &[(u32, &str)]) -> crate::platform::ForegroundJob {
-        crate::platform::ForegroundJob {
-            process_group_id: processes.first().map_or(0, |(pid, _)| *pid),
-            processes: processes
-                .iter()
-                .map(|(pid, name)| crate::platform::ForegroundProcess {
-                    pid: *pid,
-                    name: (*name).into(),
-                    argv0: None,
-                    argv: None,
-                    cmdline: None,
-                })
-                .collect(),
+    /// The report evidence of a pane whose foreground job runs these Claude or
+    /// Codex processes.
+    fn foreground_agents(process_ids: &[u32]) -> SessionReportEvidence {
+        SessionReportEvidence {
+            foreground_agents: Some(process_ids.to_vec()),
         }
     }
 
@@ -8378,7 +8365,7 @@ mod tests {
         terminal.set_detected_state(Some(agent), AgentState::Idle);
         report_session(&mut terminal, label, &format!("{label}-a"), 1, "startup");
         terminal.observe_agent_launch(agent, 10, known_options(&["--placeholder-a"]), None);
-        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(10, label)])));
+        terminal.sync_agent_launch_session(&foreground_agents(&[10]));
         assert_eq!(
             terminal.launch_options_for_session(label),
             Some(vec!["--placeholder-a".into()])
@@ -8392,7 +8379,7 @@ mod tests {
         // Ctrl-Z stops the first Codex, and a second one starts in the
         // foreground and reports its new conversation.
         report_session(&mut terminal, "codex", "codex-b", 2, "startup");
-        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(11, "codex")])));
+        terminal.sync_agent_launch_session(&foreground_agents(&[11]));
         assert_eq!(terminal.launch_options_for_session("codex"), None);
         // Detection reads the second Codex, which takes its conversation.
         terminal.observe_agent_launch(Agent::Codex, 11, known_options(&["--placeholder-b"]), None);
@@ -8408,7 +8395,7 @@ mod tests {
         // `claude --resume claude-c` runs in the foreground while the first
         // Claude is stopped.
         report_session(&mut terminal, "claude", "claude-c", 2, "resume");
-        terminal.sync_agent_launch_session(|| Some(foreground_job_of(&[(11, "claude")])));
+        terminal.sync_agent_launch_session(&foreground_agents(&[11]));
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         terminal.observe_agent_launch(
             Agent::Claude,
@@ -8428,19 +8415,17 @@ mod tests {
         // The first Claude runs another Claude in its own process group, and
         // that one resumes another conversation.
         report_session(&mut terminal, "claude", "claude-c", 2, "resume");
-        terminal.sync_agent_launch_session(|| {
-            Some(foreground_job_of(&[(10, "claude"), (12, "claude")]))
-        });
+        terminal.sync_agent_launch_session(&foreground_agents(&[10, 12]));
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
     #[test]
     fn a_conversation_change_inside_the_only_agent_of_the_job_keeps_its_options() {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
-        // `/clear`, with a tool the agent runs in the same job.
+        // `/clear`, with a tool the agent runs in the same job, which is no
+        // Claude or Codex process.
         report_session(&mut terminal, "claude", "claude-b", 2, "clear");
-        terminal
-            .sync_agent_launch_session(|| Some(foreground_job_of(&[(10, "claude"), (13, "node")])));
+        terminal.sync_agent_launch_session(&foreground_agents(&[10]));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-a".into()])

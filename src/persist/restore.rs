@@ -2818,7 +2818,7 @@ mod tests {
                 Some(1),
                 Some("startup".into()),
             );
-            terminal.sync_agent_launch_session(|| None);
+            terminal.sync_agent_launch_session(&Default::default());
         });
         assert_eq!(saved.value, "fresh-session");
         assert_eq!(saved.launch_options, None);
@@ -2883,18 +2883,12 @@ mod tests {
         restored_terminals.into_values().next().unwrap()
     }
 
-    /// The foreground job of a pane whose only process is Claude `process_id`.
+    /// The report evidence of a pane whose foreground job runs these Claude
+    /// processes.
     #[cfg(unix)]
-    fn foreground_claude_job(process_id: u32) -> crate::platform::ForegroundJob {
-        crate::platform::ForegroundJob {
-            process_group_id: process_id,
-            processes: vec![crate::platform::ForegroundProcess {
-                pid: process_id,
-                name: "claude".into(),
-                argv0: None,
-                argv: None,
-                cmdline: None,
-            }],
+    fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
+        crate::terminal::SessionReportEvidence {
+            foreground_agents: Some(process_ids.to_vec()),
         }
     }
 
@@ -2986,7 +2980,7 @@ mod tests {
                     resumed,
                 );
                 set_claude_session(terminal);
-                terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
+                terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
             })
             .await;
             assert!(terminal.pending_agent_resume_plan.is_none());
@@ -3070,7 +3064,7 @@ mod tests {
                 None,
             );
             set_claude_session(terminal);
-            terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
+            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
         })
         .await;
         // That agent exited, and the user started another by hand.
@@ -3103,7 +3097,7 @@ mod tests {
         let mut terminal = handed_off(&snapshot, |terminal| {
             terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
             report(terminal, "claude-session", 1, "startup");
-            terminal.sync_agent_launch_session(|| Some(foreground_claude_job(4242)));
+            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
                 4242,
@@ -3120,21 +3114,7 @@ mod tests {
         // conversation, and Herdr cannot tell which one reported it.
         terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
         report(&mut terminal, "claude-child", 2, "resume");
-        terminal.sync_agent_launch_session(|| {
-            Some(crate::platform::ForegroundJob {
-                process_group_id: 4242,
-                processes: [4242, 4343]
-                    .into_iter()
-                    .map(|pid| crate::platform::ForegroundProcess {
-                        pid,
-                        name: "claude".into(),
-                        argv0: None,
-                        argv: None,
-                        cmdline: None,
-                    })
-                    .collect(),
-            })
-        });
+        terminal.sync_agent_launch_session(&foreground_claude(&[4242, 4343]));
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 

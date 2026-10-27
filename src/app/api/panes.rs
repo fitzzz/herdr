@@ -1612,6 +1612,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let evidence = self.session_report_evidence(ws_idx, pane_id, &agent_label);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1621,6 +1622,7 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            evidence,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
@@ -1633,6 +1635,44 @@ impl App {
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
         )
+    }
+
+    /// What the server can tell, as a Claude or Codex conversation report
+    /// arrives, about which process sent it: read here, once per report, so a
+    /// launch record pairs the conversation only on that evidence.
+    fn session_report_evidence(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        agent_label: &str,
+    ) -> crate::terminal::SessionReportEvidence {
+        if !matches!(
+            crate::detect::parse_agent_label(agent_label),
+            Some(crate::detect::Agent::Claude | crate::detect::Agent::Codex)
+        ) {
+            return Default::default();
+        }
+        let foreground_agents = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(crate::terminal::TerminalRuntime::child_pid)
+            .and_then(crate::detect::foreground_job)
+            .map(|job| {
+                job.processes
+                    .iter()
+                    .filter(|process| {
+                        matches!(
+                            crate::detect::identify_agent_process(process),
+                            Some((
+                                crate::detect::Agent::Claude | crate::detect::Agent::Codex,
+                                _
+                            ))
+                        )
+                    })
+                    .map(|process| process.pid)
+                    .collect()
+            });
+        crate::terminal::SessionReportEvidence { foreground_agents }
     }
 
     /// A resume command belongs to the session it was reported with, so it is
