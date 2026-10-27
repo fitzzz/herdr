@@ -3093,6 +3093,54 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
+    async fn live_handoff_carries_no_pairing_reported_beside_another_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let observed = ProcessInstance {
+            pid: 4242,
+            started: Some(1),
+        };
+        for (case, in_job) in [
+            ("another process", ProcessInstance::unknown_start(4343)),
+            (
+                "the id reused later",
+                ProcessInstance {
+                    pid: 4242,
+                    started: Some(2),
+                },
+            ),
+        ] {
+            // The old server read Claude's report beside one other Claude
+            // before detection read process 4242.
+            let terminal = handed_off(&snapshot, |terminal| {
+                terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+                terminal.set_agent_session_ref_for_session_start(
+                    "herdr:claude".into(),
+                    "claude".into(),
+                    crate::agent_resume::AgentSessionRef::id("claude-session"),
+                    Some(1),
+                    Some("startup".into()),
+                );
+                terminal.sync_agent_launch_session(
+                    &crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![in_job])),
+                );
+                terminal.observe_agent_launch(
+                    crate::detect::Agent::Claude,
+                    observed,
+                    crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                    None,
+                );
+            })
+            .await;
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
     async fn live_handoff_keeps_an_assumed_pairing_bound_to_its_process() {
         let (snapshot, _) = snapshot_with_saved_pane_history();
         let report = |terminal: &mut TerminalState, id: &str, seq: u64, start: &str| {

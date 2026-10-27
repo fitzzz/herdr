@@ -3360,9 +3360,15 @@ mod tests {
     /// A process id the pane's foreground job does not run.
     const EXITED_PROCESS_ID: u32 = 0x3FFF_FFFF;
 
-    /// Claude reports `session`. The pane's foreground job runs one Claude,
-    /// process `std::process::id()`.
-    fn report_claude_session(state: &mut AppState, pane_id: PaneId, seq: u64, session: &str) {
+    /// Claude reports `session` while the pane's foreground job runs one
+    /// Claude, process `reporter`.
+    fn report_claude_session(
+        state: &mut AppState,
+        pane_id: PaneId,
+        reporter: u32,
+        seq: u64,
+        session: &str,
+    ) {
         state.handle_app_event(AppEvent::AgentSessionReported {
             pane_id,
             source: "herdr:claude".into(),
@@ -3371,7 +3377,7 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id(session),
             session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
             evidence: crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![
-                ProcessInstance::unknown_start(std::process::id()),
+                ProcessInstance::unknown_start(reporter),
             ])),
         });
     }
@@ -3439,7 +3445,7 @@ mod tests {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
         assert_eq!(
             saved_claude_restore(&state, pane_id),
@@ -3455,7 +3461,7 @@ mod tests {
             saved_claude_restore(&state, pane_id),
             ("session-a".into(), claude_resume(&[], "session-a"))
         );
-        report_claude_session(&mut state, pane_id, 2, "session-b");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-b");
         assert_eq!(
             saved_claude_restore(&state, pane_id),
             (
@@ -3466,11 +3472,65 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_reported_beside_another_process_does_not_take_the_observed_options() {
+        let report = |state: &mut AppState, pane_id, in_job| {
+            state.handle_app_event(AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:claude".into(),
+                agent_label: "claude".into(),
+                seq: Some(1),
+                session_ref: crate::agent_resume::AgentSessionRef::id("session-a"),
+                session_start_source: Some("startup".into()),
+                evidence: crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![
+                    in_job,
+                ])),
+            });
+        };
+        let in_job = ProcessInstance {
+            pid: std::process::id(),
+            started: Some(100),
+        };
+        for (case, observed) in [
+            (
+                "another process",
+                ProcessInstance::unknown_start(EXITED_PROCESS_ID),
+            ),
+            (
+                "the job's id reused later",
+                ProcessInstance {
+                    pid: std::process::id(),
+                    started: Some(200),
+                },
+            ),
+        ] {
+            let mut state = app_with_workspaces(&["one"]);
+            state.ensure_test_terminals();
+            let pane_id = state.workspaces[0].tabs[0].root_pane;
+            report(&mut state, pane_id, in_job);
+            state.handle_app_event(AppEvent::AgentLaunchObserved {
+                pane_id,
+                agent: Agent::Claude,
+                process: observed,
+                argv: Some(vec![
+                    "claude".into(),
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                ]),
+            });
+            assert_eq!(
+                saved_claude_restore(&state, pane_id),
+                ("session-a".into(), claude_resume(&[], "session-a")),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn a_launcher_exec_does_not_pair_a_new_process_with_the_previous_conversation() {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
 
         // Process B is a launcher that execs Claude in its own process.
@@ -3507,7 +3567,7 @@ mod tests {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
         // B is left unpaired, then C replaces it before either reports.
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID - 1, "acceptEdits");
@@ -3530,7 +3590,7 @@ mod tests {
             let mut state = app_with_workspaces(&["one"]);
             state.ensure_test_terminals();
             let pane_id = state.workspaces[0].tabs[0].root_pane;
-            report_claude_session(&mut state, pane_id, 1, "session-a");
+            report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
             observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
             (state, pane_id)
         };
@@ -3544,12 +3604,12 @@ mod tests {
         let (mut state, pane_id) = setup();
         observe_claude_argv(&mut state, pane_id, b, &resumed);
         assert_eq!(saved_claude_restore(&state, pane_id), expected);
-        report_claude_session(&mut state, pane_id, 2, "session-a");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-a");
         assert_eq!(saved_claude_restore(&state, pane_id), expected);
 
         // B's report of the same conversation before the observation.
         let (mut state, pane_id) = setup();
-        report_claude_session(&mut state, pane_id, 2, "session-a");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-a");
         observe_claude_argv(&mut state, pane_id, b, &resumed);
         assert_eq!(saved_claude_restore(&state, pane_id), expected);
 
@@ -3565,7 +3625,7 @@ mod tests {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
         observe_claude_argv(
             &mut state,
@@ -3583,7 +3643,7 @@ mod tests {
             claude_resume(&["--permission-mode", "bypassPermissions"], "session-a"),
         );
         assert_eq!(saved_claude_restore(&state, pane_id), expected);
-        report_claude_session(&mut state, pane_id, 2, "session-a");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-a");
         assert_eq!(saved_claude_restore(&state, pane_id), expected);
     }
 
@@ -3592,7 +3652,7 @@ mod tests {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
         observe_claude_argv(
             &mut state,
@@ -3611,7 +3671,7 @@ mod tests {
             saved_claude_restore(&state, pane_id),
             ("session-a".into(), claude_resume(&[], "session-a"))
         );
-        report_claude_session(&mut state, pane_id, 2, "session-fork");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-fork");
         assert_eq!(
             saved_claude_restore(&state, pane_id),
             (
@@ -3626,12 +3686,12 @@ mod tests {
         let mut state = app_with_workspaces(&["one"]);
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
-        report_claude_session(&mut state, pane_id, 1, "session-a");
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
         observe_claude_process(&mut state, pane_id, EXITED_PROCESS_ID, "plan");
 
         // Process A has exited; B reports its conversation before detection
         // sees B.
-        report_claude_session(&mut state, pane_id, 2, "session-b");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-b");
         assert_eq!(
             saved_claude_restore(&state, pane_id),
             ("session-b".into(), claude_resume(&[], "session-b"))
@@ -3652,8 +3712,8 @@ mod tests {
         state.ensure_test_terminals();
         let pane_id = state.workspaces[0].tabs[0].root_pane;
         observe_claude_process(&mut state, pane_id, std::process::id(), "plan");
-        report_claude_session(&mut state, pane_id, 1, "session-a");
-        report_claude_session(&mut state, pane_id, 2, "session-a2");
+        report_claude_session(&mut state, pane_id, std::process::id(), 1, "session-a");
+        report_claude_session(&mut state, pane_id, std::process::id(), 2, "session-a2");
         assert_eq!(
             saved_claude_restore(&state, pane_id),
             (
