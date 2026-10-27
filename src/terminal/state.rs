@@ -148,12 +148,14 @@ fn seed_keeps_record(
     resumed_session: Option<&str>,
 ) -> bool {
     use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
-    if !seed.launched
-        || seed
-            .process_id
-            .is_some_and(|bound| bound != process_id || seed.seed_reading.is_none())
-    {
-        return false;
+    match &seed.state {
+        LaunchState::Saved(_) => return false,
+        LaunchState::Bound {
+            process_id: bound,
+            kept_seed,
+            ..
+        } if *bound != process_id || kept_seed.is_none() => return false,
+        LaunchState::Started(_) | LaunchState::Bound { .. } => {}
     }
     if matches!(
         observed,
@@ -165,7 +167,7 @@ fn seed_keeps_record(
         && (match observed {
             AgentLaunchOptions::Known(observed) => observed.is_empty(),
             AgentLaunchOptions::Unavailable(_) => true,
-        } || resumes(resumed_session, seed.session.as_ref()))
+        } || resumes(resumed_session, seed.session()))
 }
 
 /// Whether a command line that resumes `resumed_session` resumes `session`.
@@ -238,16 +240,77 @@ impl<'a> ResumeReading<'a> {
     }
 }
 
-/// The conversation a launch record owns, and the last conversation an
-/// earlier process owned, carried while the record is unpaired.
+/// Where a launch record stands with its process.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProcessSession {
-    session: Option<crate::agent_resume::AgentSessionRef>,
-    /// The process's own command line or the agent's own report showed it
-    /// runs `session`; otherwise the pairing is assumed and another reading
-    /// of the same process decides it again.
-    confirmed: bool,
-    earlier: Option<crate::agent_resume::AgentSessionRef>,
+enum LaunchState {
+    /// Herdr started the launch (a restore's resume command or `herdr agent
+    /// start`), and detection has not read its process yet.
+    Started(Pairing),
+    /// A pane restored without its agent keeps its saved launch for the next
+    /// save; nothing runs it.
+    Saved(crate::agent_resume::AgentSessionRef),
+    /// Detection read this process, or a live handoff bound the seed to it.
+    Bound {
+        process_id: u32,
+        pairing: Pairing,
+        /// While the record still holds a seed's options for this process,
+        /// the rank of the reading they were kept through, so a better
+        /// reading of the process decides again.
+        kept_seed: Option<ReadingRank>,
+    },
+}
+
+impl LaunchState {
+    fn session(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        match self {
+            Self::Started(pairing) | Self::Bound { pairing, .. } => pairing.session(),
+            Self::Saved(session) => Some(session),
+        }
+    }
+
+    fn earlier(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        match self {
+            Self::Started(pairing) | Self::Bound { pairing, .. } => pairing.earlier(),
+            Self::Saved(_) => None,
+        }
+    }
+}
+
+/// The conversation a launch owns. Options are saved only beside it, so a
+/// wrapper that starts another process never pairs one process's options
+/// with the other's conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pairing {
+    /// The process's own command line or the agent's own report showed that
+    /// it runs this conversation.
+    Confirmed(crate::agent_resume::AgentSessionRef),
+    /// Assumed, so another reading of the same process decides it again.
+    Assumed {
+        session: crate::agent_resume::AgentSessionRef,
+        earlier: Option<crate::agent_resume::AgentSessionRef>,
+    },
+    /// No conversation. `earlier` here and in `Assumed` is the last
+    /// conversation an earlier process owned, which a later process is never
+    /// paired with.
+    Unpaired {
+        earlier: Option<crate::agent_resume::AgentSessionRef>,
+    },
+}
+
+impl Pairing {
+    fn session(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        match self {
+            Self::Confirmed(session) | Self::Assumed { session, .. } => Some(session),
+            Self::Unpaired { .. } => None,
+        }
+    }
+
+    fn earlier(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        match self {
+            Self::Confirmed(_) => None,
+            Self::Assumed { earlier, .. } | Self::Unpaired { earlier } => earlier.as_ref(),
+        }
+    }
 }
 
 /// The conversation the launch record of `process_id` owns, given the record
@@ -261,33 +324,34 @@ fn session_for_process(
     current_reported: bool,
     process_id: u32,
     reading: ResumeReading,
-) -> ProcessSession {
+) -> Pairing {
     // Another reading of the same process, or the seed of the launch that
     // started it.
     let same_launch = previous.filter(|previous| {
-        previous.agent == agent && previous.process_id.is_none_or(|bound| bound == process_id)
+        previous.agent == agent
+            && previous
+                .process_id()
+                .is_none_or(|bound| bound == process_id)
     });
-    if let Some(launch) = same_launch.filter(|launch| launch.session_confirmed) {
-        return ProcessSession {
-            session: launch.session.clone(),
-            confirmed: true,
-            earlier: launch.earlier_session.clone(),
-        };
+    if let Some(
+        LaunchState::Started(Pairing::Confirmed(session))
+        | LaunchState::Bound {
+            pairing: Pairing::Confirmed(session),
+            ..
+        },
+    ) = same_launch.map(|launch| &launch.state)
+    {
+        return Pairing::Confirmed(session.clone());
     }
     // The last conversation an earlier process owned stays unpaired until
     // the new process reports its own.
     let earlier = match same_launch {
-        Some(launch) => launch.earlier_session.as_ref(),
-        None => previous.and_then(|previous| {
-            previous
-                .session
-                .as_ref()
-                .or(previous.earlier_session.as_ref())
-        }),
+        Some(launch) => launch.state.earlier(),
+        None => previous.and_then(|previous| previous.session().or(previous.state.earlier())),
     };
     // The conversation the seed's launch named, or an earlier reading of
     // this process assumed.
-    let assumed = same_launch.and_then(|launch| launch.session.as_ref());
+    let assumed = same_launch.and_then(ObservedAgentLaunch::session);
     // A conversation a live agent reported that no earlier process owned: a
     // fresh agent whose report arrived before detection read it.
     let reported = current_session.filter(|session| current_reported && earlier != Some(*session));
@@ -314,10 +378,11 @@ fn session_for_process(
             false,
         ),
     };
-    ProcessSession {
-        session: session.cloned(),
-        confirmed,
-        earlier: earlier.cloned(),
+    let earlier = earlier.cloned();
+    match (session.cloned(), confirmed) {
+        (Some(session), true) => Pairing::Confirmed(session),
+        (Some(session), false) => Pairing::Assumed { session, earlier },
+        (None, _) => Pairing::Unpaired { earlier },
     }
 }
 
@@ -346,8 +411,9 @@ pub enum SeededLaunch {
     /// pairing whatever its command line says.
     Paired { process_id: u32 },
     /// Nothing runs it: a pane restored without resuming its agent, or whose
-    /// directory is missing, keeps the saved launch for its next save. No process keeps its options or its
-    /// mark, and a conversation reported meanwhile belongs to another launch.
+    /// directory is missing, keeps the saved launch for its next save. No
+    /// process keeps its options or its mark, and a conversation reported
+    /// meanwhile belongs to another launch.
     Saved,
 }
 
@@ -356,36 +422,32 @@ pub enum SeededLaunch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedAgentLaunch {
     pub agent: Agent,
-    /// The agent process whose command line was read; `None` until detection
-    /// binds a record seeded by restore or `herdr agent start` to it.
-    pub process_id: Option<u32>,
     pub options: crate::agent_resume::AgentLaunchOptions,
     /// The agent was resumed by a restore that fell back to the bare resume
     /// command; stays set while the record is bound to that process.
     pub resumed_without_options: bool,
-    /// The conversation known to run in this process, or, before detection
-    /// binds a seed, in the launch it seeded. Options are saved only beside
-    /// this conversation, so a wrapper that starts another process never
-    /// pairs one process's options with the other's conversation.
-    pub session: Option<crate::agent_resume::AgentSessionRef>,
-    /// The process's own command line or the agent's own report showed that
-    /// `session` runs in it; otherwise the pairing is assumed.
-    session_confirmed: bool,
-    /// A launch runs `session`; false only for a `SeededLaunch::Saved` seed.
-    launched: bool,
     /// The pane's conversation when this record last looked, so only a
     /// conversation reported since then is paired with it.
     seen_session: Option<crate::agent_resume::AgentSessionRef>,
-    /// The last conversation an earlier process owned, carried while this
-    /// record is unpaired, so a later process is never paired with it.
-    earlier_session: Option<crate::agent_resume::AgentSessionRef>,
-    /// While the record still holds a seed's options for its process, the
-    /// rank of the reading they were kept through, so a better reading of
-    /// that process decides again.
-    seed_reading: Option<ReadingRank>,
+    state: LaunchState,
 }
 
 impl ObservedAgentLaunch {
+    /// The agent process whose command line was read; `None` until detection
+    /// binds a record seeded by restore or `herdr agent start` to it.
+    pub fn process_id(&self) -> Option<u32> {
+        match self.state {
+            LaunchState::Bound { process_id, .. } => Some(process_id),
+            LaunchState::Started(_) | LaunchState::Saved(_) => None,
+        }
+    }
+
+    /// The conversation known to run in this process, or, before detection
+    /// binds a seed, in the launch it seeded.
+    fn session(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        self.state.session()
+    }
+
     fn saved_options(&self) -> Option<(Agent, &[String])> {
         match &self.options {
             crate::agent_resume::AgentLaunchOptions::Known(options) => {
@@ -520,8 +582,8 @@ impl TerminalState {
                 != launch
                     .as_ref()
                     .and_then(ObservedAgentLaunch::resumed_without_options_agent)
-            || current.map(|launch| &launch.session)
-                != launch.as_ref().map(|launch| &launch.session);
+            || current.map(ObservedAgentLaunch::session)
+                != launch.as_ref().map(ObservedAgentLaunch::session);
         self.agent_launch = launch;
         if saved_changed {
             self.agent_launch_revision += 1;
@@ -531,21 +593,33 @@ impl TerminalState {
     /// Records the options a session restore or `herdr agent start` launched
     /// the agent with, before detection sees its process.
     pub fn seed_agent_launch(&mut self, seed: AgentLaunchSeed) {
+        let state = match (seed.launch, seed.session) {
+            (SeededLaunch::Started, Some(session)) => LaunchState::Started(Pairing::Assumed {
+                session,
+                earlier: None,
+            }),
+            (SeededLaunch::Started, None) => {
+                LaunchState::Started(Pairing::Unpaired { earlier: None })
+            }
+            (SeededLaunch::Paired { process_id }, session) => LaunchState::Bound {
+                process_id,
+                pairing: session.map_or(Pairing::Unpaired { earlier: None }, Pairing::Confirmed),
+                kept_seed: None,
+            },
+            (SeededLaunch::Saved, Some(session)) => LaunchState::Saved(session),
+            // A saved launch without a conversation has nothing to save.
+            (SeededLaunch::Saved, None) => {
+                self.set_agent_launch(None);
+                return;
+            }
+        };
         let seen_session = self.current_session_ref().cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent: seed.agent,
-            process_id: match seed.launch {
-                SeededLaunch::Paired { process_id } => Some(process_id),
-                SeededLaunch::Started | SeededLaunch::Saved => None,
-            },
             options: seed.options,
             resumed_without_options: seed.resumed_without_options,
-            session: seed.session,
-            session_confirmed: matches!(seed.launch, SeededLaunch::Paired { .. }),
-            launched: seed.launch != SeededLaunch::Saved,
             seen_session,
-            earlier_session: None,
-            seed_reading: None,
+            state,
         }));
     }
 
@@ -566,17 +640,21 @@ impl TerminalState {
         // The same process is observed again when its command line became
         // readable, or when a launcher script exec'd the agent in its own
         // process; that replaces a record that could not read or place it.
-        if current.is_some_and(|current| {
-            current.process_id == Some(process_id)
-                && rank
-                    <= current
-                        .seed_reading
-                        .unwrap_or_else(|| ReadingRank::of(&current.options))
+        if current.is_some_and(|current| match current.state {
+            LaunchState::Bound {
+                process_id: bound,
+                kept_seed,
+                ..
+            } => {
+                bound == process_id
+                    && rank <= kept_seed.unwrap_or_else(|| ReadingRank::of(&current.options))
+            }
+            LaunchState::Started(_) | LaunchState::Saved(_) => false,
         }) {
             return;
         }
         let reading = ResumeReading::of(&options, resumed_session);
-        let (options, resumed_without_options, seed_reading) = match current {
+        let (options, resumed_without_options, kept_seed) = match current {
             Some(current) if seed_keeps_record(current, process_id, &options, resumed_session) => (
                 current.options.clone(),
                 current.resumed_without_options,
@@ -585,7 +663,7 @@ impl TerminalState {
             _ => (options, false, None),
         };
         let current_session = self.current_session_ref();
-        let paired = session_for_process(
+        let pairing = session_for_process(
             self.agent_launch.as_ref(),
             agent,
             current_session,
@@ -599,15 +677,14 @@ impl TerminalState {
         let seen_session = current_session.cloned();
         self.set_agent_launch(Some(ObservedAgentLaunch {
             agent,
-            process_id: Some(process_id),
             options,
             resumed_without_options,
-            session: paired.session,
-            session_confirmed: paired.confirmed,
-            launched: true,
             seen_session,
-            earlier_session: paired.earlier,
-            seed_reading,
+            state: LaunchState::Bound {
+                process_id,
+                pairing,
+                kept_seed,
+            },
         }));
     }
 
@@ -645,15 +722,16 @@ impl TerminalState {
             return;
         };
         launch.seen_session = Some(session.clone());
-        if !launch.launched || launch.process_id.is_some_and(|pid| !process_running(pid)) {
-            return;
+        let pairing = match &mut launch.state {
+            LaunchState::Saved(_) => return,
+            LaunchState::Bound { process_id, .. } if !process_running(*process_id) => return,
+            LaunchState::Started(pairing) | LaunchState::Bound { pairing, .. } => pairing,
+        };
+        let changed = pairing.session() != Some(&session);
+        *pairing = Pairing::Confirmed(session);
+        if changed {
+            self.agent_launch_revision += 1;
         }
-        launch.session_confirmed = true;
-        if launch.session.as_ref() == Some(&session) {
-            return;
-        }
-        launch.session = Some(session);
-        self.agent_launch_revision += 1;
     }
 
     /// The launch record, when its options belong to the conversation a
@@ -661,14 +739,14 @@ impl TerminalState {
     fn launch_for_current_session(&self) -> Option<&ObservedAgentLaunch> {
         self.agent_launch
             .as_ref()
-            .filter(|launch| launch.session.as_ref() == self.current_session_ref())
+            .filter(|launch| launch.session() == self.current_session_ref())
     }
 
     /// Whether the pane's agent was resumed without its launch options.
     pub fn resumed_without_launch_options(&self) -> bool {
-        self.agent_launch
-            .as_ref()
-            .is_some_and(|launch| launch.launched && launch.resumed_without_options)
+        self.agent_launch.as_ref().is_some_and(|launch| {
+            !matches!(launch.state, LaunchState::Saved(_)) && launch.resumed_without_options
+        })
     }
 
     /// Whether to save beside a session of `agent_label` that it was resumed
@@ -730,15 +808,15 @@ impl TerminalState {
     /// for a live handoff.
     #[cfg(unix)]
     pub(crate) fn handoff_agent_launch(&self) -> Option<HandoffAgentLaunch> {
-        let launch = self.launch_for_current_session()?;
-        if !launch.launched {
-            return Some(HandoffAgentLaunch::Saved);
+        match self.launch_for_current_session()?.state {
+            LaunchState::Saved(_) => Some(HandoffAgentLaunch::Saved),
+            LaunchState::Bound {
+                process_id,
+                pairing: Pairing::Confirmed(_),
+                ..
+            } => Some(HandoffAgentLaunch::Confirmed { process_id }),
+            LaunchState::Started(_) | LaunchState::Bound { .. } => None,
         }
-        launch
-            .session_confirmed
-            .then_some(launch.process_id)
-            .flatten()
-            .map(|process_id| HandoffAgentLaunch::Confirmed { process_id })
     }
 
     #[cfg(unix)]
@@ -3062,7 +3140,7 @@ mod tests {
             known_options(&["--placeholder-b"]),
             None,
         );
-        assert_eq!(terminal.agent_launch().unwrap().process_id, Some(101));
+        assert_eq!(terminal.agent_launch().unwrap().process_id(), Some(101));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-b".to_string()])
@@ -3118,7 +3196,7 @@ mod tests {
             None,
         );
         let record = terminal.agent_launch().unwrap();
-        assert_eq!(record.process_id, Some(100));
+        assert_eq!(record.process_id(), Some(100));
         assert_eq!(record.options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
     }
@@ -3155,7 +3233,7 @@ mod tests {
             Some("placeholder-session"),
         );
         let record = terminal.agent_launch().unwrap();
-        assert_eq!(record.process_id, Some(100));
+        assert_eq!(record.process_id(), Some(100));
         assert_eq!(record.options, not_recorded);
         assert!(terminal.resumed_without_launch_options());
         assert_eq!(terminal.launch_options_for_session("claude"), None);
@@ -3188,18 +3266,37 @@ mod tests {
         earlier_session: Option<&str>,
     ) -> ObservedAgentLaunch {
         let id = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
+        let earlier = earlier_session.map(id);
+        let pairing = match session.map(id) {
+            Some(session) => Pairing::Assumed { session, earlier },
+            None => Pairing::Unpaired { earlier },
+        };
         ObservedAgentLaunch {
             agent,
-            process_id,
             options: known_options(&["--placeholder-seeded"]),
             resumed_without_options,
-            session: session.map(id),
-            session_confirmed: false,
-            launched: true,
             seen_session: None,
-            earlier_session: earlier_session.map(id),
-            seed_reading: None,
+            state: match process_id {
+                Some(process_id) => LaunchState::Bound {
+                    process_id,
+                    pairing,
+                    kept_seed: None,
+                },
+                None => LaunchState::Started(pairing),
+            },
         }
+    }
+
+    /// `record` with its assumed conversation confirmed.
+    fn confirmed(mut record: ObservedAgentLaunch) -> ObservedAgentLaunch {
+        if let LaunchState::Started(pairing) | LaunchState::Bound { pairing, .. } =
+            &mut record.state
+        {
+            if let Pairing::Assumed { session, .. } = pairing {
+                *pairing = Pairing::Confirmed(session.clone());
+            }
+        }
+        record
     }
 
     #[test]
@@ -3213,13 +3310,13 @@ mod tests {
         let kept = launch_record(Agent::Claude, None, false, Some("seeded"), None);
         let fallback = launch_record(Agent::Claude, None, true, Some("seeded"), None);
         let bound = launch_record(Agent::Claude, Some(10), true, Some("seeded"), None);
-        let kept_through_launcher = ObservedAgentLaunch {
-            seed_reading: Some(ReadingRank::Unrecognized),
-            ..bound.clone()
-        };
+        let mut kept_through_launcher = bound.clone();
+        if let LaunchState::Bound { kept_seed, .. } = &mut kept_through_launcher.state {
+            *kept_seed = Some(ReadingRank::Unrecognized);
+        }
         // A saved launch that nothing runs, with the mark.
         let saved = ObservedAgentLaunch {
-            launched: false,
+            state: LaunchState::Saved(crate::agent_resume::AgentSessionRef::id("seeded").unwrap()),
             ..fallback.clone()
         };
         for (case, seed, observed, resumed, keeps) in [
@@ -3315,19 +3412,20 @@ mod tests {
     fn session_for_process_decides_every_case() {
         use ResumeReading::{Nothing, Resumes, Unknown};
         let id = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
-        let confirmed = |record: ObservedAgentLaunch| ObservedAgentLaunch {
-            session_confirmed: true,
-            ..record
-        };
         let current = id("current");
         let seed = launch_record(Agent::Claude, None, false, Some("current"), None);
         let seed_of_other = launch_record(Agent::Claude, None, false, Some("other"), None);
         let seed_of_nothing = launch_record(Agent::Claude, None, false, None, None);
         let reported_seed = confirmed(seed.clone());
+        let path = crate::agent_resume::AgentSessionRef::path(test_session_path(
+            "placeholder-session.jsonl",
+        ))
+        .unwrap();
         let path_seed = ObservedAgentLaunch {
-            session: crate::agent_resume::AgentSessionRef::path(test_session_path(
-                "placeholder-session.jsonl",
-            )),
+            state: LaunchState::Started(Pairing::Assumed {
+                session: path.clone(),
+                earlier: None,
+            }),
             ..seed_of_nothing.clone()
         };
         let owner = confirmed(launch_record(
@@ -3670,21 +3768,22 @@ mod tests {
                     process_id,
                     reading
                 ),
-                ProcessSession {
-                    session: expected.map(id),
-                    confirmed: is_confirmed,
-                    earlier: carried.map(id),
+                match (expected.map(id), is_confirmed) {
+                    (Some(session), true) => Pairing::Confirmed(session),
+                    (Some(session), false) => Pairing::Assumed {
+                        session,
+                        earlier: carried.map(id),
+                    },
+                    (None, _) => Pairing::Unpaired {
+                        earlier: carried.map(id),
+                    },
                 },
                 "{case}"
             );
         }
         assert_eq!(
             session_for_process(None, Agent::Claude, None, false, 10, Nothing),
-            ProcessSession {
-                session: None,
-                confirmed: false,
-                earlier: None,
-            },
+            Pairing::Unpaired { earlier: None },
             "no conversation yet"
         );
         // No command line names a conversation kept as a path, so the seed's
@@ -3698,8 +3797,8 @@ mod tests {
                 10,
                 Nothing
             )
-            .session,
-            path_seed.session,
+            .session(),
+            Some(&path),
             "seed naming a path"
         );
     }
@@ -3806,7 +3905,7 @@ mod tests {
             record.options,
             known_options(&["--model", "placeholder", "--permission-mode", "plan"])
         );
-        assert_eq!(record.session, None);
+        assert_eq!(record.session(), None);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
@@ -4043,7 +4142,7 @@ mod tests {
             None,
         );
         let launch = terminal.agent_launch().unwrap();
-        assert_eq!(launch.process_id, Some(20));
+        assert_eq!(launch.process_id(), Some(20));
         assert_eq!(launch.options, known_options(&["--seeded"]));
         assert_eq!(terminal.agent_launch_revision(), seeded_revision);
 
@@ -4091,7 +4190,7 @@ mod tests {
         });
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
         let launch = terminal.agent_launch().unwrap();
-        assert_eq!(launch.process_id, Some(40));
+        assert_eq!(launch.process_id(), Some(40));
         assert_eq!(launch.options, not_recorded);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
 
@@ -4183,7 +4282,7 @@ mod tests {
         assert_ne!(terminal.agent_launch_revision(), revision);
         assert!(terminal.resumed_without_launch_options());
         terminal.observe_agent_launch(Agent::Claude, 40, known_options(&[]), None);
-        assert_eq!(terminal.agent_launch().unwrap().process_id, Some(40));
+        assert_eq!(terminal.agent_launch().unwrap().process_id(), Some(40));
         assert!(terminal.resumed_without_launch_options());
         assert!(terminal.resumed_without_launch_options_for_session("claude"));
         assert!(!terminal.resumed_without_launch_options_for_session("codex"));
