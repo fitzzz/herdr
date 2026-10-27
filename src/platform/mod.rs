@@ -43,6 +43,8 @@ pub struct ForegroundProcess {
     pub argv0: Option<String>,
     pub argv: Option<Vec<String>>,
     pub cmdline: Option<String>,
+    /// When the process started, as [`ProcessInstance::started`].
+    pub started: Option<u64>,
 }
 
 /// One running process, told apart from a later process given the same id by
@@ -69,13 +71,13 @@ impl ProcessInstance {
     }
 }
 
-/// A process read while walking up from another, with when it started and the
-/// id of its parent.
+/// A process read while walking up from another, with the id of its parent
+/// and its process group, `None` where the platform has no process groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AncestorProcess {
     pub process: ForegroundProcess,
-    pub started: Option<u64>,
     pub parent: u32,
+    pub process_group: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

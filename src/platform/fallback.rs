@@ -222,11 +222,6 @@ pub(crate) fn process_and_parent(_pid: u32) -> Option<super::AncestorProcess> {
 }
 
 /// Unsupported platform stub.
-pub(crate) fn process_start_time(_pid: u32) -> Option<u64> {
-    None
-}
-
-/// Unsupported platform stub.
 pub fn foreground_group_leader_job(_process_group_id: u32) -> Option<ForegroundJob> {
     None
 }

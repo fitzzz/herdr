@@ -421,14 +421,15 @@ pub enum SessionReportEvidence {
     /// the process that sent the report, inside the pane, with the launchers
     /// directly above it that started it.
     Reporter(Vec<ProcessInstance>),
-    /// The server read the process that sent the report but found no process
-    /// running the agent between it and the pane's own process, such as when
-    /// one of them exited first, so it cannot tell who reported.
+    /// The server read the process that sent the report but could not place
+    /// a process running the agent in the pane: none was found below the
+    /// pane's own process, or the walk ended before reaching the pane, such as
+    /// when a process exited first, so it cannot tell who reported.
     Unidentified,
     /// The server could not read the process that sent the report, such as
-    /// for a report that did not come over the local API socket, or that
-    /// process runs the agent outside the pane: the Claude and Codex
-    /// processes in the pane's foreground job, when the job could be read.
+    /// for a report that did not come over the local API socket: the Claude
+    /// and Codex processes in the pane's foreground job, when the job could be
+    /// read.
     ForegroundAgents(Option<Vec<u32>>),
 }
 
@@ -799,10 +800,10 @@ impl TerminalState {
     /// process, that is the record bound to it (a conversation change inside
     /// it, such as Claude `/clear`); a record holding another process or not
     /// yet bound keeps its pairing, and the reporter owns the conversation
-    /// when detection binds it. When the server read the sender but found no
-    /// agent process for it, the report stays undecided, so a repeated report
-    /// decides again. When it could not read the sender, or the sender runs
-    /// the agent outside the pane, it is a launch not yet bound to a process,
+    /// when detection binds it. When the server read the sender but could not
+    /// place its agent process in the pane, the report stays undecided, so a
+    /// repeated report decides again. When it could not read the sender, it
+    /// is a launch not yet bound to a process,
     /// when the pane's foreground job runs at most one Claude or Codex
     /// process, or the recorded process when the job runs it and no other;
     /// with more than one in the job, or the bound process's job unreadable,
@@ -8886,15 +8887,25 @@ mod tests {
     }
 
     #[test]
-    fn a_conversation_reported_from_outside_the_pane_is_paired_by_the_foreground_job() {
+    fn a_conversation_reported_from_outside_the_pane_is_not_paired_with_the_job() {
         let mut terminal = agent_running_its_reported_conversation(Agent::Codex);
-        // A shared Codex daemon outside the pane sent the report, so the
-        // pane's foreground job, running its one Codex, decides.
-        report_from(
+        // A Codex process outside the pane, or one whose walk was cut before
+        // the pane, sent the report while the pane's job runs its one Codex.
+        report_with(
             &mut terminal,
             "codex",
             "codex-b",
             (2, "clear"),
+            &SessionReportEvidence::Unidentified,
+        );
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
+        // The report stayed undecided: repeated over a connection the server
+        // cannot read, the foreground job running its one Codex pairs it.
+        report_from(
+            &mut terminal,
+            "codex",
+            "codex-b",
+            (3, "compact"),
             None,
             &[(10, "codex")],
         );

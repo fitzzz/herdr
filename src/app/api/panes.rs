@@ -1642,10 +1642,10 @@ impl App {
     /// arrives, about which process sent it: read here, once per report, so a
     /// launch record pairs the conversation only on that evidence. The agent
     /// process in `peer_ancestry`, the process on the other end of the API
-    /// connection and its parents, is the reporter when it runs inside the
-    /// pane. When the server could not read that process, or it runs the
-    /// agent outside the pane, the pane's foreground job shows which Claude or
-    /// Codex processes could have sent the report.
+    /// connection and its parents, is the reporter when the walk places it in
+    /// the pane; otherwise the report stays undecided. Only when the server
+    /// could not read that process does the pane's foreground job show which
+    /// Claude or Codex processes could have sent the report.
     fn session_report_evidence(
         &self,
         ws_idx: usize,
@@ -1665,17 +1665,12 @@ impl App {
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
             .and_then(crate::terminal::TerminalRuntime::child_pid);
         if let Some(ancestry) = peer_ancestry {
-            match pane_process
+            return match pane_process
                 .map(|pane_process| crate::detect::report_sender(ancestry, agent, pane_process))
             {
-                Some(ReportSender::Agent(reporter)) => {
-                    return SessionReportEvidence::Reporter(reporter)
-                }
-                Some(ReportSender::OutsidePane) => {}
-                Some(ReportSender::Unidentified) | None => {
-                    return SessionReportEvidence::Unidentified
-                }
-            }
+                Some(ReportSender::Agent(reporter)) => SessionReportEvidence::Reporter(reporter),
+                Some(ReportSender::Unidentified) | None => SessionReportEvidence::Unidentified,
+            };
         }
         let foreground_agents = pane_process
             .and_then(crate::detect::foreground_job)

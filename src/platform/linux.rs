@@ -98,6 +98,7 @@ struct ProcGroupMember {
     pid: u32,
     comm: String,
     state: char,
+    started: Option<u64>,
 }
 
 pub(crate) fn launch_executable() -> std::io::Result<PathBuf> {
@@ -382,6 +383,7 @@ fn foreground_job_from_members(
                 argv0: None,
                 cmdline: argv.as_ref().map(|parts| parts.join(" ")),
                 argv,
+                started: member.started,
             }
         })
         .collect::<Vec<_>>();
@@ -617,12 +619,19 @@ fn numeric_file_name(entry: &std::fs::DirEntry) -> Option<u32> {
 }
 
 fn live_process_group_member(process_group_id: u32, pid: u32) -> Option<ProcGroupMember> {
-    let (pgrp, comm, state) = process_pgrp_comm_and_state(pid)?;
-    (pgrp > 0 && pgrp as u32 == process_group_id).then_some(ProcGroupMember { pid, comm, state })
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (pgrp, comm, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    (pgrp > 0 && pgrp as u32 == process_group_id).then(|| ProcGroupMember {
+        pid,
+        comm,
+        state,
+        started: stat_field_after_comm(&stat, STAT_STARTTIME),
+    })
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
-    let (pgrp, name, state) = process_pgrp_comm_and_state(process_group_id)?;
+    let stat = std::fs::read_to_string(format!("/proc/{process_group_id}/stat")).ok()?;
+    let (pgrp, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
     if pgrp as u32 != process_group_id {
         return None;
     }
@@ -638,6 +647,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
             argv0: None,
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: stat_field_after_comm(&stat, STAT_STARTTIME),
         }],
     })
 }
@@ -775,7 +785,7 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
 /// A process, when it started and the id of its parent.
 pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    let (pgrp, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
     let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
         .then(|| process_argv(pid))
         .flatten();
@@ -786,20 +796,15 @@ pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
             argv0: None,
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: stat_field_after_comm(&stat, STAT_STARTTIME),
         },
-        started: stat_field_after_comm(&stat, STAT_STARTTIME),
         parent: stat_field_after_comm(&stat, STAT_PPID)?.try_into().ok()?,
+        process_group: u32::try_from(pgrp).ok().filter(|pgrp| *pgrp > 0),
     })
 }
 
-/// When a process started, in clock ticks since boot.
-pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat_field_after_comm(&stat, STAT_STARTTIME)
-}
-
 /// `/proc/<pid>/stat` fields counted from the state after the command name:
-/// field 4 (ppid) and field 22 (starttime).
+/// field 4 (ppid) and field 22 (starttime, in clock ticks since boot).
 const STAT_PPID: usize = 1;
 const STAT_STARTTIME: usize = 19;
 
@@ -1364,6 +1369,7 @@ mod tests {
                     pid,
                     comm: (*comm).to_string(),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1421,6 +1427,7 @@ mod tests {
                     pid,
                     comm: format!("p{pid}"),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1474,6 +1481,7 @@ mod tests {
                     pid,
                     comm: format!("p{pid}"),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1558,6 +1566,7 @@ mod tests {
                     pid,
                     comm: "leader".to_string(),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1569,6 +1578,7 @@ mod tests {
                 pid: 200,
                 comm: "leader".to_string(),
                 state: 'S',
+                started: None,
             }]
         );
     }
@@ -1595,6 +1605,7 @@ mod tests {
                             pid,
                             comm: format!("member-{pid}"),
                             state: 'S',
+                            started: None,
                         })
                         .filter(|_| process_group_id == 200)
                 },
@@ -1628,11 +1639,13 @@ mod tests {
                     pid: 200,
                     comm: "codex".to_string(),
                     state: 'D',
+                    started: None,
                 },
                 ProcGroupMember {
                     pid: 201,
                     comm: "helper".to_string(),
                     state: 'S',
+                    started: None,
                 },
             ],
             true,
@@ -1659,11 +1672,13 @@ mod tests {
                     pid: 200,
                     comm: "codex".to_string(),
                     state: 'S',
+                    started: None,
                 },
                 ProcGroupMember {
                     pid: 201,
                     comm: "node".to_string(),
                     state: 'S',
+                    started: None,
                 },
             ],
             true,

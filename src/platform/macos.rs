@@ -439,6 +439,7 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
             argv0: process_argv0_name(pid),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: Some(start_time_from_bsdinfo(&info)),
         });
     }
 
@@ -468,6 +469,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
             argv0: process_argv0_name(process_group_id),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: Some(start_time_from_bsdinfo(&info)),
         }],
     })
 }
@@ -1157,17 +1159,14 @@ pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
             argv0: process_argv0_name(pid),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: Some(start_time_from_bsdinfo(&info)),
         },
-        started: Some(start_time_from_bsdinfo(&info)),
         parent: info.pbi_ppid,
+        process_group: Some(info.pbi_pgid),
     })
 }
 
 /// When a process started, in microseconds since the epoch.
-pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
-    process_bsdinfo(pid).map(|info| start_time_from_bsdinfo(&info))
-}
-
 fn start_time_from_bsdinfo(info: &libc::proc_bsdinfo) -> u64 {
     info.pbi_start_tvsec
         .saturating_mul(1_000_000)
