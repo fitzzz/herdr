@@ -3371,7 +3371,7 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id(session),
             session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
             evidence: crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![
-                std::process::id(),
+                ProcessInstance::unknown_start(std::process::id()),
             ])),
         });
     }

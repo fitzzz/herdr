@@ -2896,7 +2896,12 @@ mod tests {
     /// processes.
     #[cfg(unix)]
     fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
-        crate::terminal::SessionReportEvidence::ForegroundAgents(Some(process_ids.to_vec()))
+        crate::terminal::SessionReportEvidence::ForegroundAgents(Some(
+            process_ids
+                .iter()
+                .map(|&pid| ProcessInstance::unknown_start(pid))
+                .collect(),
+        ))
     }
 
     #[cfg(unix)]

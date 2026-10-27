@@ -430,7 +430,7 @@ pub enum SessionReportEvidence {
     /// for a report that did not come over the local API socket: the Claude
     /// and Codex processes in the pane's foreground job, when the job could be
     /// read.
-    ForegroundAgents(Option<Vec<u32>>),
+    ForegroundAgents(Option<Vec<ProcessInstance>>),
 }
 
 impl Default for SessionReportEvidence {
@@ -803,12 +803,12 @@ impl TerminalState {
     /// when detection binds it. When the server read the sender but could not
     /// place its agent process in the pane, the report stays undecided, so a
     /// repeated report decides again. When it could not read the sender, it
-    /// is a launch not yet bound to a process,
-    /// when the pane's foreground job runs at most one Claude or Codex
-    /// process, or the recorded process when the job runs it and no other;
-    /// with more than one in the job, or the bound process's job unreadable,
-    /// the report stays undecided too. A conversation reported beside a saved
-    /// launch that nothing runs belongs to another launch.
+    /// is the launch the pane's foreground job runs when the job runs exactly
+    /// one Claude or Codex process: a launch not yet bound to a process, or
+    /// the recorded process when the job runs it; with none or more than one
+    /// in the job, or the job unreadable, the report stays undecided too. A
+    /// conversation reported beside a saved launch that nothing runs belongs
+    /// to another launch.
     pub fn sync_agent_launch_session(&mut self, evidence: &SessionReportEvidence) {
         let Some(session) = self.current_session_ref().cloned() else {
             return;
@@ -825,18 +825,19 @@ impl TerminalState {
             (SessionReportEvidence::Reporter(_), LaunchState::Started(_)) => false,
             (SessionReportEvidence::Unidentified, _) => return,
             (SessionReportEvidence::ForegroundAgents(_), _)
-                if launch.seen_session.as_ref() == Some(&session) || evidence.undecided() =>
+                if launch.seen_session.as_ref() == Some(&session) =>
             {
                 return
             }
-            (
-                SessionReportEvidence::ForegroundAgents(agents),
-                LaunchState::Bound { process, .. },
-            ) => match agents.as_deref() {
-                Some([agent_process]) => *agent_process == process.pid,
-                Some(_) | None => return,
-            },
-            (SessionReportEvidence::ForegroundAgents(_), LaunchState::Started(_)) => true,
+            (SessionReportEvidence::ForegroundAgents(agents), state) => {
+                match (agents.as_deref(), state) {
+                    (Some([agent_process]), LaunchState::Bound { process, .. }) => {
+                        agent_process.is(process)
+                    }
+                    (Some([_]), LaunchState::Started(_)) => true,
+                    _ => return,
+                }
+            }
         };
         launch.seen_session = Some(session.clone());
         if !pairs {
@@ -3967,7 +3968,7 @@ mod tests {
                     .collect(),
             )
         };
-        let beside_another_agent = SessionReportEvidence::ForegroundAgents(Some(vec![10, 12]));
+        let beside_another_agent = foreground_agents(&[10, 12]);
         for (case, previous, report, reading, expected) in [
             (
                 "reported by this process, record of another",
@@ -8657,7 +8658,12 @@ mod tests {
     /// The report evidence of a pane whose foreground job runs these Claude or
     /// Codex processes.
     fn foreground_agents(process_ids: &[u32]) -> SessionReportEvidence {
-        SessionReportEvidence::ForegroundAgents(Some(process_ids.to_vec()))
+        SessionReportEvidence::ForegroundAgents(Some(
+            process_ids
+                .iter()
+                .map(|&pid| ProcessInstance::unknown_start(pid))
+                .collect(),
+        ))
     }
 
     /// The agent's own hook reports conversation `id` at session start.
@@ -8706,9 +8712,11 @@ mod tests {
             Some(reporter) => {
                 SessionReportEvidence::Reporter(vec![ProcessInstance::unknown_start(reporter)])
             }
-            None => SessionReportEvidence::ForegroundAgents(Some(
-                job.iter().map(|(process_id, _)| *process_id).collect(),
-            )),
+            None => foreground_agents(
+                &job.iter()
+                    .map(|(process_id, _)| *process_id)
+                    .collect::<Vec<_>>(),
+            ),
         };
         report_with(terminal, agent, id, (seq, start), &evidence);
     }
@@ -8723,6 +8731,73 @@ mod tests {
     ) {
         report_session(terminal, agent, id, seq, start);
         terminal.sync_agent_launch_session(evidence);
+    }
+
+    #[test]
+    fn a_started_seed_pairs_only_beside_one_agent_in_the_job() {
+        for (case, job, pairs) in [
+            (
+                "job unreadable",
+                SessionReportEvidence::ForegroundAgents(None),
+                false,
+            ),
+            ("two agents in the job", foreground_agents(&[10, 12]), false),
+            ("one agent in the job", foreground_agents(&[10]), true),
+        ] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            // `herdr agent start` typed the launch; detection has not read
+            // its process yet when a conversation is reported over a
+            // connection the server cannot read.
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: known_options(&["--placeholder-a"]),
+                resumed_without_options: false,
+                launch: SeededLaunch::Started { session: None },
+            });
+            report_with(&mut terminal, "claude", "claude-b", (1, "startup"), &job);
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                pairs.then(|| vec!["--placeholder-a".to_string()]),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reused_process_id_in_the_job_does_not_confirm_the_bound_record() {
+        let bound = ProcessInstance {
+            pid: 10,
+            started: Some(100),
+        };
+        for (in_job, pairs) in [(Some(200), false), (Some(100), true)] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                bound,
+                known_options(&["--placeholder-a"]),
+                None,
+            );
+            // Over a connection the server cannot read, a conversation is
+            // reported while the job runs a process with the bound id; one
+            // with another start time is a later process that reused it.
+            report_with(
+                &mut terminal,
+                "claude",
+                "claude-b",
+                (1, "startup"),
+                &SessionReportEvidence::ForegroundAgents(Some(vec![ProcessInstance {
+                    pid: 10,
+                    started: in_job,
+                }])),
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                pairs.then(|| vec!["--placeholder-a".to_string()]),
+                "started {in_job:?}"
+            );
+        }
     }
 
     #[test]

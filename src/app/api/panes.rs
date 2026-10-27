@@ -1686,7 +1686,10 @@ impl App {
                             ))
                         )
                     })
-                    .map(|process| process.pid)
+                    .map(|process| crate::platform::ProcessInstance {
+                        pid: process.pid,
+                        started: process.started,
+                    })
                     .collect()
             });
         SessionReportEvidence::ForegroundAgents(foreground_agents)
