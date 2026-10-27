@@ -126,7 +126,11 @@ fn terminal_screen_matches_legacy_render_frames_and_links_for_every_cell_kind() 
                 None,
                 &old_links,
             );
-            let new_helper = candidate.screen_snapshot().unwrap().frame_data(area, None);
+            let new_helper = candidate.screen_snapshot().unwrap().frame_data(
+                area,
+                candidate.crop_rows_above(area.height),
+                None,
+            );
             assert_eq!(new_helper, old_helper, "{context} helper frame");
             if area.width == 50 {
                 assert_eq!(new_helper.hyperlinks.len(), 2, "{context}");
@@ -206,7 +210,7 @@ fn terminal_screen_follows_palette_and_host_theme_changes_without_text_writes() 
     let third = pane.screen_snapshot().unwrap();
     let mut reference = Buffer::empty(Rect::new(0, 0, 8, 2));
     let mut candidate = Buffer::empty(Rect::new(0, 0, 8, 2));
-    third.write_to_buffer(&mut candidate, Rect::new(0, 0, 8, 2));
+    third.write_to_buffer(&mut candidate, Rect::new(0, 0, 8, 2), 0);
     let backend = TestBackend::new(8, 2);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
@@ -386,7 +390,7 @@ fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
     let (first_frame, first) = pane
         .screen_snapshot()
         .unwrap()
-        .frame_data_with_row_revisions(area, None);
+        .frame_data_with_row_revisions(area, 0, None);
     let first = first.unwrap();
     assert_eq!(first.rows.len(), 6);
     assert_eq!(first.rows[5], 0, "padding row below the grid");
@@ -399,7 +403,7 @@ fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
     let (second_frame, second) = pane
         .screen_snapshot()
         .unwrap()
-        .frame_data_with_row_revisions(area, None);
+        .frame_data_with_row_revisions(area, 0, None);
     let second = second.unwrap();
     assert_eq!(second.key, first.key);
     assert_ne!(second_frame.hyperlinks, first_frame.hyperlinks);
@@ -417,14 +421,14 @@ fn terminal_screen_frame_row_revisions_identify_equal_frame_rows() {
     let (_, narrower) = pane
         .screen_snapshot()
         .unwrap()
-        .frame_data_with_row_revisions(Rect::new(0, 0, 19, 6), None);
+        .frame_data_with_row_revisions(Rect::new(0, 0, 19, 6), 0, None);
     assert_ne!(narrower.unwrap().key, second.key);
 
     // A wide cell clipped at the right edge carries into the next row.
     let (_, clipped) = pane
         .screen_snapshot()
         .unwrap()
-        .frame_data_with_row_revisions(Rect::new(0, 0, 1, 6), None);
+        .frame_data_with_row_revisions(Rect::new(0, 0, 1, 6), 0, None);
     assert!(clipped.is_none());
 }
 
@@ -436,7 +440,7 @@ fn terminal_screen_frame_row_revisions_match_only_the_same_screen_rows() {
         let (frame, revisions) = pane
             .screen_snapshot()
             .unwrap()
-            .frame_data_with_row_revisions(area, None);
+            .frame_data_with_row_revisions(area, 0, None);
         (frame, revisions.unwrap())
     };
     let content =
@@ -513,7 +517,7 @@ fn terminal_screen_patch_links_attach_like_full_frames() {
     let (frame, revisions) = pane
         .screen_snapshot()
         .unwrap()
-        .frame_data_with_row_revisions(Rect::new(0, 0, 50, 12), None);
+        .frame_data_with_row_revisions(Rect::new(0, 0, 50, 12), 0, None);
     // Every row starts with fresh diff state, as a patch row does.
     assert!(revisions.is_some());
     let uri = |table: &[String], cell: &CellData| {
@@ -548,7 +552,7 @@ fn terminal_screen_extracts_each_change_once_for_every_consumer() {
             .ghostty
             .screen_snapshot()
             .unwrap()
-            .frame_data(area, None);
+            .frame_data(area, 0, None);
         let _ = pane.ghostty.visible_hyperlinks(area);
         let _ = pane.collect_dirty_patch(20, 6);
     };
@@ -584,4 +588,104 @@ fn terminal_screen_extracts_each_change_once_for_every_consumer() {
     assert_eq!(extracted(), after_change);
     read_everything();
     assert_eq!(extracted(), after_change + 6);
+}
+
+fn row_text(buffer: &Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+fn rows_text(buffer: &Buffer) -> Vec<String> {
+    (0..buffer.area.height)
+        .map(|y| row_text(buffer, y))
+        .collect()
+}
+
+fn numbered_lines(pane: &GhosttyPaneTerminal, prefix: &str, range: std::ops::Range<usize>) {
+    let lines = range
+        .map(|i| format!("{prefix}{i}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    write(pane, lines.as_bytes());
+}
+
+#[test]
+fn terminal_screen_cropped_view_follows_the_cursor_in_both_renderers() {
+    // Another client holds the grid at 10 rows; this view is 4 rows tall.
+    let pane = pane(20, 10);
+    numbered_lines(&pane, "L", 0..9);
+    write(
+        &pane,
+        b"\r\n\x1b]8;;https://example.test/last\x1b\\L9\x1b]8;;\x1b\\",
+    );
+    let area = Rect::new(0, 0, 20, 4);
+    for legacy in [true, false] {
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                if legacy {
+                    pane.render_legacy(frame, area, true);
+                } else {
+                    pane.render(frame, area, true);
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            rows_text(terminal.backend().buffer()),
+            ["L6", "L7", "L8", "L9"],
+            "legacy={legacy}"
+        );
+        assert_eq!(
+            ratatui::backend::Backend::get_cursor_position(terminal.backend_mut()).unwrap(),
+            ratatui::layout::Position::new(2, 3),
+            "legacy={legacy}"
+        );
+    }
+    let links = pane.visible_hyperlinks(area);
+    assert!(!links.is_empty());
+    assert!(links
+        .iter()
+        .all(|((_, y), _, uri)| *y == 3 && uri == "https://example.test/last"));
+    let legacy_links = ghostty_visible_hyperlinks(&mut pane.core.lock().unwrap(), area).unwrap();
+    assert_eq!(legacy_links, links);
+    let screen = pane.screen_snapshot().unwrap();
+    let frame = screen.frame_data(area, pane.crop_rows_above(area.height), None);
+    let first_row: String = frame.cells[..2]
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect();
+    assert_eq!(first_row, "L6");
+}
+
+#[test]
+fn terminal_screen_cropped_view_keeps_the_top_while_the_cursor_is_in_view() {
+    let pane = pane(20, 10);
+    write(&pane, b"A\r\nB");
+    let (_, buffer) = draw(&pane, Rect::new(0, 0, 20, 4), false);
+    assert_eq!(rows_text(&buffer), ["A", "B", "", ""]);
+    assert_eq!(pane.crop_rows_above(4), 0);
+    assert_eq!(pane.crop_rows_above(10), 0);
+}
+
+#[test]
+fn terminal_screen_cropped_view_scrolled_back_stays_put_and_reaches_the_oldest_row() {
+    let pane = pane(20, 10);
+    numbered_lines(&pane, "L", 0..40);
+    let area = Rect::new(0, 0, 20, 4);
+    ghostty_set_scroll_offset_from_bottom(&mut pane.core.lock().unwrap().terminal, 5);
+    let (_, before) = draw(&pane, area, false);
+    write(&pane, b"\r\nN0\r\nN1\r\nN2");
+    let (_, after) = draw(&pane, area, false);
+    assert_eq!(rows_text(&after), rows_text(&before));
+    let (_, legacy) = draw(&pane, area, true);
+    assert_eq!(rows_text(&legacy), rows_text(&before));
+
+    let max = pane.scroll_metrics().unwrap().max_offset_from_bottom;
+    ghostty_set_scroll_offset_from_bottom(&mut pane.core.lock().unwrap().terminal, max);
+    let (_, top) = draw(&pane, area, false);
+    assert_eq!(rows_text(&top), ["L0", "L1", "L2", "L3"]);
 }

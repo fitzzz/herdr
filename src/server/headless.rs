@@ -2595,6 +2595,18 @@ impl HeadlessServer {
                     runtime.current_size(),
                     runtime.pixel_size(),
                 );
+                if let Some(view_rows) = self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.render_state.last_pane_surface())
+                    .and_then(|surface| surface.panes.iter().find(|pane| pane.pane_id == pane_id))
+                    .map(|pane| pane.inner_rect.height)
+                {
+                    super::pane_input::offset_cropped_mouse_rows(
+                        &mut events,
+                        runtime.crop_rows_above(view_rows),
+                    );
+                }
                 let popup_blocks_input = self.app.state.popup_pane.is_some()
                     && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
                 if popup_blocks_input

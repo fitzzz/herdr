@@ -236,6 +236,7 @@ struct CollectedPanePatch {
     patch: crate::pane::TerminalDirtyPatch,
     content_revision: u64,
     scroll_metrics: Option<crate::pane::ScrollMetrics>,
+    screen_rows: u16,
     mouse_reporting: bool,
     sgr_pixel_mouse: bool,
     alternate_screen_active: bool,
@@ -382,6 +383,7 @@ impl HeadlessServer {
             let terminal_id = self.terminal_id_for_pane(*source).map(ToString::to_string);
             let mut width = 0u16;
             let mut height = 0u16;
+            let mut min_height = u16::MAX;
             for recipient in &recipients {
                 let Some(pane) = recipient.surface.panes.iter().find(|pane| {
                     self.app
@@ -393,6 +395,7 @@ impl HeadlessServer {
                 public_pane_id.get_or_insert_with(|| pane.pane_id.clone());
                 width = width.max(pane.inner_rect.width);
                 height = height.max(pane.inner_rect.height);
+                min_height = min_height.min(pane.inner_rect.height);
             }
             for recipient in &terminal_recipients {
                 if terminal_id.as_deref() != Some(recipient.terminal_id) {
@@ -408,6 +411,7 @@ impl HeadlessServer {
                 }
                 width = width.max(recipient.frame.width);
                 height = height.max(recipient.frame.height);
+                min_height = min_height.min(recipient.frame.height);
             }
             let Some(public_pane_id) = public_pane_id else {
                 continue;
@@ -422,6 +426,11 @@ impl HeadlessServer {
             ) else {
                 fallback!("runtime_missing");
             };
+            // Row patches index the grid from its top row; a view shorter
+            // than the grid that draws a lower slice takes a full render.
+            if runtime.crop_rows_above(min_height) > 0 {
+                fallback!("cropped_view");
+            }
             let (synchronized, synchronized_epoch) = runtime.synchronized_output_state();
             if synchronized {
                 fallback!("synchronized_visible");
@@ -449,6 +458,7 @@ impl HeadlessServer {
                 patch,
                 content_revision: snapshot.content_revision,
                 scroll_metrics: snapshot.scroll_metrics,
+                screen_rows: runtime.current_size().0,
                 mouse_reporting: snapshot.mouse_reporting,
                 sgr_pixel_mouse: snapshot.sgr_pixel_mouse,
                 alternate_screen_active: snapshot.alternate_screen_active,
@@ -492,12 +502,22 @@ impl HeadlessServer {
                     fallback!("invalid_patch");
                 };
                 patch_rows.extend(rows);
+                // Every retained view draws the grid from its top row (the
+                // cropped-view fallback above), so the hidden rows lie below.
+                let view_metrics = collected_pane.scroll_metrics.map(|metrics| {
+                    crate::ui::cropped_view_scroll_metrics(
+                        metrics,
+                        collected_pane.screen_rows,
+                        pane.inner_rect.height,
+                        0,
+                    )
+                });
                 let Some(scrollbar_rows) = retained_scrollbar_patch(
                     &self.app,
                     &surface.frame,
                     pane,
                     collected_pane.alternate_screen_active,
-                    collected_pane.scroll_metrics,
+                    view_metrics,
                 ) else {
                     fallback!("scrollbar_patch");
                 };
