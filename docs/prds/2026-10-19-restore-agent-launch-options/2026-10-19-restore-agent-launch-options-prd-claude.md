@@ -898,7 +898,9 @@ in the same pane and directory, using Herdr's existing restore order and spacing
    carried on restore? FR-10 as approved makes them fall back to the bare resume command with the
    `launch options not kept` notice. Options asked: (a) keep the FR-10 limit (recommended: the approved, safe
    behavior); (b) lift it for bash, zsh and fish, which can quote an apostrophe. Asked through Portal in report 000047
-   on 2026-10-26 (review round 7, r7-8); pending. Until answered the FR-10 limit stays.
+   on 2026-10-26 (review round 7, r7-8), but Portal did not accept it there (no question id), so it never reached a
+   person; asked again on 2026-10-27 as `t2-apostrophe-launch-options` (report 000072), now open with a person.
+   Until answered the FR-10 limit stays.
 
 The notice placement question (`t2-fallback-notice-placement`) referred to in the known limits was answered by K-377 r1.
 
