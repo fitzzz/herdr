@@ -292,6 +292,39 @@ pub fn identify_agent_process(
     (agent != Agent::Letta || is_interactive_letta_process(process)).then_some((agent, candidate))
 }
 
+/// How many processes above a reporting process are read to find its agent.
+const REPORTER_ANCESTOR_LIMIT: usize = 16;
+
+/// The `agent` processes behind a report sent by process `process_id`, such
+/// as the Python process a Claude or Codex hook runs: the nearest process at
+/// or above it that runs `agent`, then each parent directly above that one
+/// that runs `agent` too (a launcher such as npm's `codex`, which starts the
+/// agent binary as its child). `process` reads a process and the id of its
+/// parent.
+pub fn reporting_agent_processes(
+    process_id: u32,
+    agent: Agent,
+    mut process: impl FnMut(u32) -> Option<(crate::platform::ForegroundProcess, u32)>,
+) -> Option<Vec<u32>> {
+    let mut agent_processes = Vec::new();
+    let mut pid = process_id;
+    for _ in 0..REPORTER_ANCESTOR_LIMIT {
+        let Some((info, parent)) = process(pid) else {
+            break;
+        };
+        if identify_agent_process(&info).is_some_and(|(identified, _)| identified == agent) {
+            agent_processes.push(pid);
+        } else if !agent_processes.is_empty() {
+            break;
+        }
+        if parent == 0 || parent == pid {
+            break;
+        }
+        pid = parent;
+    }
+    (!agent_processes.is_empty()).then_some(agent_processes)
+}
+
 /// Detect the state of an agent from the live terminal tail snapshot.
 /// If `agent` is `None`, returns `Unknown`.
 #[cfg(test)]
@@ -898,6 +931,105 @@ mod tests {
             argv: Some(argv.iter().map(|arg| (*arg).to_string()).collect()),
             cmdline: Some(argv.join(" ")),
         }
+    }
+
+    /// Reads processes from a fake table of `(pid, parent, name, argv)`.
+    fn fake_process_table<'a>(
+        table: &'a [(u32, u32, &'a str, &'a [&'a str])],
+    ) -> impl FnMut(u32) -> Option<(crate::platform::ForegroundProcess, u32)> + 'a {
+        |pid| {
+            table
+                .iter()
+                .find(|(entry, ..)| *entry == pid)
+                .map(|(pid, parent, name, argv)| (foreground_process(*pid, name, argv), *parent))
+        }
+    }
+
+    #[test]
+    fn reporting_agent_processes_walks_up_to_the_nearest_agent() {
+        // A Claude hook: python3 under the hook's sh under Claude, in a pane
+        // shell under the server.
+        let claude_hook: &[(u32, u32, &str, &[&str])] = &[
+            (50, 40, "python3", &["python3", "-"]),
+            (
+                40,
+                30,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (30, 20, "claude", &["claude", "--model", "placeholder"]),
+            (20, 10, "bash", &["bash"]),
+            (10, 1, "herdr", &["herdr", "server"]),
+        ];
+        assert_eq!(
+            reporting_agent_processes(50, Agent::Claude, fake_process_table(claude_hook)),
+            Some(vec![30])
+        );
+        // A report for another agent finds none.
+        assert_eq!(
+            reporting_agent_processes(50, Agent::Codex, fake_process_table(claude_hook)),
+            None
+        );
+
+        // A nested Claude started by its parent's Bash tool reports as itself.
+        let nested: &[(u32, u32, &str, &[&str])] = &[
+            (70, 60, "python3", &["python3", "-"]),
+            (
+                60,
+                55,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (55, 45, "claude", &["claude", "--resume", "placeholder-id"]),
+            (
+                45,
+                30,
+                "bash",
+                &["/bin/bash", "-c", "claude --resume placeholder-id"],
+            ),
+            (30, 20, "claude", &["claude"]),
+            (20, 1, "bash", &["bash"]),
+        ];
+        assert_eq!(
+            reporting_agent_processes(70, Agent::Claude, fake_process_table(nested)),
+            Some(vec![55])
+        );
+
+        // npm's `codex` launcher runs the Codex binary as its child.
+        let npm_codex: &[(u32, u32, &str, &[&str])] = &[
+            (90, 85, "python3", &["python3", "-"]),
+            (
+                85,
+                80,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (80, 75, "codex", &["/placeholder/vendor/codex/codex"]),
+            (75, 20, "node", &["node", "/placeholder/bin/codex.js"]),
+            (20, 1, "bash", &["bash"]),
+        ];
+        assert_eq!(
+            reporting_agent_processes(90, Agent::Codex, fake_process_table(npm_codex)),
+            Some(vec![80, 75])
+        );
+    }
+
+    #[test]
+    fn reporting_agent_processes_stops_at_its_limit_and_at_unreadable_processes() {
+        // A chain of shells deeper than the limit above the agent.
+        let deep = (1..=20u32)
+            .map(|pid| (pid + 100, pid + 101, "sh", &["sh"][..]))
+            .chain(std::iter::once((121, 1, "claude", &["claude"][..])))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reporting_agent_processes(101, Agent::Claude, fake_process_table(&deep)),
+            None
+        );
+        // The reporter exited before the server read it.
+        assert_eq!(
+            reporting_agent_processes(999, Agent::Claude, fake_process_table(&deep)),
+            None
+        );
     }
 
     #[cfg(unix)]

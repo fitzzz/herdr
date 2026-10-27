@@ -1127,6 +1127,41 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 }
 
+/// The id of the process on the other end of a local API connection, from
+/// `LOCAL_PEERPID`: the socket credentials macOS keeps carry no process id.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (ret == 0 && pid > 0).then_some(pid as u32)
+}
+
+/// A process and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<(ForegroundProcess, u32)> {
+    let info = process_bsdinfo(pid)?;
+    let argv = process_argv(pid);
+    Some((
+        ForegroundProcess {
+            pid,
+            name: comm_from_bsdinfo(&info)?,
+            argv0: process_argv0_name(pid),
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
+        },
+        info.pbi_ppid,
+    ))
+}
+
 pub fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;

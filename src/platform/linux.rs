@@ -766,6 +766,38 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 }
 
+/// The id of the process on the other end of a local API connection.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    u32::try_from(stream.peer_creds().ok()?.pid()?).ok()
+}
+
+/// A process and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<(ForegroundProcess, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    // After (comm): state(0) ppid(1)
+    let parent = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
+        .then(|| process_argv(pid))
+        .flatten();
+    Some((
+        ForegroundProcess {
+            pid,
+            name,
+            argv0: None,
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
+        },
+        parent,
+    ))
+}
+
 pub fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;

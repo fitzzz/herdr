@@ -3037,7 +3037,7 @@ impl HeadlessServer {
                 .handle_api_projection_after_internal_events_drained(msg.request, projection)
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_after_internal_events_drained(msg.request, msg.peer_process_id)
         };
         if let Some(snapshot) = frozen_alt_screen_read {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)

@@ -1556,6 +1556,7 @@ impl AppState {
                 evidence,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
+                    let reported = session_ref.clone();
                     let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
@@ -1563,7 +1564,11 @@ impl AppState {
                         seq,
                         session_start_source,
                     );
-                    terminal.sync_agent_launch_session(&evidence);
+                    // A report the pane did not take, such as an older one,
+                    // says nothing about who runs its conversation.
+                    if reported.is_some_and(|session| terminal.session_ref_is_current(&session)) {
+                        terminal.sync_agent_launch_session(&evidence);
+                    }
                     mutation
                 })
                 .into_iter()
@@ -3365,6 +3370,7 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id(session),
             session_start_source: Some(if seq == 1 { "startup" } else { "clear" }.into()),
             evidence: crate::terminal::SessionReportEvidence {
+                reporter: None,
                 foreground_agents: Some(vec![std::process::id()]),
             },
         });

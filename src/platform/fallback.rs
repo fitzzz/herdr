@@ -212,6 +212,16 @@ pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {
 }
 
 /// Unsupported platform stub.
+pub(crate) fn local_stream_peer_process_id(_stream: &crate::ipc::LocalStream) -> Option<u32> {
+    None
+}
+
+/// Unsupported platform stub.
+pub(crate) fn process_and_parent(_pid: u32) -> Option<(super::ForegroundProcess, u32)> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn foreground_group_leader_job(_process_group_id: u32) -> Option<ForegroundJob> {
     None
 }

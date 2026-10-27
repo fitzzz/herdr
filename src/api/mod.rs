@@ -85,6 +85,9 @@ pub struct ApiRequestMessage {
     // In-process dispatch only. This is absent from Request/Method and cannot be
     // selected by a JSON client or change an advertised endpoint method.
     pub(crate) projection: Option<ApiRequestProjection>,
+    // In-process dispatch only, like `projection`: the process on the other end
+    // of the local connection that sent a `pane.report_agent_session`.
+    pub(crate) peer_process_id: Option<u32>,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 }

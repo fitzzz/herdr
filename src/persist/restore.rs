@@ -2888,6 +2888,7 @@ mod tests {
     #[cfg(unix)]
     fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
         crate::terminal::SessionReportEvidence {
+            reporter: None,
             foreground_agents: Some(process_ids.to_vec()),
         }
     }

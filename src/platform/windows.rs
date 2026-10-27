@@ -2366,6 +2366,25 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
     }
 }
 
+/// The id of the process on the other end of a local API connection, the
+/// named pipe's client process.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    stream.peer_creds().ok()?.pid()
+}
+
+/// A process and the id of its parent. A process that started after the
+/// cached snapshot, such as the CLI that sent a report, is read from a fresh
+/// one.
+pub(crate) fn process_and_parent(pid: u32) -> Option<(super::ForegroundProcess, u32)> {
+    let read = |snapshot: &ProcessSnapshot| {
+        snapshot
+            .entry(pid)
+            .map(|entry| (foreground_process_from_entry(entry), entry.parent_pid))
+    };
+    read(&cached_foreground_processes()).or_else(|| read(&fresh_foreground_processes()))
+}
+
 pub fn process_exists(pid: u32) -> bool {
     let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
         return false;
