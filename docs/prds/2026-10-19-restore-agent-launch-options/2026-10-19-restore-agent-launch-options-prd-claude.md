@@ -585,6 +585,20 @@ Evidence paths starting with `w3/`, `w4/`, `w5/`, `logs/` or `artifacts/` are in
   nested conversation was never saved beside `--dangerously-skip-permissions` and came back bare with the marker;
   the other agents kept their options over a handoff and a restart) and `w20b/REGRESSION-PROOF.md` (the regression
   steps, same results as `w19b`). FR-5 and FR-14 set to Yes. Every row is now Yes or a reasoned N/A.
+- 2026-10-27 00:56:19 EDT - Review round 13 on `d1f0df1b` (Claude run 7ae82898, Codex run c934f83a) found, confirmed by reading the
+  code: (P1, Codex r13-report-first-process-match, the same gap as Claude r13-1 at P3) when a report arrives before
+  Herdr first observes the agent's process, the observation path checks only whether the evidence is undecided and
+  never compares the lone agent in the job (or the reporter) with the observed process, so a different or reused
+  process is paired with the earlier conversation, and one test asserted that; the sync path, fixed in round 12, and
+  the observation path define an undecided report differently; (P3, r13-2) an observation that left the pairing
+  undecided still marks the conversation as seen, so a later decisive report of it is dropped; (P4, r13-3, design
+  disagreement with the round 12 decision that a lone agent in the job is the seed's launch) a hand-typed agent that
+  reports first after the seeded launch exited takes the seed's options for one detection read. FR-5 and FR-14 reset to
+  No. Assigned to W2 (`BRIEF-W2-round13-fixes.md`): one evidence-to-process match used in both arrival orders, keeping
+  the singleton's identity through an unbound seed, and a repeated report decided again after an undecided
+  observation. Agent decision, inferred (G61): r13-3 is kept; its suggested hardening (clear a typed seed when the pane
+  is seen at its shell) is not taken, because the shell is in the foreground while it starts the typed command, so it
+  could drop a restore's options.
 
 ## Introduction/Overview
 
@@ -703,7 +717,7 @@ the pane runtime (see FR-28).
 | FR-2 | A restored Codex agent resumes the same native session id with its original launch options. | stated (request) | Yes | Yes | Yes |
 | FR-3 | An agent launched with bypass (Claude `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox`) comes back in bypass. | stated (request; T-79) | Yes | Yes | Yes |
 | FR-4 | An agent launched with a restrictive permission, approval or sandbox option comes back with that same option. | stated (T-79) | Yes | Yes | Yes |
-| FR-5 | Restore never adds a bypass or permission option the agent was not launched with; there is no global bypass setting. | stated (T-79) | Yes | Yes | Yes |
+| FR-5 | Restore never adds a bypass or permission option the agent was not launched with; there is no global bypass setting. | stated (T-79) | No | No | No |
 | FR-6 | The model and effort options an agent was launched with come back unchanged. | stated (request) | Yes | Yes | Yes |
 | FR-7 | Every other launch option comes back too (for example extra directories, allowed and disallowed tools, MCP and settings files, system-prompt additions, Codex `-c` overrides and `--no-daemon`), except the parts named in FR-8. | stated (request; #2, K-367 r1) | Yes | Yes | Yes |
 | FR-8 | Parts of the launch command that pick or start a conversation (for example Claude `--resume`, `--continue`, `--session-id`, `--fork-session`; Codex `resume <id>`, `--last`), a one-time prompt, and print-and-exit mode are not repeated; the saved session id takes their place. The implementer keeps a per-agent list of these parts. | stated (#2, K-367 r1) | Yes | Yes | Yes |
@@ -712,7 +726,7 @@ the pane runtime (see FR-28).
 | FR-11 | A Codex agent started with `herdr agent start --kind codex -- <options> resume <id>` is recorded at launch with both its conversation id and its options, so a restore right after starting keeps them. | stated (#4, K-369 r1) | Yes | Yes | Yes |
 | FR-12 | Launch options that carry inline text or config values (for example inline `--settings` or `--mcp-config` JSON, `--append-system-prompt` text, Codex `-c key=value` overrides) are saved as-is in Herdr's session file and repeated exactly on restore; Herdr does not filter or redact them. | stated (#5, K-370 r1) | Yes | Yes | Yes |
 | FR-13 | Each agent's options are kept per pane and survive a server restart and a live handoff. | stated (request) | Yes | Yes | Yes |
-| FR-14 | Each agent's options always belong to its current conversation: when the conversation in a pane changes or the agent exits, Herdr does not restore an old conversation with a different agent's options or a new one with stale options. | inferred | Yes | Yes | Yes |
+| FR-14 | Each agent's options always belong to its current conversation: when the conversation in a pane changes or the agent exits, Herdr does not restore an old conversation with a different agent's options or a new one with stale options. | inferred | No | No | No |
 | FR-15 | Session files written before this change still restore, using the bare command and notice from FR-10. | stated (#3, K-368 r1) | Yes | Yes | Yes |
 | FR-16 | Two panes holding the same conversation still resume it only once, as today. | inferred | Yes | Yes | N/A: this change does not alter how duplicate panes are resolved; the deterministic restore tests cover it |
 | FR-17 | `[session] resume_agents_on_restore = false` still turns off agent resume entirely. | inferred | Yes | Yes | N/A: no new surface; the setting is read where it was before and the deterministic restore test covers it |
