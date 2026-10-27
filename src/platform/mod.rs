@@ -440,8 +440,10 @@ pub(crate) fn interactive_shell_restore_command(
 pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
         "pwsh" | "powershell" => quote_powershell_arg,
-        "fish" => quote_fish_arg,
+        "fish" | "xonsh" => quote_fish_arg,
         "csh" | "tcsh" => quote_csh_arg,
+        "nu" => quote_nu_arg,
+        "elvish" => quote_elvish_arg,
         // Unknown names, including wrappers, keep POSIX quoting.
         _ => quote_posix_arg,
     };
@@ -454,8 +456,9 @@ pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) 
     Some(command)
 }
 
-/// Inside fish single quotes `\\` and `\'` are escapes, so every backslash
-/// is doubled and every quote escaped.
+/// Inside fish single quotes, and in the Python string literals xonsh reads,
+/// `\\` and `\'` are escapes, so every backslash is doubled and every quote
+/// escaped.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn quote_fish_arg(value: &str) -> String {
     if is_plain_unix_word(value) {
@@ -472,6 +475,25 @@ fn quote_csh_arg(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''").replace('!', "'\\!'"))
+}
+
+/// Nushell single quotes cannot hold a quote, so a value goes in double
+/// quotes, where `\\` and `\"` are escapes and `$` is literal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_nu_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Inside elvish single quotes only a quote is special, and it is doubled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_elvish_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -893,6 +915,41 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn interactive_shell_command_quotes_apostrophes_for_nu_elvish_and_xonsh() {
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            r#"don't "dq" \d $HOME"#.into(),
+            "plain".into(),
+        ];
+        for (shell, expected) in [
+            (
+                "nu",
+                r#"claude --append-system-prompt "don't \"dq\" \\d $HOME" plain"#,
+            ),
+            (
+                "/usr/bin/nu",
+                r#"claude --append-system-prompt "don't \"dq\" \\d $HOME" plain"#,
+            ),
+            (
+                "elvish",
+                r#"claude --append-system-prompt 'don''t "dq" \d $HOME' plain"#,
+            ),
+            (
+                "xonsh",
+                r#"claude --append-system-prompt 'don\'t "dq" \\d $HOME' plain"#,
+            ),
+        ] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(expected),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn interactive_shell_command_keeps_posix_quoting_for_sh_family_and_unknown_shells() {
         let argv = vec![
             "claude".into(),
@@ -900,7 +957,16 @@ mod tests {
             "wow!".into(),
             "a'b".into(),
         ];
-        for shell in ["bash", "zsh", "sh", "/bin/sh", "my-shell-wrapper"] {
+        for shell in [
+            "bash",
+            "zsh",
+            "sh",
+            "/bin/sh",
+            "dash",
+            "ksh",
+            "mksh",
+            "my-shell-wrapper",
+        ] {
             assert_eq!(
                 interactive_shell_command(&argv, shell).as_deref(),
                 Some(r#"claude '{"pattern":"\\d"}' 'wow!' 'a'\''b'"#),

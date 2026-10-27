@@ -55,9 +55,21 @@ impl ReportedAgentResume {
     }
 }
 
+/// A command an agent reports to resume itself. Reported commands keep the
+/// published rule that no argument contains an apostrophe; launch options
+/// restore checks only `validate_restore_argv`, since restore quotes an
+/// apostrophe for every shell it types into.
+pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
+    validate_restore_argv(argv)?;
+    if argv.iter().any(|arg| arg.contains('\'')) {
+        return Err("resume_argv must not contain apostrophes".into());
+    }
+    Ok(())
+}
+
 /// Restore types the command into the pane's shell, so the executable must be a
 /// bare command name: shells disagree on how to invoke a quoted path.
-pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
+fn validate_restore_argv(argv: &[String]) -> Result<(), String> {
     let Some(command) = argv.first() else {
         return Err("resume_argv must not be empty".into());
     };
@@ -73,11 +85,6 @@ pub fn validate_resume_argv(argv: &[String]) -> Result<(), String> {
     }
     if argv.iter().any(|arg| arg.chars().any(char::is_control)) {
         return Err("resume_argv must not contain control characters".into());
-    }
-    // Restore quotes arguments POSIX-style, which PowerShell reads differently
-    // only when an argument itself contains an apostrophe.
-    if argv.iter().any(|arg| arg.contains('\'')) {
-        return Err("resume_argv must not contain apostrophes".into());
     }
     let plain_command = !command.is_empty()
         && !command.starts_with('-')
@@ -320,7 +327,7 @@ pub fn plan_with_launch_options(
             .chain(options.iter().cloned())
             .collect()
     };
-    if validate_resume_argv(&argv).is_err() {
+    if validate_restore_argv(&argv).is_err() {
         return Some((
             bare,
             Some(LaunchOptionsRestore::NotKept(
@@ -2397,12 +2404,11 @@ mod tests {
 
     #[test]
     fn launch_options_exceeding_restore_limits_use_the_bare_command() {
-        let apostrophe = ["--append-system-prompt", "the placeholder's text"];
         let many = vec!["--verbose"; MAX_RESUME_ARGS];
         let long = "x".repeat(MAX_RESUME_ARGV_BYTES);
         let large = ["--system-prompt", long.as_str()];
         let control = ["--system-prompt", "line\nbreak"];
-        for options in [&apostrophe[..], &many[..], &large[..], &control[..]] {
+        for options in [&many[..], &large[..], &control[..]] {
             let (plan, outcome) =
                 restore("herdr:claude", "claude", "claude-session", Some(options));
             assert_eq!(plan.argv, vec!["claude", "--resume", "claude-session"]);
@@ -2421,6 +2427,37 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn launch_options_with_an_apostrophe_are_kept() {
+        let options = ["--append-system-prompt", "the placeholder's text"];
+        let (plan, outcome) = restore("herdr:claude", "claude", "claude-session", Some(&options));
+        assert_eq!(
+            plan.argv,
+            vec![
+                "claude",
+                "--append-system-prompt",
+                "the placeholder's text",
+                "--resume",
+                "claude-session"
+            ]
+        );
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+
+        let options = ["-c", "model_reasoning_effort='low'"];
+        let (plan, outcome) = restore("herdr:codex", "codex", "codex-session", Some(&options));
+        assert_eq!(
+            plan.argv,
+            vec![
+                "codex",
+                "resume",
+                "codex-session",
+                "-c",
+                "model_reasoning_effort='low'"
+            ]
+        );
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
     }
 
     #[test]
