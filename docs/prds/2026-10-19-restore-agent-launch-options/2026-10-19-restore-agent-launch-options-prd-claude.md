@@ -397,6 +397,31 @@ Evidence paths starting with `w3/`, `w4/`, `w5/`, `logs/` or `artifacts/` are in
   Yes for FR-1, FR-2, FR-4 to FR-7, FR-9, FR-10, FR-12, FR-13, FR-14, FR-22 and FR-29. Live check `w14c/BYPASS-PROOF.md` (build
   `2fec054b`): a Claude in bypass and a Codex in YOLO mode came back that way with the same session ids; FR-3 set to
   Yes. Every row is now Yes or a reasoned N/A.
+- 2026-10-26 20:13:12 EDT - Review round 8 on `872754b3` (Claude run f67ec87a, Codex run 23d79860) found, confirmed by reading the
+  code: (P1, Codex) two new tests assert Linux behavior on other platforms: the history-space test runs on Windows,
+  where the restore command has no leading space, and a restore test expects bash to keep a 4,800-byte line on macOS,
+  where every shell is limited to 1,023 bytes; this repository's pull request runs no CI, so neither was compiled;
+  (P2, Claude r8-1) a conversation reported while the recorded process is alive is confirmed on that process even
+  when another agent process in the pane sent it (a Codex suspended with Ctrl-Z and a second one started, a Claude
+  resuming another conversation beside a suspended one, a child agent in the same process group); (P3, r8-2, design
+  disagreement) an agent that resumes without naming its id (`claude --continue`, the `--resume` picker,
+  `codex resume --last`) and replaces the pane's agent before Herdr sees the earlier one exit is never paired, which
+  fails safe but the docs did not name it; (P3, r8-3, flagged) a pane's first observed process takes a reported
+  conversation even when the process that reported it exited unseen; (P3, r8-4, design disagreement) the pairing state
+  is a set of flags with implicit invariants; (P4, r8-5) a shell respawn keeps the old launch record; (P4, r8-6) the
+  missing-directory seed shows the marker on a pane that runs no agent; (P4, r8-7, design disagreement) the bash, zsh
+  and fish exemption from the 4,095-byte limit assumes line editing is on; (P4, r8-8) a doc comment sits on the wrong
+  item. FR-1 to FR-7, FR-9, FR-10, FR-12, FR-13, FR-14, FR-21, FR-22, FR-23, FR-29 and FR-30 reset to No. Fixes
+  assigned to W2 (`BRIEF-W2-round8-fixes.md`): platform-split test expectations and a check of every test this branch
+  added; a report is confirmed on the recorded process only when that process is the only Claude or Codex process in
+  the pane's current foreground job, otherwise the record stays unpaired and the next observation decides; the
+  pairing state becomes an enum of states with no behavior change (agent decision, inferred, G61: the unit changed in
+  seven rounds and the enum makes the invariants impossible to break); the respawn reset; the missing-directory seed
+  saves its launch without the marker; the doc comment. Agent decisions, inferred, within FR-10 and FR-14: r8-2 and
+  r8-7 are named in the docs (`session-state.mdx` and translations) instead of changed, because both fail safe or
+  need an unusual shell setup, and changing them adds pairing rules or makes every long Linux restore fall back;
+  r8-3 is a known limit (below), because closing it needs the agent's process id in its report (the r7-3 proposal);
+  W2 will also try to compile the tests for macOS and Windows with the private toolchain.
 
 ## Introduction/Overview
 
@@ -511,36 +536,36 @@ the pane runtime (see FR-28).
 
 | ID | Requirement | Source | Implemented | Automated Tests | Interaction Testing |
 | --- | --- | --- | --- | --- | --- |
-| FR-1 | A restored Claude agent resumes the same native session id with its original launch options. | stated (request) | Yes | Yes | Yes |
-| FR-2 | A restored Codex agent resumes the same native session id with its original launch options. | stated (request) | Yes | Yes | Yes |
-| FR-3 | An agent launched with bypass (Claude `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox`) comes back in bypass. | stated (request; T-79) | Yes | Yes | Yes |
-| FR-4 | An agent launched with a restrictive permission, approval or sandbox option comes back with that same option. | stated (T-79) | Yes | Yes | Yes |
-| FR-5 | Restore never adds a bypass or permission option the agent was not launched with; there is no global bypass setting. | stated (T-79) | Yes | Yes | Yes |
-| FR-6 | The model and effort options an agent was launched with come back unchanged. | stated (request) | Yes | Yes | Yes |
-| FR-7 | Every other launch option comes back too (for example extra directories, allowed and disallowed tools, MCP and settings files, system-prompt additions, Codex `-c` overrides and `--no-daemon`), except the parts named in FR-8. | stated (request; #2, K-367 r1) | Yes | Yes | Yes |
+| FR-1 | A restored Claude agent resumes the same native session id with its original launch options. | stated (request) | No | No | No |
+| FR-2 | A restored Codex agent resumes the same native session id with its original launch options. | stated (request) | No | No | No |
+| FR-3 | An agent launched with bypass (Claude `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`, Codex `--dangerously-bypass-approvals-and-sandbox`) comes back in bypass. | stated (request; T-79) | No | No | No |
+| FR-4 | An agent launched with a restrictive permission, approval or sandbox option comes back with that same option. | stated (T-79) | No | No | No |
+| FR-5 | Restore never adds a bypass or permission option the agent was not launched with; there is no global bypass setting. | stated (T-79) | No | No | No |
+| FR-6 | The model and effort options an agent was launched with come back unchanged. | stated (request) | No | No | No |
+| FR-7 | Every other launch option comes back too (for example extra directories, allowed and disallowed tools, MCP and settings files, system-prompt additions, Codex `-c` overrides and `--no-daemon`), except the parts named in FR-8. | stated (request; #2, K-367 r1) | No | No | No |
 | FR-8 | Parts of the launch command that pick or start a conversation (for example Claude `--resume`, `--continue`, `--session-id`, `--fork-session`; Codex `resume <id>`, `--last`), a one-time prompt, and print-and-exit mode are not repeated; the saved session id takes their place. The implementer keeps a per-agent list of these parts. | stated (#2, K-367 r1) | Yes | Yes | Yes |
-| FR-9 | Herdr learns each agent's launch options by reading the running agent's own command line, which covers agents typed by hand, started with `herdr agent start`, and started by Portal. Where Herdr does not read the command line (inside WSL), FR-10 applies. | stated (#1, K-366 r1) | Yes | Yes | Yes |
-| FR-10 | When Herdr cannot carry an agent's launch options (agent running before the updated Herdr recorded them, inside WSL where Herdr does not read the command line, or options that break the restore command limits of 64 arguments, 8 KiB and no apostrophes), restore resumes the conversation with today's bare command and shows a notice that the launch options were not kept, so the user can relaunch it in the right mode. The notice is shown on the pane until that agent exits: in its top border title, or, when the pane has no top border, in a row reserved at the top of the pane. The agents list is not marked. | stated (#3, K-368 r1; placement K-377 r1; pane only, Fitz 2026-10-20) | Yes | Yes | Yes |
+| FR-9 | Herdr learns each agent's launch options by reading the running agent's own command line, which covers agents typed by hand, started with `herdr agent start`, and started by Portal. Where Herdr does not read the command line (inside WSL), FR-10 applies. | stated (#1, K-366 r1) | No | No | No |
+| FR-10 | When Herdr cannot carry an agent's launch options (agent running before the updated Herdr recorded them, inside WSL where Herdr does not read the command line, or options that break the restore command limits of 64 arguments, 8 KiB and no apostrophes), restore resumes the conversation with today's bare command and shows a notice that the launch options were not kept, so the user can relaunch it in the right mode. The notice is shown on the pane until that agent exits: in its top border title, or, when the pane has no top border, in a row reserved at the top of the pane. The agents list is not marked. | stated (#3, K-368 r1; placement K-377 r1; pane only, Fitz 2026-10-20) | No | No | No |
 | FR-11 | A Codex agent started with `herdr agent start --kind codex -- <options> resume <id>` is recorded at launch with both its conversation id and its options, so a restore right after starting keeps them. | stated (#4, K-369 r1) | Yes | Yes | Yes |
-| FR-12 | Launch options that carry inline text or config values (for example inline `--settings` or `--mcp-config` JSON, `--append-system-prompt` text, Codex `-c key=value` overrides) are saved as-is in Herdr's session file and repeated exactly on restore; Herdr does not filter or redact them. | stated (#5, K-370 r1) | Yes | Yes | Yes |
-| FR-13 | Each agent's options are kept per pane and survive a server restart and a live handoff. | stated (request) | Yes | Yes | Yes |
-| FR-14 | Each agent's options always belong to its current conversation: when the conversation in a pane changes or the agent exits, Herdr does not restore an old conversation with a different agent's options or a new one with stale options. | inferred | Yes | Yes | Yes |
+| FR-12 | Launch options that carry inline text or config values (for example inline `--settings` or `--mcp-config` JSON, `--append-system-prompt` text, Codex `-c key=value` overrides) are saved as-is in Herdr's session file and repeated exactly on restore; Herdr does not filter or redact them. | stated (#5, K-370 r1) | No | No | No |
+| FR-13 | Each agent's options are kept per pane and survive a server restart and a live handoff. | stated (request) | No | No | No |
+| FR-14 | Each agent's options always belong to its current conversation: when the conversation in a pane changes or the agent exits, Herdr does not restore an old conversation with a different agent's options or a new one with stale options. | inferred | No | No | No |
 | FR-15 | Session files written before this change still restore, using the bare command and notice from FR-10. | stated (#3, K-368 r1) | Yes | Yes | Yes |
 | FR-16 | Two panes holding the same conversation still resume it only once, as today. | inferred | Yes | Yes | N/A: this change does not alter how duplicate panes are resolved; the deterministic restore tests cover it |
 | FR-17 | `[session] resume_agents_on_restore = false` still turns off agent resume entirely. | inferred | Yes | Yes | N/A: no new surface; the setting is read where it was before and the deterministic restore test covers it |
 | FR-18 | Restore for every other agent, and for third-party reported resume commands, is unchanged. | stated (request scope: Claude and Codex) | Yes | Yes | Yes |
 | FR-19 | Before changing code, the implementer reproduces the loss in an isolated Herdr session: Claude started with bypass, restored, and observed without it; and the same for Codex. The fix is verified against those same cases. | rule G12 | Yes | N/A: a process requirement; the deterministic tests are FR-23 | Yes |
 | FR-20 | Reproduction and verification use only Herdr sessions and agents the implementer started for this work; no running user agent is restarted, resumed or taken over. | stated (T-79); rule G4 | Yes | N/A: a process requirement | Yes |
-| FR-21 | The unreleased docs (`docs/next/website/src/content/docs/session-state.mdx`, resume command table) say that Claude and Codex restore keeps launch options. | inferred | Yes | Yes | N/A: documentation only; checked by the docs contract and translation parity recipes |
-| FR-22 | Options survive repeated restores: an agent restored with its options, then restored again, still has them. | inferred | Yes | Yes | Yes |
-| FR-23 | Deterministic regression tests cover the restore command Herdr builds for Claude and Codex with bypass, restrictive, no-permission, model and effort launches. | stated (T-79) | Yes | Yes | N/A: this row is the deterministic test suite itself |
+| FR-21 | The unreleased docs (`docs/next/website/src/content/docs/session-state.mdx`, resume command table) say that Claude and Codex restore keeps launch options. | inferred | No | No | N/A: documentation only; checked by the docs contract and translation parity recipes |
+| FR-22 | Options survive repeated restores: an agent restored with its options, then restored again, still has them. | inferred | No | No | No |
+| FR-23 | Deterministic regression tests cover the restore command Herdr builds for Claude and Codex with bypass, restrictive, no-permission, model and effort launches. | stated (T-79) | No | No | N/A: this row is the deterministic test suite itself |
 | FR-24 | Isolated live proof for Claude and for Codex shows, after a Herdr server restart: the same native session id, the original permission options on the restored process, the effective mode shown by the agent, and that the restored agent reads a directory outside its working directory without a tool permission prompt being answered. | stated (T-79) | Yes | Yes | Yes |
 | FR-25 | The delivery names its branch, remote (`fitzzz/herdr`) and exact source commit, and provides an isolated-test build or a documented way for T-79 to build and run it. | stated (T-79) | Yes | N/A: a delivery requirement | N/A: checked in the pull request and the delivery report |
 | FR-26 | The delivery report lists any capability that could not be delivered or verified (for example WSL, or a Codex behavior that could not be shown). | stated (T-79) | Yes | N/A: a delivery requirement | N/A: a report, not a user surface |
 | FR-27 | The isolated-test build or consumption path lets T-79 run its checks without stopping, restarting or replacing the installed user Herdr server and without touching any active agent (its own server, socket and session directories). | stated (T-79 exchange t79-t2-assignment-source-20261019) | Yes | N/A: a delivery requirement | Yes |
 | FR-28 | Every verification record names the agent version from the actual restored process (its executable path and arguments) and from its native transcript, and keeps the shell's `--version` output beside them as a separate source; the shell's output alone never counts as the pane runtime's version. | stated (T-79 exchange t79-x4-producer-scope-consumer-obligations) | Yes | N/A: a process requirement | Yes |
-| FR-29 | A restore that fell back to the bare command because the options were unknown (FR-10) is always distinguishable from a restore that used the agent's known launch options: Herdr's notice and state say which happened for each pane, and verification evidence and the delivery report never count a fallback restore as proof that original permissions were kept (FR-3, FR-4). | stated (T-79 exchange t79-x5-current-question-readback) | Yes | Yes | Yes |
-| FR-30 | Actual secret values from launch options (tokens, keys, inline credentials) never appear in verification evidence, test fixtures, logs written for review, delivery reports or Portal coordination messages; tests and evidence use placeholder values. This does not change FR-12: the session file still stores options as-is. | stated (T-79 exchange t79-supervisor-status-corrected-all-answered-20261019) | Yes | Yes | N/A: no user surface; checked by review of fixtures, logs and evidence files |
+| FR-29 | A restore that fell back to the bare command because the options were unknown (FR-10) is always distinguishable from a restore that used the agent's known launch options: Herdr's notice and state say which happened for each pane, and verification evidence and the delivery report never count a fallback restore as proof that original permissions were kept (FR-3, FR-4). | stated (T-79 exchange t79-x5-current-question-readback) | No | No | No |
+| FR-30 | Actual secret values from launch options (tokens, keys, inline credentials) never appear in verification evidence, test fixtures, logs written for review, delivery reports or Portal coordination messages; tests and evidence use placeholder values. This does not change FR-12: the session file still stores options as-is. | stated (T-79 exchange t79-supervisor-status-corrected-all-answered-20261019) | No | No | N/A: no user surface; checked by review of fixtures, logs and evidence files |
 
 ## Rules Applied
 
@@ -598,6 +623,11 @@ in the same pane and directory, using Herdr's existing restore order and spacing
 - Inferred, not verified: on some installs the agent's process command line may begin with an interpreter and script
   (for example `node <path>/cli.js`) rather than the agent's own executable; the implementer finds where the agent's
   options start for each supported install shape, and treats an unrecognized shape as "cannot carry" (FR-10).
+- Known limit, inferred (review round 8, r8-3): when an agent process reports its conversation and exits before
+  Herdr's process check sees it, the next agent process Herdr sees in that pane can be paired with that conversation,
+  and a Claude newcomer's own startup report does not correct it, so a save in that state writes the newcomer's
+  options beside the earlier conversation. It needs two agent processes inside one process-check interval (about
+  5 seconds); closing it needs the agent's process id in its hook report.
 - Inferred rows that stay inferred because they would not change what is built: FR-14 (options always belong to the
   pane's current conversation), FR-16 (a shared conversation still resumes once), FR-17 (the resume setting still turns
   restore off), FR-21 (unreleased docs updated), FR-22 (options survive repeated restores).
