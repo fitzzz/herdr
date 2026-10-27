@@ -2867,6 +2867,9 @@ impl TerminalState {
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
+        self.set_agent_launch(None);
+        self.agent_launch_restore = None;
+        self.persisted_agent_session_reported = false;
         self.clear_agent_name();
     }
 
@@ -7971,6 +7974,16 @@ mod tests {
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::agent_resume::AgentSessionRef::id("codex-session-2"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.persisted_agent_session_reported);
+        terminal.observe_agent_launch(Agent::Codex, 10, known_options(&["--placeholder"]), None);
+        terminal.agent_launch_restore = Some(crate::agent_resume::LaunchOptionsRestore::Kept);
 
         terminal.clear_agent_runtime_identity_after_respawn();
 
@@ -7980,6 +7993,9 @@ mod tests {
         assert!(terminal.persisted_agent_session.is_none());
         assert!(!terminal.respawn_shell_on_exit);
         assert!(!terminal.finish_agent_process_acquisition());
+        assert!(terminal.agent_launch().is_none());
+        assert!(terminal.agent_launch_restore.is_none());
+        assert!(!terminal.persisted_agent_session_reported);
     }
 
     #[test]
