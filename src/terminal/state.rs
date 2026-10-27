@@ -659,6 +659,7 @@ struct RecentAgentProcessExit {
 /// During the migration this is still one-to-one with a pane-backed PTY, but
 /// pane/view state no longer owns terminal identity, cwd, labels, or agent
 /// metadata.
+#[cfg_attr(test, derive(Clone))]
 pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
@@ -9682,5 +9683,553 @@ mod tests {
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-a".into()])
         );
+    }
+
+    /// Every short sequence of launch, report and exit events, checked after
+    /// each step against a model of which process runs which conversation.
+    mod exhaustive_pairing {
+        use super::*;
+
+        const MAX_LENGTH: usize = 4;
+
+        /// P and Q are agent processes; `P2` reuses P's id after P exited,
+        /// with another start time.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Process {
+            P,
+            Q,
+            P2,
+        }
+
+        const PROCESSES: [Process; 3] = [Process::P, Process::Q, Process::P2];
+
+        impl Process {
+            fn index(self) -> usize {
+                self as usize
+            }
+
+            fn instance(self) -> ProcessInstance {
+                match self {
+                    Self::P => ProcessInstance {
+                        pid: 10,
+                        started: Some(1),
+                    },
+                    Self::Q => ProcessInstance {
+                        pid: 11,
+                        started: Some(2),
+                    },
+                    Self::P2 => ProcessInstance {
+                        pid: 10,
+                        started: Some(3),
+                    },
+                }
+            }
+
+            fn options(self) -> Vec<String> {
+                vec![format!("--placeholder-{self:?}").to_lowercase()]
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Conversation {
+            S,
+            T,
+        }
+
+        impl Conversation {
+            fn id(self) -> &'static str {
+                match self {
+                    Self::S => "conversation-s",
+                    Self::T => "conversation-t",
+                }
+            }
+
+            fn session(self) -> crate::agent_resume::AgentSessionRef {
+                crate::agent_resume::AgentSessionRef::id(self.id()).unwrap()
+            }
+        }
+
+        /// What detection reads from a process's command line.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Reading {
+            Resumes(Conversation),
+            Nothing,
+            Unrecognized,
+        }
+
+        /// What the server knows about a report's sender.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Sender {
+            Reporter(Process),
+            Unplaced,
+            Job(&'static [Process]),
+            JobUnreadable,
+        }
+
+        impl Sender {
+            fn evidence(self) -> SessionReportEvidence {
+                match self {
+                    Self::Reporter(process) => {
+                        SessionReportEvidence::Reporter(vec![process.instance()])
+                    }
+                    Self::Unplaced => SessionReportEvidence::Unidentified,
+                    Self::Job(processes) => SessionReportEvidence::ForegroundAgents(Some(
+                        processes.iter().map(|process| process.instance()).collect(),
+                    )),
+                    Self::JobUnreadable => SessionReportEvidence::ForegroundAgents(None),
+                }
+            }
+
+            fn processes(self) -> &'static [Process] {
+                match self {
+                    Self::Reporter(Process::P) | Self::Job(&[Process::P]) => &[Process::P],
+                    Self::Reporter(Process::Q) | Self::Job(&[Process::Q]) => &[Process::Q],
+                    Self::Reporter(Process::P2) => &[Process::P2],
+                    Self::Job(processes) => processes,
+                    Self::Unplaced | Self::JobUnreadable => &[],
+                }
+            }
+
+            /// The one process this evidence names, by its kind.
+            fn named(self) -> Option<(Process, FactSource)> {
+                match self {
+                    Self::Reporter(process) => Some((process, FactSource::Reporter)),
+                    Self::Job(&[process]) => Some((process, FactSource::Job)),
+                    _ => None,
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Event {
+            /// A restore typed `claude --resume S` with saved options.
+            Seed,
+            Observe(Process, Reading),
+            /// A report of a conversation; `false` when its sequence is stale.
+            Report(Conversation, Sender, bool),
+            /// The process detection last read exits.
+            Exit,
+        }
+
+        fn alphabet() -> Vec<Event> {
+            let mut events = vec![Event::Seed, Event::Exit];
+            for process in PROCESSES {
+                for reading in [
+                    Reading::Resumes(Conversation::S),
+                    Reading::Resumes(Conversation::T),
+                    Reading::Nothing,
+                    Reading::Unrecognized,
+                ] {
+                    events.push(Event::Observe(process, reading));
+                }
+            }
+            for conversation in [Conversation::S, Conversation::T] {
+                for sender in [
+                    Sender::Reporter(Process::P),
+                    Sender::Reporter(Process::Q),
+                    Sender::Reporter(Process::P2),
+                    Sender::Unplaced,
+                    Sender::Job(&[Process::P]),
+                    Sender::Job(&[Process::Q]),
+                    Sender::Job(&[Process::P, Process::Q]),
+                    Sender::Job(&[]),
+                    Sender::JobUnreadable,
+                ] {
+                    for accepted in [true, false] {
+                        events.push(Event::Report(conversation, sender, accepted));
+                    }
+                }
+            }
+            events
+        }
+
+        const SEED_OPTIONS: &str = "--placeholder-seed";
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum FactSource {
+            CommandLine,
+            Reporter,
+            Job,
+        }
+
+        /// What is true, from the events alone.
+        #[derive(Debug, Clone, Default)]
+        struct Model {
+            time: u32,
+            appeared: [bool; 3],
+            exited: [bool; 3],
+            /// The options of each process's latest reading; `Some(None)`
+            /// when its command line was not recognized.
+            observed: [Option<Option<Vec<String>>>; 3],
+            readings: [Option<Reading>; 3],
+            /// The conversation each process runs, when it was learned and
+            /// how.
+            runs: [Option<(Conversation, u32, FactSource)>; 3],
+            bound: Option<Process>,
+            seeded: bool,
+            observed_since_seed: bool,
+            sequence: u64,
+            accepted_since_exit: bool,
+        }
+
+        impl Model {
+            fn alive(&self, process: Process) -> bool {
+                !self.exited[process.index()]
+            }
+
+            /// Whether `event` can happen next.
+            fn allows(&self, event: Event) -> bool {
+                let mentioned: &[Process] = match event {
+                    Event::Seed => return self.time == 0,
+                    Event::Exit => return self.bound.is_some(),
+                    Event::Observe(process, reading) => {
+                        // A process's command line does not change, except
+                        // when a launcher detection could not place execs the
+                        // agent in its own process.
+                        if self.readings[process.index()]
+                            .is_some_and(|read| read != Reading::Unrecognized || reading == read)
+                        {
+                            return false;
+                        }
+                        match process {
+                            Process::P => &[Process::P],
+                            Process::Q => &[Process::Q],
+                            Process::P2 => &[Process::P2],
+                        }
+                    }
+                    Event::Report(_, sender, accepted) => {
+                        if !accepted && !self.accepted_since_exit {
+                            return false;
+                        }
+                        sender.processes()
+                    }
+                };
+                // P cannot come back once another process took its id.
+                mentioned.iter().all(|process| {
+                    self.alive(*process)
+                        && (*process != Process::P || !self.appeared[Process::P2.index()])
+                })
+            }
+
+            fn appear(&mut self, process: Process) {
+                self.appeared[process.index()] = true;
+            }
+
+            fn apply(&mut self, event: Event) {
+                self.time += 1;
+                match event {
+                    Event::Seed => self.seeded = true,
+                    Event::Observe(process, reading) => {
+                        self.appear(process);
+                        self.observed_since_seed = true;
+                        self.bound = Some(process);
+                        self.readings[process.index()] = Some(reading);
+                        self.observed[process.index()] = Some(match reading {
+                            Reading::Unrecognized => None,
+                            _ => Some(process.options()),
+                        });
+                        // A command line precedes every report its process
+                        // sends, so a report naming it stays the latest fact.
+                        let reported = self.runs[process.index()]
+                            .is_some_and(|(_, _, source)| source != FactSource::CommandLine);
+                        if !reported {
+                            self.runs[process.index()] = match reading {
+                                Reading::Resumes(conversation) => {
+                                    Some((conversation, self.time, FactSource::CommandLine))
+                                }
+                                Reading::Nothing | Reading::Unrecognized => None,
+                            };
+                        }
+                    }
+                    Event::Report(conversation, sender, accepted) => {
+                        for process in sender.processes() {
+                            self.appear(*process);
+                        }
+                        if accepted {
+                            self.sequence += 1;
+                            self.accepted_since_exit = true;
+                            if let Some((process, source)) = sender.named() {
+                                self.runs[process.index()] =
+                                    Some((conversation, self.time, source));
+                            }
+                        }
+                    }
+                    Event::Exit => {
+                        if let Some(process) = self.bound.take() {
+                            self.exited[process.index()] = true;
+                            self.runs[process.index()] = None;
+                        }
+                        self.accepted_since_exit = false;
+                    }
+                }
+            }
+
+            /// The live process that runs `conversation` now: the latest fact
+            /// about it wins.
+            fn runner(&self, conversation: Conversation) -> Option<(Process, FactSource)> {
+                PROCESSES
+                    .into_iter()
+                    .filter(|process| self.alive(*process))
+                    .filter_map(|process| {
+                        self.runs[process.index()]
+                            .filter(|(runs, _, _)| *runs == conversation)
+                            .map(|(_, time, source)| (time, process, source))
+                    })
+                    .max_by_key(|(time, _, _)| *time)
+                    .map(|(_, process, source)| (process, source))
+            }
+        }
+
+        /// Drives the terminal as the server does for each event.
+        fn drive(terminal: &mut TerminalState, model: &Model, event: Event) -> Result<(), String> {
+            match event {
+                Event::Seed => {
+                    terminal.set_persisted_agent_session(
+                        crate::agent_resume::PersistedAgentSession {
+                            source: "herdr:claude".into(),
+                            agent: "claude".into(),
+                            session_ref: Conversation::S.session(),
+                        },
+                    );
+                    terminal.seed_agent_launch(AgentLaunchSeed {
+                        agent: Agent::Claude,
+                        options: known_options(&[SEED_OPTIONS]),
+                        resumed_without_options: false,
+                        launch: SeededLaunch::Started {
+                            session: Some(Conversation::S.session()),
+                        },
+                    });
+                }
+                Event::Observe(process, reading) => {
+                    terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+                    let (options, resumed) = match reading {
+                        Reading::Resumes(conversation) => (
+                            crate::agent_resume::AgentLaunchOptions::Known(process.options()),
+                            Some(conversation.id()),
+                        ),
+                        Reading::Nothing => (
+                            crate::agent_resume::AgentLaunchOptions::Known(process.options()),
+                            None,
+                        ),
+                        Reading::Unrecognized => (
+                            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                                crate::agent_resume::LaunchOptionsUnavailable::UnrecognizedCommand,
+                            ),
+                            None,
+                        ),
+                    };
+                    terminal.observe_agent_launch(
+                        Agent::Claude,
+                        process.instance(),
+                        options,
+                        resumed,
+                    );
+                }
+                Event::Report(conversation, sender, accepted) => {
+                    terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+                    let sequence = if accepted {
+                        model.sequence + 1
+                    } else {
+                        model.sequence
+                    };
+                    let took = report_as_the_server_does(
+                        terminal,
+                        conversation.session(),
+                        sequence,
+                        &sender.evidence(),
+                    );
+                    if took != accepted {
+                        return Err(format!("the report was accepted: {took}"));
+                    }
+                }
+                Event::Exit => {
+                    terminal.set_detected_state_with_visible_blocker(
+                        Some(Agent::Claude),
+                        AgentState::Idle,
+                        false,
+                        false,
+                        true,
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// A Claude report as the server applies it: whether the pane took it.
+        fn report_as_the_server_does(
+            terminal: &mut TerminalState,
+            session: crate::agent_resume::AgentSessionRef,
+            sequence: u64,
+            evidence: &SessionReportEvidence,
+        ) -> bool {
+            terminal
+                .apply_agent_session_report(
+                    "herdr:claude".into(),
+                    "claude".into(),
+                    Some(session),
+                    Some(sequence),
+                    Some("resume".into()),
+                    evidence,
+                )
+                .is_some()
+        }
+
+        /// Whether the options a session save writes now agree with the
+        /// model: `Err` names the disagreement, and `Ok(true)` a known limit.
+        fn check(terminal: &TerminalState, model: &Model) -> Result<bool, String> {
+            let Some(current) = terminal.current_session_ref() else {
+                return Ok(false);
+            };
+            let Some(conversation) = [Conversation::S, Conversation::T]
+                .into_iter()
+                .find(|conversation| conversation.session() == *current)
+            else {
+                return Ok(false);
+            };
+            let saved = terminal.launch_options_for_session("claude");
+            let runner = model.runner(conversation);
+            let runner_options =
+                runner.and_then(|(process, _)| model.observed[process.index()].clone().flatten());
+            if let Some(saved) = &saved {
+                if runner_options.as_ref() == Some(saved) {
+                    return Ok(false);
+                }
+                let seed_options = saved.as_slice() == [SEED_OPTIONS.to_string()];
+                if seed_options && model.seeded && !model.observed_since_seed {
+                    // The typed launch runs S until detection reads a
+                    // process.
+                    if conversation == Conversation::S && runner.is_none() {
+                        return Ok(false);
+                    }
+                    // Known limit (PRD Assumptions, no readable sender): the
+                    // lone agent in the job is taken to be the seed's launch
+                    // before detection reads it.
+                    if runner.is_some_and(|(_, source)| source == FactSource::Job) {
+                        return Ok(true);
+                    }
+                }
+                return Err(format!(
+                    "saved {saved:?} beside {conversation:?}, which {runner:?} runs"
+                ));
+            }
+            // A lone process that resumed the conversation itself, or that
+            // its reporter named, keeps its options beside it.
+            let lone = model.appeared.iter().filter(|appeared| **appeared).count() == 1;
+            if let (
+                true,
+                Some((_, FactSource::CommandLine | FactSource::Reporter)),
+                Some(options),
+            ) = (lone, runner, runner_options)
+            {
+                return Err(format!(
+                    "saved no options beside {conversation:?}, which {runner:?} runs with {options:?}"
+                ));
+            }
+            Ok(false)
+        }
+
+        #[derive(Default)]
+        struct Outcome {
+            sequences: u64,
+            known_limit: u64,
+            failures: Vec<(Vec<Event>, String)>,
+        }
+
+        fn explore(
+            terminal: &TerminalState,
+            model: &Model,
+            sequence: &mut Vec<Event>,
+            events: &[Event],
+            outcome: &mut Outcome,
+        ) {
+            if sequence.len() == MAX_LENGTH {
+                return;
+            }
+            for &event in events {
+                if !model.allows(event) {
+                    continue;
+                }
+                let mut terminal = terminal.clone();
+                let mut model = model.clone();
+                sequence.push(event);
+                outcome.sequences += 1;
+                let result = drive(&mut terminal, &model, event).and_then(|()| {
+                    model.apply(event);
+                    check(&terminal, &model)
+                });
+                match result {
+                    Err(failure) => outcome.failures.push((sequence.clone(), failure)),
+                    Ok(known_limit) => {
+                        outcome.known_limit += u64::from(known_limit);
+                        explore(&terminal, &model, sequence, events, outcome);
+                    }
+                }
+                sequence.pop();
+            }
+        }
+
+        #[test]
+        fn exhaustive_pairing_saves_options_only_beside_their_process_conversation() {
+            let events = alphabet();
+            let started = Instant::now();
+            let outcomes = std::thread::scope(|scope| {
+                events
+                    .iter()
+                    .map(|&first| {
+                        let events = &events;
+                        scope.spawn(move || {
+                            let mut outcome = Outcome::default();
+                            let mut terminal = test_terminal();
+                            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+                            let model = Model::default();
+                            if model.allows(first) {
+                                let mut sequence = vec![first];
+                                outcome.sequences += 1;
+                                let mut model = model;
+                                match drive(&mut terminal, &model, first).and_then(|()| {
+                                    model.apply(first);
+                                    check(&terminal, &model)
+                                }) {
+                                    Err(failure) => {
+                                        outcome.failures.push((sequence.clone(), failure))
+                                    }
+                                    Ok(known_limit) => {
+                                        outcome.known_limit += u64::from(known_limit);
+                                        explore(
+                                            &terminal,
+                                            &model,
+                                            &mut sequence,
+                                            events,
+                                            &mut outcome,
+                                        );
+                                    }
+                                }
+                            }
+                            outcome
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let sequences: u64 = outcomes.iter().map(|outcome| outcome.sequences).sum();
+            let known_limit: u64 = outcomes.iter().map(|outcome| outcome.known_limit).sum();
+            let mut failures = outcomes
+                .into_iter()
+                .flat_map(|outcome| outcome.failures)
+                .collect::<Vec<_>>();
+            failures.sort_by_key(|(sequence, _)| sequence.len());
+            eprintln!(
+                "exhaustive pairing: {sequences} sequences up to length {MAX_LENGTH}, \
+                 {known_limit} steps at a known limit, {} failing, in {:?}",
+                failures.len(),
+                started.elapsed()
+            );
+            for (sequence, failure) in failures.iter().take(40) {
+                eprintln!("failing: {sequence:?}: {failure}");
+            }
+            assert!(failures.is_empty(), "{} failing sequences", failures.len());
+        }
     }
 }
