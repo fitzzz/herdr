@@ -1161,17 +1161,15 @@ fn restore_plan_for_snapshot(
     // The pane's shell must take the typed command, through the saved
     // launcher when there is one, in one line; otherwise the options cannot
     // be repeated and restore falls back to the bare command. A launcher that
-    // cannot be encoded is reported when the restore starts.
+    // cannot be used is reported when the restore starts.
     let fits = match launcher {
-        Some(binding) => binding
-            .launcher
-            .command(planned.0.argv.get(1..).unwrap_or_default(), shell)
-            .map_or(true, |command| {
-                crate::platform::interactive_shell_accepts_line(
-                    &crate::platform::shell_restore_line(command),
-                    shell,
-                )
-            }),
+        Some(binding) => {
+            binding.launcher.validate().is_err()
+                || binding
+                    .launcher
+                    .restore_line(planned.0.argv.get(1..).unwrap_or_default(), shell)
+                    .is_ok()
+        }
         None => crate::platform::interactive_shell_restore_command(&planned.0.argv, shell)
             .is_some_and(|command| {
                 crate::platform::interactive_shell_accepts_line(&command, shell)

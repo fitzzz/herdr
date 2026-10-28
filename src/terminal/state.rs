@@ -836,6 +836,30 @@ impl TerminalState {
         }));
     }
 
+    /// The restore's resume command was not typed, such as a launcher line
+    /// the shell cannot take, so nothing runs the seeded launch: it keeps the
+    /// saved launch for the next save, as a pane restored without resuming
+    /// does, and drops the mark of a fallback that never ran.
+    pub fn restore_typed_nothing(&mut self) {
+        self.agent_launch_restore = None;
+        let Some(launch) = self.agent_launch.as_ref() else {
+            return;
+        };
+        let LaunchState::Started(pairing) = &launch.state else {
+            return;
+        };
+        let launch = pairing
+            .session()
+            .cloned()
+            .map(|session| ObservedAgentLaunch {
+                agent: launch.agent,
+                options: launch.options.clone(),
+                resumed_without_options: false,
+                state: LaunchState::Saved(session),
+            });
+        self.set_agent_launch(launch);
+    }
+
     /// Detection read the command line of a Claude or Codex process;
     /// `resumed_session` is the conversation id that command line resumes.
     pub fn observe_agent_launch(

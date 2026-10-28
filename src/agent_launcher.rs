@@ -108,6 +108,22 @@ impl AgentLauncher {
         crate::platform::agent_launcher_command(&self.argv(native_args), &self.env, shell)
             .ok_or_else(|| "launcher cannot be encoded for the target shell".into())
     }
+
+    /// The line a restore types for this launcher. A line longer than the
+    /// pane's shell takes is cut, and a cut launcher line can run something
+    /// else, so it is refused.
+    pub(crate) fn restore_line(
+        &self,
+        native_args: &[String],
+        shell: &str,
+    ) -> Result<String, String> {
+        let line = crate::platform::shell_restore_line(self.command(native_args, shell)?);
+        if crate::platform::interactive_shell_accepts_line(&line, shell) {
+            Ok(line)
+        } else {
+            Err("Saved launcher command is longer than this shell takes in one line. Shorten the launcher's arguments or environment and restart this session.".into())
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

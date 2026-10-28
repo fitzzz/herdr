@@ -248,20 +248,8 @@ impl App {
                         session.agent == binding.agent && &session.session_ref == expected
                     })
                 });
-            // A line longer than the shell takes is cut, and a cut launcher
-            // line can run something else, so it is not typed.
             let command = if identity_matches {
-                binding
-                    .launcher
-                    .command(native_args, &shell)
-                    .map(crate::platform::shell_restore_line)
-                    .and_then(|command| {
-                        if crate::platform::interactive_shell_accepts_line(&command, &shell) {
-                            Ok(command)
-                        } else {
-                            Err("Saved launcher command is longer than this shell takes in one line. Shorten the launcher's arguments or environment and restart this session.".into())
-                        }
-                    })
+                binding.launcher.restore_line(native_args, &shell)
             } else {
                 Err("Saved launcher does not match the native conversation identity".into())
             };
@@ -271,6 +259,7 @@ impl App {
                     if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                         terminal.pending_agent_resume_plan = None;
                         terminal.restore_error = Some(error);
+                        terminal.restore_typed_nothing();
                         terminal.revision = terminal.revision.saturating_add(1);
                     }
                     return true;
@@ -299,6 +288,7 @@ impl App {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.pending_agent_resume_plan = None;
                 terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());
+                terminal.restore_typed_nothing();
                 terminal.revision = terminal.revision.saturating_add(1);
             }
             return true;
@@ -337,6 +327,7 @@ impl App {
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.pending_agent_resume_plan = None;
                     terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
+                    terminal.restore_typed_nothing();
                     terminal.revision = terminal.revision.saturating_add(1);
                 }
                 return true;
@@ -624,8 +615,29 @@ mod tests {
                 .into(),
             },
         };
+        let session = crate::agent_resume::AgentSessionRef::id("same-uuid").unwrap();
+        let options = vec!["--permission-mode".to_string(), "plan".to_string()];
         let terminal = app.state.terminals.get_mut(&id).unwrap();
         terminal.agent_launcher = Some(binding.clone());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: session.clone(),
+        });
+        // As restore leaves a pane whose options made the launcher line too
+        // long: the bare launcher line is planned, with the fallback mark.
+        terminal.agent_launch_restore = Some(crate::agent_resume::LaunchOptionsRestore::NotKept(
+            crate::agent_resume::LaunchOptionsUnavailable::ExceedsResumeLimits,
+        ));
+        terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+            agent: crate::detect::Agent::Claude,
+            options: crate::agent_resume::AgentLaunchOptions::Known(options.clone()),
+            resumed_without_options: true,
+            launch: crate::terminal::SeededLaunch::Started {
+                session: Some(session),
+            },
+        });
+        assert!(terminal.resumed_without_launch_options());
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "claude".into(),
             argv: vec!["claude".into(), "--resume".into(), "same-uuid".into()],
@@ -646,6 +658,11 @@ mod tests {
             .contains("longer than this shell takes"));
         assert!(terminal.pending_agent_resume_plan.is_none());
         assert_eq!(terminal.agent_launcher.as_ref(), Some(&binding));
+        // Nothing was typed, so no fallback ran: the mark is gone, and the
+        // saved options stay for the next save.
+        assert!(!terminal.resumed_without_launch_options());
+        assert!(terminal.agent_launch_restore.is_none());
+        assert_eq!(terminal.launch_options_for_session("claude"), Some(options));
     }
 
     #[cfg(unix)]
