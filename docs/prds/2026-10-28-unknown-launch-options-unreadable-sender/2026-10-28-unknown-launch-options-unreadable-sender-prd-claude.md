@@ -87,6 +87,17 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
   run of the same script passed 4,320 of 4,320 tests with 15 skipped and `docs-contract-test` passed.
   The script reported `windows-lint skipped: Windows SDK not configured`, the same limit as before.
   The tested tree is `3e9aff7d`; the later commit changes only this PRD.
+- 2026-10-28 18:49:52 EDT - `origin/main` advanced again to `cd18e0b5` (PR #14: handoff terminal titles
+  and Codex turn-footer detection), which touches `src/persist/restore.rs`. The branch was rebased
+  onto it with no conflicts. Under a machine load average of 177, `just ci` at the default 128 test
+  threads stopped twice on timing-sensitive CLI tests that do not touch launch options
+  (`cases::hooks::devin_hook_prefers_hook_session_id_over_list`,
+  `cases::agents::agent_wait_ignores_other_panes_and_errors_when_its_pane_closes`, and
+  `cases::agents::agent_start_stops_retrying_when_the_pane_shell_stays_busy`). The first of them
+  passed in 0.15 s when rerun alone. Rerunning `just ci` with `NEXTEST_TEST_THREADS=32`, which is the
+  project's Test jobs setting, passed 4,325 of 4,325 tests with 15 skipped; `just docs-contract-test`
+  passed. The tested tree is the rebased head before this entry; the later commit changes only this
+  PRD.
 
 ## Introduction/Overview
 
