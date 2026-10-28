@@ -3405,7 +3405,7 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
-                evidence: Default::default(),
+                evidence: crate::terminal::SessionReportEvidence::Unidentified,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {

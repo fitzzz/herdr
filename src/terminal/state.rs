@@ -398,7 +398,7 @@ fn session_for_process(
 /// records what it names in [`ProcessSessions`], which both reports and
 /// observations decide from, so the order they arrive in does not change the
 /// pairing.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionReportEvidence {
     /// The reporter: the nearest process running the report's agent above
     /// the process that sent the report, inside the pane, with the launchers
@@ -410,7 +410,6 @@ pub enum SessionReportEvidence {
     /// socket, or it read that process but could not place a process running
     /// the agent in the pane, such as when none was found below the pane's
     /// own process or a process exited before the walk reached the pane.
-    #[default]
     Unidentified,
 }
 

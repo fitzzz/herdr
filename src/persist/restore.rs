@@ -3314,7 +3314,8 @@ mod tests {
                 Some(1),
                 Some("startup".into()),
             );
-            terminal.sync_agent_launch_session(&Default::default());
+            terminal
+                .sync_agent_launch_session(&crate::terminal::SessionReportEvidence::Unidentified);
         });
         assert_eq!(saved.value, "fresh-session");
         assert_eq!(saved.launch_options, None);
