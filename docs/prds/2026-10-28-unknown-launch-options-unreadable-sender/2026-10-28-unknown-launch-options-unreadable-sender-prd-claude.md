@@ -79,6 +79,14 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
   names OpenCode where the agent list is described, and drops the foreground-job read and variant as
   this task does. `just ci` passes at the new head (4,320 tests passed, 15 skipped) and
   `just docs-contract-test` passes.
+- 2026-10-28 14:29:59 EDT - The project supervisor asked for the same rebase and for its own full-suite
+  script (`herdr-full-suite.sh`) on the worktree. The script's first run stopped on
+  `herdr::api_ping shutdown_preserves_session_after_shell_is_signaled`: "signaled pane was not removed"
+  after 3.27 s, against that test's 2 s limit, under a 32-way parallel run. The test does not touch
+  agent sessions or launch options. A focused rerun of that one test passed in 0.84 s, and a second
+  run of the same script passed 4,320 of 4,320 tests with 15 skipped and `docs-contract-test` passed.
+  The script reported `windows-lint skipped: Windows SDK not configured`, the same limit as before.
+  The tested tree is `3e9aff7d`; the later commit changes only this PRD.
 
 ## Introduction/Overview
 
