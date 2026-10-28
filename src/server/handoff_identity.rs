@@ -345,10 +345,21 @@ pub(crate) fn admit_manifest(
                     .get(pane_id.as_str())
                     .ok_or_else(|| mismatch("migration frozen pane is absent from capture"))?;
                 let saved = &tab.panes[&raw];
+                // The capture holds the conversation identity as the source API
+                // publishes it; the snapshot also saves how the agent was
+                // launched (options, account), which is not part of who
+                // occupies the pane and still crosses the handoff in it.
                 let native = saved
                     .agent_session
                     .as_ref()
-                    .map(serde_json::to_value)
+                    .map(|session| {
+                        serde_json::to_value(crate::api::schema::AgentSessionInfo {
+                            source: session.source.clone(),
+                            agent: session.agent.clone(),
+                            kind: session.kind,
+                            value: session.value.clone(),
+                        })
+                    })
                     .transpose()
                     .map_err(io::Error::other)?;
                 if capture.workspace_id != workspace_id
@@ -541,6 +552,79 @@ mod tests {
         assert!(parse_unique_json(br#"{"a":{"pane_id":1,"pane_id":2}}"#).is_err());
         let value = parse_unique_json(br#"{"sequence":18446744073709551615}"#).unwrap();
         assert_eq!(value["sequence"].as_u64(), Some(u64::MAX));
+    }
+
+    /// A pane whose saved conversation carries launch options and an account,
+    /// captured from the source API, which publishes only the conversation
+    /// identity.
+    fn fixtures_with_agent_session() -> (IdentityReceipt, HandoffManifest) {
+        let (mut receipt, mut manifest) = fixtures();
+        receipt.panes[0].agent_name = Some("worker".into());
+        receipt.panes[0].agent_session = Some(serde_json::json!({
+            "agent":"claude","kind":"id","source":"herdr:claude","value":"conversation-1"
+        }));
+        let saved = manifest.snapshot.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&900)
+            .unwrap();
+        saved.agent_name = Some("worker".into());
+        saved.agent_session = Some(serde_json::from_value(serde_json::json!({
+            "source":"herdr:claude","agent":"claude","kind":"id","value":"conversation-1",
+            "launch_options":["--model","claude-haiku-5-5","--permission-mode","bypassPermissions"],
+            "launch_account":"claude:a@example.com","resumed_without_launch_options":true
+        })).unwrap());
+        (receipt, manifest)
+    }
+
+    #[test]
+    fn saved_launch_options_and_account_do_not_change_the_occupant_identity() {
+        let (receipt, manifest) = fixtures_with_agent_session();
+        let admitted = admit_manifest(&receipt, &manifest).unwrap();
+        assert!(
+            matches!(&admitted[&900], AdmittedPaneIdentity::Runtime(id) if id.as_str() == "opaque-exact-old-ID")
+        );
+        // The saved options and account stay in the manifest the import restores from.
+        let saved = manifest.snapshot.workspaces[0].tabs[0].panes[&900]
+            .agent_session
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            saved.launch_account.as_deref(),
+            Some("claude:a@example.com")
+        );
+        assert_eq!(saved.launch_options.as_ref().map(Vec::len), Some(4));
+    }
+
+    #[test]
+    fn a_different_captured_conversation_is_still_not_admitted() {
+        for (field, value) in [
+            ("value", "conversation-2"),
+            ("source", "herdr:codex"),
+            ("agent", "codex"),
+            ("kind", "path"),
+        ] {
+            let (mut receipt, manifest) = fixtures_with_agent_session();
+            receipt.panes[0].agent_session.as_mut().unwrap()[field] = value.into();
+            let error = admit_manifest(&receipt, &manifest).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "migration frozen occupant differs from capture",
+                "{field}"
+            );
+        }
+        let (mut receipt, manifest) = fixtures_with_agent_session();
+        receipt.panes[0].agent_session = None;
+        assert!(admit_manifest(&receipt, &manifest).is_err());
+        let (mut receipt, manifest) = fixtures_with_agent_session();
+        receipt.panes[0].agent_name = None;
+        assert!(admit_manifest(&receipt, &manifest).is_err());
+        let (receipt, mut manifest) = fixtures_with_agent_session();
+        manifest.snapshot.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&900)
+            .unwrap()
+            .agent_session = None;
+        assert!(admit_manifest(&receipt, &manifest).is_err());
     }
 
     #[test]
