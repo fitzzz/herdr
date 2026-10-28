@@ -404,7 +404,7 @@ fn session_for_process(
     }
 }
 
-/// What the server knew, as a Claude, Codex or Grok conversation report arrived,
+/// What the server knew, as a Claude, Codex, Grok or OpenCode conversation report arrived,
 /// about which process sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionReportEvidence {
@@ -419,7 +419,7 @@ pub enum SessionReportEvidence {
     Unidentified,
     /// The server could not read the process that sent the report, such as
     /// for a report that did not come over the local API socket: the Claude,
-    /// Codex and Grok processes in the pane's foreground job, when the job
+    /// Codex, Grok and OpenCode processes in the pane's foreground job, when the job
     /// could be read.
     ForegroundAgents(Option<Vec<ProcessInstance>>),
 }
@@ -434,7 +434,7 @@ impl SessionReportEvidence {
     /// The processes this evidence names as the one that reported, and how
     /// it shows them, or `None` when the server cannot tell. A reporter
     /// names itself and the launchers directly above it. A foreground job
-    /// running exactly one Claude, Codex or Grok process names that process, which
+    /// running exactly one Claude, Codex, Grok or OpenCode process names that process, which
     /// is the only evidence that names a launch not yet bound to a process,
     /// taken to be that process. An unreadable job, a job running
     /// none or more than one, and a sender the server read but could not
@@ -611,7 +611,7 @@ pub enum SeededLaunch {
     Saved(crate::agent_resume::AgentSessionRef),
 }
 
-/// The launch options of the Claude, Codex or Grok process running in a
+/// The launch options of the Claude, Codex, Grok or OpenCode process running in a
 /// pane, and the account launcher account it runs under, kept so restore can
 /// repeat them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,7 +870,7 @@ impl TerminalState {
         self.set_agent_launch(launch);
     }
 
-    /// Detection read the command line of a Claude, Codex or Grok process;
+    /// Detection read the command line of a Claude, Codex, Grok or OpenCode process;
     /// `resumed_session` is the conversation id that command line resumes.
     pub fn observe_agent_launch(
         &mut self,
@@ -4567,9 +4567,12 @@ mod tests {
             .map(String::from)
             .collect::<Vec<_>>();
         for argv in [&launcher, &launcher, &agent] {
-            let options =
-                crate::agent_resume::launch_options_from_process_argv(Agent::Claude, Some(argv))
-                    .unwrap();
+            let options = crate::agent_resume::launch_options_from_process_argv(
+                Agent::Claude,
+                Some(argv),
+                None,
+            )
+            .unwrap();
             let resumed =
                 crate::agent_resume::resumed_session_from_process_argv(Agent::Claude, argv);
             terminal.observe_agent_launch(
@@ -4722,6 +4725,7 @@ mod tests {
                 crate::agent_resume::launch_options_from_process_argv(
                     Agent::Claude,
                     Some(&launcher),
+                    None,
                 )
                 .unwrap(),
                 None,
@@ -4761,6 +4765,7 @@ mod tests {
                 crate::agent_resume::launch_options_from_process_argv(
                     Agent::Claude,
                     Some(&launcher),
+                    None,
                 )
                 .unwrap(),
                 None,
@@ -4801,7 +4806,7 @@ mod tests {
         terminal.observe_agent_launch(
             Agent::Claude,
             ProcessInstance::unknown_start(100),
-            crate::agent_resume::launch_options_from_process_argv(Agent::Claude, Some(&argv))
+            crate::agent_resume::launch_options_from_process_argv(Agent::Claude, Some(&argv), None)
                 .unwrap(),
             crate::agent_resume::resumed_session_from_process_argv(Agent::Claude, &argv).as_deref(),
         );

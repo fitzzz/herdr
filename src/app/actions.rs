@@ -1449,25 +1449,26 @@ impl AppState {
                 argv,
                 account,
             } => {
-                if let Some(options) =
-                    crate::agent_resume::launch_options_from_process_argv(agent, argv.as_deref())
-                {
+                self.update_terminal_state(pane_id, |terminal| {
+                    let options = crate::agent_resume::launch_options_from_process_argv(
+                        agent,
+                        argv.as_deref(),
+                        terminal.agent_launcher.as_ref(),
+                    )?;
                     let resumed_session = argv.as_deref().and_then(|argv| {
                         crate::agent_resume::resumed_session_from_process_argv(agent, argv)
                     });
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.observe_agent_launch(
-                            agent,
-                            process,
-                            options,
-                            resumed_session.as_deref(),
-                        );
-                        if let Some(account) = account {
-                            terminal.observe_agent_account(process, account);
-                        }
-                        None
-                    });
-                }
+                    terminal.observe_agent_launch(
+                        agent,
+                        process,
+                        options,
+                        resumed_session.as_deref(),
+                    );
+                    if let Some(account) = account {
+                        terminal.observe_agent_account(process, account);
+                    }
+                    None
+                });
                 Vec::new()
             }
             AppEvent::CodexPromptObserved { pane_id, ready } => self
@@ -3596,6 +3597,55 @@ mod tests {
             (
                 "session-b".into(),
                 claude_resume(&["--permission-mode", "bypassPermissions"], "session-b")
+            )
+        );
+    }
+
+    #[test]
+    fn options_the_bound_launcher_passed_on_are_not_saved_as_launch_options() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let launcher = crate::api::schema::AgentLauncher {
+            executable: "/usr/bin/placeholder-accounts".into(),
+            prefix_args: [
+                "run",
+                "claude",
+                "--account",
+                "claude:a@example.com",
+                "--",
+                "--strict-mcp-config",
+            ]
+            .map(String::from)
+            .to_vec(),
+            env: Default::default(),
+        };
+        let native = ["--permission-mode", "plan"].map(String::from);
+        let terminal_id = state.workspaces[0].terminal_id(pane_id).unwrap().clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: launcher.argv(&native),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            launcher,
+            agent: "claude".into(),
+            session: None,
+        });
+        report_claude_session(&mut state, pane_id, EXITED_PROCESS_ID, 1, "session-a");
+        observe_claude_argv(
+            &mut state,
+            pane_id,
+            EXITED_PROCESS_ID,
+            &["claude", "--strict-mcp-config", "--permission-mode", "plan"],
+        );
+        assert_eq!(
+            saved_claude_restore(&state, pane_id),
+            (
+                "session-a".into(),
+                claude_resume(&["--permission-mode", "plan"], "session-a")
             )
         );
     }

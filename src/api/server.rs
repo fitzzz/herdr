@@ -84,6 +84,11 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         terminal_input_ack: true,
         terminal_input_literal: true,
         agent_prompt_outcome: true,
+        launch_option_replay: crate::detect::Agent::ALL
+            .into_iter()
+            .filter(|agent| crate::agent_resume::carries_launch_options(*agent))
+            .map(|agent| crate::detect::agent_label(agent).to_string())
+            .collect(),
     })
 }
 
@@ -1525,6 +1530,7 @@ mod tests {
                 terminal_input_ack: false,
                 terminal_input_literal: false,
                 agent_prompt_outcome: false,
+                launch_option_replay: Vec::new(),
             }),
             None,
             None,
@@ -1598,6 +1604,10 @@ mod tests {
         assert_eq!(
             response["result"]["capabilities"]["methods"],
             serde_json::json!(["agent.start_with_launcher", "agent.launcher_info"])
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["launch_option_replay"],
+            serde_json::json!(["claude", "codex", "opencode", "grok"])
         );
     }
 

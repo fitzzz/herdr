@@ -297,7 +297,7 @@ async fn publish_agent_process_detected_event(
 /// the program its command line ran (`argv[0]`) when it was read.
 type PublishedAgentLaunch = (Agent, crate::platform::ProcessInstance, Option<String>);
 
-/// Claude, Codex and Grok restore repeats the options read from the agent's
+/// Claude, Codex, Grok and OpenCode restore repeats the options read from the agent's
 /// command line, so each new agent process is reported once, also when a wrapper runs
 /// one after another in the same process group, or a later process reuses the
 /// id (told apart by its start time). A process is reported once more when a
@@ -330,8 +330,8 @@ fn agent_launch_observation(
     Some((agent, agent_process))
 }
 
-/// One probe's launch observation: publishes the probed Claude, Codex or
-/// Grok process with its command line, and for Claude and Codex the account
+/// One probe's launch observation: publishes the probed Claude, Codex, Grok
+/// or OpenCode process with its command line, and for Claude and Codex the account
 /// it runs under, when [`agent_launch_observation`] finds it new.
 async fn publish_agent_launch_observation(
     state_events: &mpsc::Sender<AppEvent>,

@@ -1143,20 +1143,13 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    // A launcher that passes its prefix arguments on to the agent adds them
-    // again, so the copy the agent's command line showed is not repeated.
-    let launch_options = session.launch_options.as_deref().map(|options| {
-        launcher.map_or(options, |binding| {
-            options
-                .strip_prefix(binding.launcher.prefix_args.as_slice())
-                .unwrap_or(options)
-        })
-    });
+    // The saved options leave out what a launcher's prefix passed on to the
+    // agent (`launch_options_from_process_argv`), so they are repeated as saved.
     let planned = crate::agent_resume::plan_with_launch_options(
         &session.source,
         &session.agent,
         &persisted.session_ref,
-        launch_options,
+        session.launch_options.as_deref(),
     )?;
     // The pane's shell must take the typed command, through the saved
     // launcher when there is one, in one line; otherwise the options cannot
@@ -2244,48 +2237,21 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn restore_plan_does_not_repeat_the_launcher_prefix_the_agent_showed() {
-        let prefix = vec!["--effort".to_string(), "low".to_string()];
-        let session = launch_options_session(
-            "claude",
-            Some(vec![
-                "--effort".into(),
-                "low".into(),
-                "--model".into(),
-                "claude-haiku-5-5".into(),
-            ]),
-        );
-        let launcher = sh_launcher(prefix, 0);
-        let (plan, outcome) =
-            restore_plan_for_snapshot(&session, true, "bash", Some(&launcher)).unwrap();
-        assert_eq!(
-            outcome,
-            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
-        );
-        assert_eq!(
-            plan.argv,
-            [
-                "claude",
-                "--model",
-                "claude-haiku-5-5",
-                "--resume",
-                "claude-session"
-            ]
-        );
-        // Without a launcher the same options are the agent's own.
-        let (plan, _) = restore_plan_for_snapshot(&session, true, "bash", None).unwrap();
-        assert_eq!(
-            plan.argv,
-            [
-                "claude",
-                "--effort",
-                "low",
-                "--model",
-                "claude-haiku-5-5",
-                "--resume",
-                "claude-session"
-            ]
-        );
+    fn restore_plan_repeats_saved_options_through_a_launcher_as_saved() {
+        // Saved options hold only what the launcher's prefix did not pass on,
+        // so an option that is also in the prefix was given twice.
+        let options = ["--effort", "low", "--model", "claude-haiku-5-5"];
+        let session = launch_options_session("claude", Some(options.map(String::from).to_vec()));
+        let launcher = sh_launcher(vec!["--effort".into(), "low".into()], 0);
+        for launcher in [Some(&launcher), None] {
+            let (plan, outcome) =
+                restore_plan_for_snapshot(&session, true, "bash", launcher).unwrap();
+            assert_eq!(
+                outcome,
+                Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+            );
+            assert_eq!(plan.argv[1..5], options);
+        }
     }
 
     #[test]

@@ -89,8 +89,8 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
-    /// Process detection read the command line of a new Claude, Codex or
-    /// Grok process, read with when it started. `argv` is `None` where the
+    /// Process detection read the command line of a new Claude, Codex, Grok
+    /// or OpenCode process, read with when it started. `argv` is `None` where the
     /// platform does not read it. `account` is the Claude or Codex account
     /// its `AGENT_ACCOUNTS_ID` names, `Some(None)` when it names none, and
     /// `None` when the environment was not read.
