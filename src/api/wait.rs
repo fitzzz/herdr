@@ -18,6 +18,8 @@ use crate::api::{ApiRequestSender, EventHub};
 use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
+const NOT_SUBMITTED_SETTLE_MS: u64 = 500;
+const NOT_SUBMITTED_STREAK: u32 = 2;
 
 pub(super) fn wait_for_output(
     request_id: String,
@@ -162,6 +164,9 @@ pub(super) fn wait_for_agent(
             after_state_change_seq: None,
             accept_transient_status: true,
             timeout_kind: AgentWaitTimeoutKind::Status,
+            rejection_probe: None,
+            acceptance_probe: None,
+            match_status: true,
         },
         stream,
         api_tx,
@@ -182,23 +187,15 @@ pub(super) fn prompt_agent(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
-    let Some(wait) = params.wait.clone() else {
-        return Ok(Some(dispatch_to_app_with_timeout(
-            Request {
-                id: request_id,
-                method: Method::AgentPrompt(params),
-            },
-            api_tx,
-            None,
-        )));
-    };
-
+    let wait = params.wait.clone();
+    let total_timeout_ms = wait.as_ref().and_then(|wait| wait.timeout_ms);
     let wait_started = std::time::Instant::now();
+
     let before_prompt = match agent_get_for_prompt(
         &request_id,
         &params.target,
         api_tx,
-        wait.timeout_ms,
+        total_timeout_ms,
         wait_started,
     ) {
         Ok(agent) => agent,
@@ -208,12 +205,24 @@ pub(super) fn prompt_agent(
                 .map_err(std::io::Error::other);
         }
     };
-    let prompt_started_working =
-        before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
+    let expected_agent = before_prompt
+        .agent
+        .as_deref()
+        .and_then(crate::detect::parse_agent_label);
+    let queued_evidence_supported = crate::detect::queued_evidence_supported(expected_agent);
+    let prompt_needle = prompt_evidence_needle(&params.text);
     let target = params.target.clone();
+
+    // Capture the screen before writing so evidence of new text on screen can be
+    // distinguished from text that was already there.
+    let before_screen = read_agent_screen(&request_id, &target, api_tx).ok();
+    let baseline = before_screen
+        .as_deref()
+        .map(|screen| crate::detect::manifest::composer_text_occurrences(screen, &prompt_needle))
+        .unwrap_or(0);
+
     if let Some(prompt_wait) = params.wait.as_mut() {
-        prompt_wait.submission_deadline = wait
-            .timeout_ms
+        prompt_wait.submission_deadline = total_timeout_ms
             .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
     }
     let last_event_sequence = event_hub.current_sequence();
@@ -225,7 +234,7 @@ pub(super) fn prompt_agent(
     let prompt_response = dispatch_to_app_with_caller_timeout(
         prompt_request,
         api_tx,
-        remaining_timeout_ms(wait.timeout_ms, wait_started).map(std::time::Duration::from_millis),
+        remaining_timeout_ms(total_timeout_ms, wait_started).map(std::time::Duration::from_millis),
     );
     #[cfg(not(windows))]
     let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
@@ -241,53 +250,76 @@ pub(super) fn prompt_agent(
         return agent_wait_not_running(request_id).map(Some);
     }
 
-    let prompt_activity_observed = prompt_started_working
-        || matches!(
-            prompted.agent_status,
-            crate::api::schema::AgentStatus::Working | crate::api::schema::AgentStatus::Blocked
-        );
     let prompt_state_change_seq = prompted.state_change_seq;
-    let until = agent_wait_statuses(wait.until);
     let mut initial = prompted;
+    let prompt_started_working = initial.agent_status == crate::api::schema::AgentStatus::Working;
 
-    if !prompt_activity_observed {
-        let remaining_timeout_ms = remaining_timeout_ms(wait.timeout_ms, wait_started);
-        let (effect_timeout_ms, timeout_kind) = match remaining_timeout_ms {
-            Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
-                (timeout_ms, AgentWaitTimeoutKind::Status)
-            }
-            _ => (
-                AGENT_PROMPT_EFFECT_TIMEOUT_MS,
-                AgentWaitTimeoutKind::PromptStalled {
-                    timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
-                },
-            ),
-        };
-        let Some(outcome) = wait_for_resolved_agent(
-            request_id.clone(),
-            ResolvedAgentWait {
-                target: target.clone(),
-                until: prompt_activity_statuses(),
-                timeout_ms: Some(effect_timeout_ms),
-                initial,
-                last_event_sequence,
-                after_state_change_seq: Some(prompt_state_change_seq),
-                accept_transient_status: true,
-                timeout_kind,
-            },
-            stream,
-            api_tx,
-            event_hub,
-            running,
-        )?
-        else {
-            return Ok(None);
-        };
-        initial = match outcome {
-            AgentWaitOutcome::Matched(agent) => *agent,
-            AgentWaitOutcome::Response(response) => return Ok(Some(response)),
-        };
+    if prompt_started_working && !queued_evidence_supported {
+        return agent_prompt_stalled(
+            &request_id,
+            &initial,
+            "no acceptance evidence rule is available for this agent kind",
+        )
+        .map(Some);
     }
+
+    let remaining = remaining_timeout_ms(total_timeout_ms, wait_started);
+    let (effect_timeout_ms, timeout_kind) =
+        prompt_effect_timeout(remaining, prompt_started_working);
+    let earliest =
+        std::time::Instant::now() + std::time::Duration::from_millis(NOT_SUBMITTED_SETTLE_MS);
+    let rejection_probe = PromptRejectionProbe {
+        needle: prompt_needle.clone(),
+        baseline,
+        earliest,
+        expected_agent,
+    };
+    let acceptance_mode = if prompt_started_working {
+        Some(PromptAcceptanceMode::QueuedEvidence)
+    } else if crate::detect::composer_evidence_supported(expected_agent) {
+        Some(PromptAcceptanceMode::ComposerCleared)
+    } else {
+        None
+    };
+    let acceptance_probe = acceptance_mode.map(|mode| PromptAcceptanceProbe {
+        mode,
+        needle: prompt_needle.clone(),
+        baseline,
+        earliest,
+        expected_agent,
+    });
+    let Some(outcome) = wait_for_resolved_agent(
+        request_id.clone(),
+        ResolvedAgentWait {
+            target: target.clone(),
+            until: prompt_activity_statuses(),
+            timeout_ms: Some(effect_timeout_ms),
+            initial,
+            last_event_sequence,
+            after_state_change_seq: Some(prompt_state_change_seq),
+            accept_transient_status: true,
+            timeout_kind,
+            rejection_probe: Some(rejection_probe),
+            acceptance_probe,
+            match_status: !prompt_started_working,
+        },
+        stream,
+        api_tx,
+        event_hub,
+        running,
+    )?
+    else {
+        return Ok(None);
+    };
+    initial = match outcome {
+        AgentWaitOutcome::Matched(agent) => *agent,
+        AgentWaitOutcome::Response(response) => return Ok(Some(response)),
+    };
+
+    let Some(wait) = wait else {
+        return agent_prompt_success(request_id, initial).map(Some);
+    };
+    let until = agent_wait_statuses(wait.until);
     if agent_wait_matches(&initial, &until, None) {
         return agent_prompt_success(request_id, initial).map(Some);
     }
@@ -297,7 +329,7 @@ pub(super) fn prompt_agent(
         ResolvedAgentWait {
             target,
             until,
-            timeout_ms: remaining_timeout_ms(wait.timeout_ms, wait_started),
+            timeout_ms: remaining_timeout_ms(total_timeout_ms, wait_started),
             initial,
             // Replay from before submission so terminal lifecycle events consumed by
             // the activity gate still terminate this settled-state wait.
@@ -305,6 +337,9 @@ pub(super) fn prompt_agent(
             after_state_change_seq: None,
             accept_transient_status: false,
             timeout_kind: AgentWaitTimeoutKind::Status,
+            rejection_probe: None,
+            acceptance_probe: None,
+            match_status: true,
         },
         stream,
         api_tx,
@@ -321,11 +356,46 @@ pub(super) fn prompt_agent(
     agent_prompt_success(request_id, agent).map(Some)
 }
 
+/// First non-empty line of the submitted text, bounded so a long paste does not
+/// make screen evidence expensive to search for.
+fn prompt_evidence_needle(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect()
+}
+
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {
     total_ms.map(|total_ms| {
         let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         total_ms.saturating_sub(elapsed_ms)
     })
+}
+
+fn prompt_effect_timeout(
+    remaining_ms: Option<u64>,
+    working_start: bool,
+) -> (u64, AgentWaitTimeoutKind) {
+    match remaining_ms {
+        Some(timeout_ms) if timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS => {
+            (timeout_ms, AgentWaitTimeoutKind::Status)
+        }
+        _ if working_start => (
+            AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+            AgentWaitTimeoutKind::PromptAcceptance {
+                timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+            },
+        ),
+        _ => (
+            AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+            AgentWaitTimeoutKind::PromptStalled {
+                timeout_ms: AGENT_PROMPT_EFFECT_TIMEOUT_MS,
+            },
+        ),
+    }
 }
 
 fn agent_prompt_success(
@@ -339,6 +409,139 @@ fn agent_prompt_success(
     .map_err(std::io::Error::other)
 }
 
+/// The written-but-not-accepted outcome. Positive evidence says the text stayed
+/// in the composer or the agent rejected it.
+fn agent_prompt_not_submitted(
+    request_id: &str,
+    agent: &crate::api::schema::AgentInfo,
+    evidence: &str,
+) -> std::io::Result<String> {
+    let status = format!("{:?}", agent.agent_status).to_ascii_lowercase();
+    serde_json::to_string(&ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: "agent_prompt_not_submitted".into(),
+            message: format!(
+                "agent prompt was written but not submitted: {evidence}; the input must not be resent without checking the agent (current status is {status})"
+            ),
+        },
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// The written-but-not-confirmed outcome. `reason` distinguishes a missing
+/// agent-kind rule from evidence that was expected but not observed.
+fn agent_prompt_stalled(
+    request_id: &str,
+    agent: &crate::api::schema::AgentInfo,
+    reason: &str,
+) -> std::io::Result<String> {
+    let status = format!("{:?}", agent.agent_status).to_ascii_lowercase();
+    serde_json::to_string(&ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: "agent_prompt_stalled".into(),
+            message: format!(
+                "agent prompt was written but {reason}; the input may still be in the agent's input box and must not be resent without checking the agent (current status is {status})"
+            ),
+        },
+    })
+    .map_err(std::io::Error::other)
+}
+
+fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bool {
+    if crate::detect::manifest::composer_text_occurrences(screen, &probe.needle) <= probe.baseline {
+        return false;
+    }
+    match probe.mode {
+        PromptAcceptanceMode::QueuedEvidence => crate::detect::composer_queued_evidence(
+            probe.expected_agent,
+            screen,
+            "",
+            "",
+            &probe.needle,
+        ),
+        PromptAcceptanceMode::ComposerCleared => {
+            !crate::detect::composer_match(probe.expected_agent, screen, "", "").is_some_and(
+                |composer| {
+                    matches!(
+                        composer.state,
+                        crate::detect::ComposerState::SelectionList
+                            | crate::detect::ComposerState::PartialCommand
+                            | crate::detect::ComposerState::Draft
+                    )
+                },
+            )
+        }
+    }
+}
+
+fn prompt_not_submitted_evidence(
+    screen: &str,
+    needle: &str,
+    baseline: usize,
+    agent: Option<crate::detect::Agent>,
+) -> Option<&'static str> {
+    if needle.is_empty()
+        || crate::detect::manifest::composer_text_occurrences(screen, needle) <= baseline
+    {
+        return None;
+    }
+    if crate::detect::composer_match(agent, screen, "", "").is_some_and(|composer| {
+        matches!(
+            composer.state,
+            crate::detect::ComposerState::Draft | crate::detect::ComposerState::PartialCommand
+        ) && crate::detect::manifest::composer_text_occurrences(&composer.region_text, needle) > 0
+    }) {
+        return Some("the text is still in the agent's input box");
+    }
+    None
+}
+
+fn read_agent_screen(
+    request_id: &str,
+    target: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<String, ErrorResponse> {
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:read"),
+            method: Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: target.to_string(),
+                source: crate::api::schema::ReadSource::Detection,
+                lines: Some(80),
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: "failed to decode agent read response".into(),
+        },
+    })?;
+    if let Some(error) = response_error(request_id, &value) {
+        return Err(error);
+    }
+    Ok(value["result"]["read"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn response_error(request_id: &str, value: &serde_json::Value) -> Option<ErrorResponse> {
+    value.get("error")?;
+    let error = serde_json::from_value(value["error"].clone()).ok()?;
+    Some(ErrorResponse {
+        id: request_id.into(),
+        error,
+    })
+}
+
 struct ResolvedAgentWait {
     target: String,
     until: Vec<crate::api::schema::AgentStatus>,
@@ -348,12 +551,46 @@ struct ResolvedAgentWait {
     after_state_change_seq: Option<u64>,
     accept_transient_status: bool,
     timeout_kind: AgentWaitTimeoutKind,
+    rejection_probe: Option<PromptRejectionProbe>,
+    acceptance_probe: Option<PromptAcceptanceProbe>,
+    match_status: bool,
+}
+
+struct PromptRejectionProbe {
+    needle: String,
+    baseline: usize,
+    earliest: std::time::Instant,
+    expected_agent: Option<crate::detect::Agent>,
+}
+
+#[derive(Clone, Copy)]
+enum PromptAcceptanceMode {
+    QueuedEvidence,
+    ComposerCleared,
+}
+
+struct PromptAcceptanceProbe {
+    mode: PromptAcceptanceMode,
+    needle: String,
+    baseline: usize,
+    earliest: std::time::Instant,
+    expected_agent: Option<crate::detect::Agent>,
+}
+
+impl PromptAcceptanceProbe {
+    fn required_streak(&self) -> u32 {
+        match self.mode {
+            PromptAcceptanceMode::QueuedEvidence => 1,
+            PromptAcceptanceMode::ComposerCleared => NOT_SUBMITTED_STREAK,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 enum AgentWaitTimeoutKind {
     Status,
     PromptStalled { timeout_ms: u64 },
+    PromptAcceptance { timeout_ms: u64 },
 }
 
 enum AgentWaitOutcome {
@@ -382,6 +619,8 @@ fn wait_for_resolved_agent(
     let expected_agent = wait.initial.agent.clone();
     let pane_id = wait.initial.pane_id.clone();
     let mut last_event_sequence = wait.last_event_sequence;
+    let mut not_submitted_streak = 0;
+    let mut acceptance_streak = 0;
 
     loop {
         if should_stop_connection(stream, running)? {
@@ -401,13 +640,15 @@ fn wait_for_resolved_agent(
                     ..
                 } if event_pane == pane_id => {
                     if released {
-                        if let Some(status) = final_status
-                            .filter(|status| wait.until.contains(status))
-                            .or(matched_event_status)
-                        {
-                            let mut matched = wait.initial.clone();
-                            matched.agent_status = status;
-                            return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                        if wait.match_status {
+                            if let Some(status) = final_status
+                                .filter(|status| wait.until.contains(status))
+                                .or(matched_event_status)
+                            {
+                                let mut matched = wait.initial.clone();
+                                matched.agent_status = status;
+                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                            }
                         }
                         return agent_wait_not_running(request_id)
                             .map(AgentWaitOutcome::Response)
@@ -425,7 +666,10 @@ fn wait_for_resolved_agent(
                     agent_status,
                     ..
                 } if event_pane == pane_id => {
-                    if wait.accept_transient_status && wait.until.contains(&agent_status) {
+                    if wait.match_status
+                        && wait.accept_transient_status
+                        && wait.until.contains(&agent_status)
+                    {
                         matched_event_status = Some(agent_status);
                     }
                     should_probe = true;
@@ -473,13 +717,56 @@ fn wait_for_resolved_agent(
                     .map(AgentWaitOutcome::Response)
                     .map(Some);
             }
-            if let Some(status) = matched_event_status {
-                let mut matched = current;
-                matched.agent_status = status;
-                return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+            if wait.match_status {
+                if let Some(status) = matched_event_status {
+                    let mut matched = current;
+                    matched.agent_status = status;
+                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                }
+                if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
+                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                }
             }
-            if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
-                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+        }
+
+        if wait.rejection_probe.is_some() || wait.acceptance_probe.is_some() {
+            if let Ok(screen) = read_agent_screen(&request_id, &wait.target, api_tx) {
+                if let Some(probe) = &wait.rejection_probe {
+                    if std::time::Instant::now() >= probe.earliest {
+                        if let Some(evidence) = prompt_not_submitted_evidence(
+                            &screen,
+                            &probe.needle,
+                            probe.baseline,
+                            probe.expected_agent,
+                        ) {
+                            not_submitted_streak += 1;
+                            if not_submitted_streak >= NOT_SUBMITTED_STREAK {
+                                let current = agent_get(&request_id, &wait.target, api_tx)
+                                    .unwrap_or_else(|_| wait.initial.clone());
+                                return agent_prompt_not_submitted(&request_id, &current, evidence)
+                                    .map(AgentWaitOutcome::Response)
+                                    .map(Some);
+                            }
+                        } else {
+                            not_submitted_streak = 0;
+                        }
+                    }
+                }
+
+                if let Some(probe) = &wait.acceptance_probe {
+                    if std::time::Instant::now() >= probe.earliest {
+                        if prompt_acceptance_evidence(&screen, probe) {
+                            acceptance_streak += 1;
+                            if acceptance_streak >= probe.required_streak() {
+                                let current = agent_get(&request_id, &wait.target, api_tx)
+                                    .unwrap_or_else(|_| wait.initial.clone());
+                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                            }
+                        } else {
+                            acceptance_streak = 0;
+                        }
+                    }
+                }
             }
         }
 
@@ -502,7 +789,9 @@ fn wait_for_resolved_agent(
                     .map(AgentWaitOutcome::Response)
                     .map(Some);
             }
-            if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
+            if wait.match_status
+                && agent_wait_matches(&current, &wait.until, wait.after_state_change_seq)
+            {
                 return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
             }
             return agent_wait_timeout(request_id, wait.timeout_kind, &current)
@@ -661,7 +950,16 @@ fn agent_wait_timeout(
             (
                 "agent_prompt_stalled",
                 format!(
-                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; current status is {status}"
+                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; input was written and may still be in the agent's input box, so check the agent before resending (current status is {status})"
+                ),
+            )
+        }
+        AgentWaitTimeoutKind::PromptAcceptance { timeout_ms } => {
+            let status = format!("{:?}", current.agent_status).to_ascii_lowercase();
+            (
+                "agent_prompt_stalled",
+                format!(
+                    "agent prompt was written but no acceptance evidence was observed within {timeout_ms} ms; the input may still be in the agent's input box and must not be resent without checking the agent (current status is {status})"
                 ),
             )
         }
@@ -850,5 +1148,142 @@ mod tests {
         let unavailable: ErrorResponse = serde_json::from_str(&unavailable).unwrap();
         assert_eq!(unavailable.id, "wait");
         assert_eq!(unavailable.error.code, "server_unavailable");
+    }
+
+    fn test_agent() -> crate::api::schema::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": "term_1",
+            "agent_status": "idle",
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": "w1:p1",
+            "focused": true,
+            "revision": 0
+        }))
+        .expect("test agent")
+    }
+
+    #[test]
+    fn prompt_success_has_no_outcome_fields() {
+        let response = agent_prompt_success("req".into(), test_agent()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_prompted");
+        assert!(response["result"].get("outcome").is_none());
+        assert!(response["result"].get("merged_draft").is_none());
+    }
+
+    #[test]
+    fn not_submitted_evidence_is_the_current_composer_text_only() {
+        let needle = "hello";
+        assert_eq!(
+            prompt_not_submitted_evidence(
+                "Unrecognized command 'hello'\n",
+                needle,
+                1,
+                Some(crate::detect::Agent::Codex)
+            ),
+            None,
+            "a stale rejection line must not count against the baseline"
+        );
+        assert_eq!(
+            prompt_not_submitted_evidence("Unrecognized command 'hello'\n", needle, 0, None),
+            None,
+            "the generic path must not classify a rejection without composer evidence"
+        );
+        assert_eq!(
+            prompt_not_submitted_evidence(
+                "\u{203a} hello\n",
+                needle,
+                0,
+                Some(crate::detect::Agent::Codex)
+            ),
+            Some("the text is still in the agent's input box")
+        );
+        assert_eq!(
+            prompt_not_submitted_evidence(
+                "\u{203a} /moXYZ-not-a-command\n",
+                "/moXYZ-not-a-command",
+                0,
+                Some(crate::detect::Agent::Codex)
+            ),
+            Some("the text is still in the agent's input box")
+        );
+        assert_eq!(
+            prompt_not_submitted_evidence(
+                "idle screen",
+                needle,
+                0,
+                Some(crate::detect::Agent::Codex)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_effect_timeout_respects_caller_budget() {
+        assert!(matches!(
+            prompt_effect_timeout(Some(500), true),
+            (500, AgentWaitTimeoutKind::Status)
+        ));
+        assert!(matches!(
+            prompt_effect_timeout(None, true),
+            (
+                5000,
+                AgentWaitTimeoutKind::PromptAcceptance { timeout_ms: 5000 }
+            )
+        ));
+        assert!(matches!(
+            prompt_effect_timeout(None, false),
+            (
+                5000,
+                AgentWaitTimeoutKind::PromptStalled { timeout_ms: 5000 }
+            )
+        ));
+    }
+
+    #[test]
+    fn acceptance_evidence_requires_queued_message_or_cleared_composer() {
+        let queued = PromptAcceptanceProbe {
+            mode: PromptAcceptanceMode::QueuedEvidence,
+            needle: "hello".into(),
+            baseline: 0,
+            earliest: std::time::Instant::now(),
+            expected_agent: Some(crate::detect::Agent::Codex),
+        };
+        assert!(prompt_acceptance_evidence(
+            "• Messages to be submitted after next tool call\n  hello\n",
+            &queued
+        ));
+        assert!(!prompt_acceptance_evidence("\u{203a} hello\n", &queued));
+
+        let cleared = PromptAcceptanceProbe {
+            mode: PromptAcceptanceMode::ComposerCleared,
+            needle: "hello".into(),
+            baseline: 0,
+            earliest: std::time::Instant::now(),
+            expected_agent: Some(crate::detect::Agent::Codex),
+        };
+        assert!(prompt_acceptance_evidence(
+            "hello\n\n\u{203a} Ask Codex to do anything\n",
+            &cleared
+        ));
+        assert!(!prompt_acceptance_evidence("\u{203a} hello\n", &cleared));
+    }
+
+    #[test]
+    fn stalled_timeout_says_input_was_written() {
+        let response = agent_wait_timeout(
+            "req".into(),
+            AgentWaitTimeoutKind::PromptStalled { timeout_ms: 5000 },
+            &test_agent(),
+        )
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "agent_prompt_stalled");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("input was written"),
+            "stalled message should say the input was written: {message}"
+        );
     }
 }

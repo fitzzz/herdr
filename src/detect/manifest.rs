@@ -120,11 +120,38 @@ pub struct RuleEvidence {
     pub region_preview: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerState {
+    SelectionList,
+    PartialCommand,
+    Draft,
+    QueuedEvidence,
+}
+
+impl ComposerState {
+    /// Short, agent-neutral reason used when Herdr refuses to write a prompt.
+    pub fn refusal_reason(self) -> Option<&'static str> {
+        match self {
+            Self::SelectionList => Some("a selection list is open"),
+            Self::PartialCommand => Some("a slash command is already in the input box"),
+            Self::Draft => Some("unsent typed text is present in the agent's input box"),
+            Self::QueuedEvidence => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ComposerMatch {
+    pub state: ComposerState,
+    pub region_text: String,
+}
+
 #[derive(Debug, Clone)]
 struct LoadedManifest {
     manifest: AgentManifest,
     // Keep Regex search caches warm across manifest loads and pane polling.
     compiled_rules: Arc<[CompiledRule]>,
+    compiled_composer: Arc<[CompiledRule]>,
     source: ManifestSource,
     warning: Option<String>,
     cached_remote_version: Option<String>,
@@ -148,6 +175,54 @@ pub(crate) struct AgentManifest {
     aliases: Vec<String>,
     #[serde(default)]
     rules: Vec<ManifestRule>,
+    #[serde(default)]
+    composer: Vec<ManifestComposerRule>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct ManifestComposerRule {
+    id: String,
+    state: ManifestComposerState,
+    #[serde(default)]
+    priority: i32,
+    #[serde(default = "default_region")]
+    region: String,
+    /// Only valid with state = "queued_evidence".
+    #[serde(default)]
+    requires_submitted_text: bool,
+    #[serde(default)]
+    all: Vec<ManifestGate>,
+    #[serde(default)]
+    any: Vec<ManifestGate>,
+    #[serde(default, rename = "not")]
+    not_gate: Vec<ManifestGate>,
+    #[serde(default)]
+    contains: Vec<String>,
+    #[serde(default)]
+    regex: Vec<String>,
+    #[serde(default)]
+    line_regex: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ManifestComposerState {
+    SelectionList,
+    PartialCommand,
+    Draft,
+    QueuedEvidence,
+}
+
+impl From<ManifestComposerState> for ComposerState {
+    fn from(value: ManifestComposerState) -> Self {
+        match value {
+            ManifestComposerState::SelectionList => Self::SelectionList,
+            ManifestComposerState::PartialCommand => Self::PartialCommand,
+            ManifestComposerState::Draft => Self::Draft,
+            ManifestComposerState::QueuedEvidence => Self::QueuedEvidence,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -414,6 +489,90 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
         };
     };
     explain(agent, screen_content)
+}
+
+pub fn composer_match(agent: Agent, input: DetectionInput<'_>) -> Option<ComposerMatch> {
+    let loaded = load_manifest(agent)?;
+    let mut best: Option<(&ManifestComposerRule, String)> = None;
+    for (rule, compiled_rule) in loaded
+        .manifest
+        .composer
+        .iter()
+        .zip(loaded.compiled_composer.iter())
+    {
+        if rule.state == ManifestComposerState::QueuedEvidence {
+            continue;
+        }
+        let region_text = region(input, &rule.region);
+        if !compiled_rule_matches(compiled_rule, region_text) {
+            continue;
+        }
+        match &best {
+            Some((previous, _)) if previous.priority >= rule.priority => {}
+            _ => best = Some((rule, region_text.to_string())),
+        }
+    }
+    best.map(|(rule, region_text)| ComposerMatch {
+        state: rule.state.into(),
+        region_text,
+    })
+}
+
+pub fn composer_evidence_supported(agent: Agent) -> bool {
+    load_manifest(agent).is_some_and(|loaded| !loaded.manifest.composer.is_empty())
+}
+
+pub fn queued_evidence_supported(agent: Agent) -> bool {
+    load_manifest(agent).is_some_and(|loaded| {
+        loaded
+            .manifest
+            .composer
+            .iter()
+            .any(|rule| rule.state == ManifestComposerState::QueuedEvidence)
+    })
+}
+
+pub fn composer_queued_evidence(agent: Agent, input: DetectionInput<'_>, needle: &str) -> bool {
+    let Some(loaded) = load_manifest(agent) else {
+        return false;
+    };
+    let normalized_needle = normalize_composer_text(needle);
+    if normalized_needle.is_empty() {
+        return false;
+    }
+    loaded
+        .manifest
+        .composer
+        .iter()
+        .zip(loaded.compiled_composer.iter())
+        .any(|(rule, compiled_rule)| {
+            if rule.state != ManifestComposerState::QueuedEvidence {
+                return false;
+            }
+            let region_text = region(input, &rule.region);
+            if !normalize_composer_text(region_text).contains(&normalized_needle) {
+                return false;
+            }
+            compiled_rule_matches(compiled_rule, region_text)
+        })
+}
+
+fn normalize_composer_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+/// Count occurrences of `needle` in `haystack` after whitespace-insensitive
+/// lowercase normalization. Used to prove that a submission added new screen
+/// evidence rather than matching text that was already present.
+pub fn composer_text_occurrences(haystack: &str, needle: &str) -> usize {
+    let needle = normalize_composer_text(needle);
+    if needle.is_empty() {
+        return 0;
+    }
+    normalize_composer_text(haystack).matches(&needle).count()
 }
 
 impl DetectionExplain {
@@ -697,9 +856,11 @@ fn loaded_manifest(
     local_override_shadowing_remote: bool,
 ) -> Result<LoadedManifest, String> {
     let compiled_rules = compile_manifest(&manifest)?.into();
+    let compiled_composer = compile_composer_manifest(&manifest)?.into();
     Ok(LoadedManifest {
         manifest,
         compiled_rules,
+        compiled_composer,
         source,
         warning,
         cached_remote_version,
@@ -926,6 +1087,15 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
             manifest.rules.len()
         ));
     }
+    if manifest.composer.len() > MAX_RULES_PER_MANIFEST {
+        return Err(format!(
+            "manifest contains {} composer rules, max is {MAX_RULES_PER_MANIFEST}",
+            manifest.composer.len()
+        ));
+    }
+    if !manifest.composer.is_empty() && manifest.min_engine_version.unwrap_or(0) < 4 {
+        return Err("composer rules require min_engine_version 4".to_string());
+    }
 
     let mut complexity = ManifestComplexity::default();
     for rule in &manifest.rules {
@@ -961,6 +1131,9 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
         validate_rule_gate(rule, &mut complexity)
             .map_err(|err| format!("rule {} has invalid matcher gates: {err}", rule.id))?;
     }
+    for rule in &manifest.composer {
+        validate_composer_rule(rule, &mut complexity)?;
+    }
 
     Ok(())
 }
@@ -976,6 +1149,31 @@ fn validate_rule_gate(
     complexity: &mut ManifestComplexity,
 ) -> Result<(), String> {
     validate_gate(&manifest_gate_from_rule(rule), "rule", 0, complexity)
+}
+
+fn validate_composer_rule(
+    rule: &ManifestComposerRule,
+    complexity: &mut ManifestComplexity,
+) -> Result<(), String> {
+    if rule.id.trim().is_empty() {
+        return Err("manifest composer rule id must not be empty".to_string());
+    }
+    validate_region_name(&rule.region)
+        .map_err(|err| format!("composer rule {} uses invalid region: {err}", rule.id))?;
+    if rule.requires_submitted_text && rule.state != ManifestComposerState::QueuedEvidence {
+        return Err(format!(
+            "composer rule {} uses requires_submitted_text without state = \"queued_evidence\"",
+            rule.id
+        ));
+    }
+    validate_gate(
+        &manifest_gate_from_composer_rule(rule),
+        "composer rule",
+        0,
+        complexity,
+    )
+    .map_err(|err| format!("composer rule {} has invalid matcher gates: {err}", rule.id))?;
+    Ok(())
 }
 
 fn validate_gate(
@@ -1108,6 +1306,8 @@ fn validate_region_name(spec: &str) -> Result<(), String> {
         | "above_prompt_box"
         | "last_non_empty_above_prompt_box"
         | "after_last_horizontal_rule"
+        | "current_prompt_line"
+        | "queued_input_block"
         | "osc_title"
         | "osc_progress" => Ok(()),
         _ if region_count(trimmed, "bottom_lines").is_some()
@@ -1154,6 +1354,17 @@ fn manifest_gate_from_rule(rule: &ManifestRule) -> ManifestGate {
     }
 }
 
+fn manifest_gate_from_composer_rule(rule: &ManifestComposerRule) -> ManifestGate {
+    ManifestGate {
+        all: rule.all.clone(),
+        any: rule.any.clone(),
+        not_gate: rule.not_gate.clone(),
+        contains: rule.contains.clone(),
+        regex: rule.regex.clone(),
+        line_regex: rule.line_regex.clone(),
+    }
+}
+
 fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
     manifest
         .rules
@@ -1162,6 +1373,18 @@ fn compile_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, Strin
             compile_gate(&manifest_gate_from_rule(rule))
                 .map(|gate| CompiledRule { gate })
                 .map_err(|err| format!("rule {} could not be compiled: {err}", rule.id))
+        })
+        .collect()
+}
+
+fn compile_composer_manifest(manifest: &AgentManifest) -> Result<Vec<CompiledRule>, String> {
+    manifest
+        .composer
+        .iter()
+        .map(|rule| {
+            compile_gate(&manifest_gate_from_composer_rule(rule))
+                .map(|gate| CompiledRule { gate })
+                .map_err(|err| format!("composer rule {} could not be compiled: {err}", rule.id))
         })
         .collect()
 }
@@ -1302,6 +1525,8 @@ fn region<'a>(input: DetectionInput<'a>, spec: &str) -> &'a str {
         "above_prompt_box" => above_prompt_box(content),
         "last_non_empty_above_prompt_box" => last_non_empty_line(above_prompt_box(content)),
         "after_last_horizontal_rule" => after_last_horizontal_rule(content),
+        "current_prompt_line" => current_prompt_line(content),
+        "queued_input_block" => queued_input_block(content),
         _ => {
             if let Some(count) = region_count(trimmed, "bottom_lines") {
                 return bottom_lines(content, count);
@@ -1440,6 +1665,27 @@ fn current_codex_prompt_index(lines: &[&str]) -> Option<usize> {
 
 fn codex_prompt_line(line: &str) -> bool {
     line == "›" || line.starts_with("› ")
+}
+
+fn current_prompt_line(content: &str) -> &str {
+    content
+        .lines()
+        .rev()
+        .find(|line| codex_prompt_line(line))
+        .unwrap_or("")
+}
+
+fn queued_input_block(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(index) = lines.iter().rposition(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("queued follow-up inputs")
+            || lower.contains("messages to be submitted after next tool call")
+            || lower.contains("messages to be submitted at end of turn")
+    }) else {
+        return "";
+    };
+    slice_from_line_index(content, &lines, index)
 }
 
 fn codex_block_marker_line(line: &str) -> bool {

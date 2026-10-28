@@ -12,6 +12,12 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+type AgentPromptQueue = (
+    String,
+    crate::api::schema::AgentInfo,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+);
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -185,14 +191,7 @@ impl App {
         &mut self,
         id: String,
         params: AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<AgentPromptQueue, String> {
         if params.text.is_empty() {
             return Err(encode_error(
                 id,
@@ -242,6 +241,36 @@ impl App {
                 format!(
                     "agent {} is no longer the pane foreground process",
                     params.target
+                ),
+            ));
+        }
+        // Check the agent's own input box once per prompt, before any bytes are
+        // written. A selection list, an existing slash command, or unsent typed
+        // text must not be merged into the prompt, so refuse without typing.
+        let composer = crate::detect::composer_match(
+            Some(expected_agent),
+            &runtime.detection_text(),
+            &runtime.agent_osc_title(),
+            &runtime.agent_osc_progress(),
+        );
+        if let Some(composer) = composer.as_ref().filter(|composer| {
+            matches!(
+                composer.state,
+                crate::detect::ComposerState::SelectionList
+                    | crate::detect::ComposerState::PartialCommand
+                    | crate::detect::ComposerState::Draft
+            )
+        }) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!(
+                    "agent {} is not at an empty prompt: {}",
+                    params.target,
+                    composer
+                        .state
+                        .refusal_reason()
+                        .unwrap_or("the composer is not ready")
                 ),
             ));
         }
@@ -718,6 +747,179 @@ mod tests {
             .is_err(),
             "blocked prompt wrote or scheduled terminal input"
         );
+    }
+
+    struct ManifestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for ManifestGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            crate::detect::manifest::reload_manifests();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn install_codex_composer_manifest() -> ManifestGuard {
+        let lock = crate::config::test_config_env_lock().lock().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-t3-app-manifest-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir
+            .join(crate::config::app_dir_name())
+            .join("agent-detection");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("codex.toml"),
+            r#"id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 4
+updated_at = "2026-06-10T12:00:00Z"
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "selection"
+state = "selection_list"
+priority = 3
+region = "whole_recent"
+contains = ["TEST-SELECTION"]
+
+[[composer]]
+id = "partial"
+state = "partial_command"
+priority = 2
+region = "whole_recent"
+contains = ["TEST-PARTIAL"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+priority = 1
+region = "whole_recent"
+contains = ["TEST-DRAFT"]
+"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        crate::detect::manifest::reload_manifests();
+        ManifestGuard {
+            _lock: lock,
+            previous,
+            dir,
+        }
+    }
+
+    fn codex_agent_with_screen(
+        screen: &[u8],
+    ) -> (App, tokio::sync::mpsc::Receiver<Bytes>, ManifestGuard) {
+        let guard = install_codex_composer_manifest();
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, screen, 4,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, rx, guard)
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_a_codex_selection_list_without_writing() {
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-SELECTION\n");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("selection list"),
+            "message should name the composer state: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_a_partial_slash_command_without_writing() {
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-PARTIAL\n");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("slash command"),
+            "message should name the composer state: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_refuses_unsent_typed_text_without_writing() {
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-DRAFT\n");
+
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "req",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(
+            error.error.message.contains("unsent typed text"),
+            "message should name the unsent text: {}",
+            error.error.message
+        );
+        assert!(
+            !error.error.message.contains("draft"),
+            "message must not echo the draft: {}",
+            error.error.message
+        );
+        assert!(rx.try_recv().is_err(), "refused prompt wrote input");
     }
 
     #[tokio::test]

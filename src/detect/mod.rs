@@ -6,6 +6,8 @@
 pub mod manifest;
 pub mod manifest_update;
 
+pub use manifest::{ComposerMatch, ComposerState};
+
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentState {
@@ -439,6 +441,52 @@ pub fn detect_agent_with_osc(
             osc_title,
             osc_progress,
         },
+    )
+}
+
+pub fn composer_match(
+    agent: Option<Agent>,
+    screen: &str,
+    osc_title: &str,
+    osc_progress: &str,
+) -> Option<ComposerMatch> {
+    let agent = agent?;
+    manifest::composer_match(
+        agent,
+        manifest::DetectionInput {
+            screen,
+            osc_title,
+            osc_progress,
+        },
+    )
+}
+
+pub fn composer_evidence_supported(agent: Option<Agent>) -> bool {
+    agent.is_some_and(manifest::composer_evidence_supported)
+}
+
+pub fn queued_evidence_supported(agent: Option<Agent>) -> bool {
+    agent.is_some_and(manifest::queued_evidence_supported)
+}
+
+pub fn composer_queued_evidence(
+    agent: Option<Agent>,
+    screen: &str,
+    osc_title: &str,
+    osc_progress: &str,
+    needle: &str,
+) -> bool {
+    let Some(agent) = agent else {
+        return false;
+    };
+    manifest::composer_queued_evidence(
+        agent,
+        manifest::DetectionInput {
+            screen,
+            osc_title,
+            osc_progress,
+        },
+        needle,
     )
 }
 

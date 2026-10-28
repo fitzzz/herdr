@@ -10868,6 +10868,11 @@
               "description": "Managed launcher start and persisted recovery are both supported.",
               "type": "boolean"
             },
+            "agent_prompt_outcome": {
+              "default": false,
+              "description": "`agent.prompt` reports a truthful submission outcome: it refuses a busy\ncomposer with `agent_not_ready`, answers `agent_prompt_stalled` when\nacceptance evidence is missing, and answers `agent_prompt_not_submitted`\nwhen the text stayed in the composer or was rejected. A success answer\nmeans acceptance was observed.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

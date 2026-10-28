@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.09.23.1"
-min_engine_version = 3
-updated_at = "2026-09-23T22:12:00Z"
+version = "2026.10.27.1"
+min_engine_version = 4
+updated_at = "2026-10-27T18:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -38,8 +38,20 @@ priority = 950
 region = "top_non_empty_lines(20)"
 visible_blocker = true
 all = [
-  { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
-  { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+  { any = [
+    { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
+    { contains = ["Folder access"] },
+  ] },
+  { any = [
+    { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+    { all = [
+      { contains = ["Trust this folder?", "Codex can read, edit, and run files here"] },
+      { any = [
+        { contains = ["Trust and continue"] },
+        { contains = ["enter continue"] },
+      ] },
+    ] },
+  ] },
 ]
 
 [[rules]]
@@ -48,8 +60,19 @@ state = "blocked"
 priority = 950
 region = "bottom_non_empty_lines(20)"
 visible_blocker = true
-contains = ["Update available!", "Update now"]
-regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z']
+# Keep the legacy dialog; the shared picker (0.159+) has a different heading
+# and footer. Choices can scroll out of a short viewport, but both gates must
+# remain visible. The passive update history notice has neither picker footer.
+any = [
+  { all = [
+    { contains = ["Update available!", "Update now"] },
+    { regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z'] },
+  ] },
+  { all = [
+    { regex = ['(?m)^\s*Update\s+available\s+·'] },
+    { regex = ['enter\s+continue\s+·\s+esc\s+skip\s*\z'] },
+  ] },
+]
 
 [[rules]]
 id = "live_strong_blocker"
@@ -92,3 +115,55 @@ any = [{ contains = [" to interrupt)"] }, { contains = ["s)"] }]
 regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
 # A failed reconnect keeps its final elapsed timer but is no longer working.
 not = [{ line_regex = ['^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$'] }]
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+regex = ['\S']
+not = [
+  { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
+  { contains = ["Action Required"] },
+]
+
+# Composer evidence: the agent's own input box, independent of agent status.
+# Captured from codex-cli 0.163.0 with `herdr agent read --source detection --format text`.
+
+[[composer]]
+id = "selection_list"
+state = "selection_list"
+priority = 1000
+region = "bottom_non_empty_lines(16)"
+all = [
+  { regex = ['(?m)^\s*(?:Select Model and Effort|Select Reasoning Level)\s*$'] },
+  { contains = ["enter select · esc back"] },
+]
+
+[[composer]]
+id = "partial_command"
+state = "partial_command"
+priority = 900
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+/[^\r\n]*$']
+
+[[composer]]
+id = "draft_text"
+state = "draft"
+priority = 600
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n][^\r\n]*$']
+not = [{ regex = ['(?m)^›[ \t]+Ask Codex to do anything[ \t]*$'] }]
+
+[[composer]]
+id = "queued_message"
+state = "queued_evidence"
+priority = 100
+region = "queued_input_block"
+requires_submitted_text = true
+any = [
+  { contains = ["Queued follow-up inputs"] },
+  { contains = ["Messages to be submitted after next tool call"] },
+  { contains = ["Messages to be submitted at end of turn"] },
+]
