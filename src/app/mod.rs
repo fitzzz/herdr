@@ -134,6 +134,8 @@ pub struct App {
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
+    /// `[session] account_launcher`, with `~` expanded.
+    account_launcher: Option<std::path::PathBuf>,
     next_agent_resume_at: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
@@ -194,6 +196,11 @@ fn agent_panel_sort_from_config(
         crate::config::AgentPanelSortConfig::Spaces => state::AgentPanelSort::Spaces,
         crate::config::AgentPanelSortConfig::Priority => state::AgentPanelSort::Priority,
     }
+}
+
+fn account_launcher_from_config(path: Option<&str>) -> Option<std::path::PathBuf> {
+    path.filter(|path| !path.trim().is_empty())
+        .map(crate::worktree::expand_tilde_path)
 }
 
 /// Parse the configured agent name list into a deduplicated set of `Agent`
@@ -599,6 +606,9 @@ impl App {
             startup_per_agent_delay: Duration::from_millis(
                 config.session.startup_per_agent_delay_ms.into(),
             ),
+            account_launcher: account_launcher_from_config(
+                config.session.account_launcher.as_deref(),
+            ),
             next_agent_resume_at: None,
             session_save_deadline: None,
             session_save_thread: None,
@@ -859,6 +869,15 @@ impl App {
         {
             diagnostics.push(
                 "session.startup_per_agent_delay_ms changes require restarting Herdr; kept current setting"
+                    .into(),
+            );
+        }
+        if !invalid_section("session")
+            && account_launcher_from_config(config.session.account_launcher.as_deref())
+                != self.account_launcher
+        {
+            diagnostics.push(
+                "session.account_launcher changes require restarting Herdr; kept current setting"
                     .into(),
             );
         }

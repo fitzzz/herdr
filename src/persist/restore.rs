@@ -1200,7 +1200,9 @@ fn restore_plan_for_snapshot(
 /// resume the agent or the pane's directory is missing. Without a resume command the seed keeps the mark from
 /// the saved session. A native restore that fell back to the bare command keeps
 /// its options unknown, so the next save does not record the bare command as
-/// the agent's launch options.
+/// the agent's launch options. The saved account launcher account is seeded
+/// with the options, also when the options are unknown, so restore can run
+/// the agent on it and the next save keeps it.
 fn restored_agent_launch(
     session: Option<&PaneAgentSessionSnapshot>,
     native_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
@@ -1217,12 +1219,16 @@ fn restored_agent_launch(
         Some(crate::agent_resume::LaunchOptionsRestore::Kept) => false,
         None => session.resumed_without_launch_options,
     };
+    let account = session
+        .launch_account
+        .as_deref()
+        .and_then(|account| crate::agent_resume::launch_account(agent, account));
     let options = match (&session.launch_options, native_restore) {
         (Some(saved), _) => crate::agent_resume::AgentLaunchOptions::Known(saved.clone()),
         (None, Some(crate::agent_resume::LaunchOptionsRestore::NotKept(reason))) => {
             crate::agent_resume::AgentLaunchOptions::Unavailable(reason)
         }
-        (None, _) if resumed_without_options => {
+        (None, _) if resumed_without_options || account.is_some() => {
             crate::agent_resume::AgentLaunchOptions::Unavailable(
                 crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
             )
@@ -1233,6 +1239,7 @@ fn restored_agent_launch(
         agent,
         options,
         resumed_without_options,
+        account,
         launch: match (
             native_restore,
             persisted_agent_session_from_snapshot(session)?.session_ref,
@@ -1605,6 +1612,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
 
@@ -1623,6 +1631,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true, "sh", None).is_none());
@@ -1637,6 +1646,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let mut resumed = HashSet::new();
@@ -1661,6 +1671,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
@@ -1696,6 +1707,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
@@ -1743,6 +1755,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: format!("{agent}-session"),
             launch_options,
+            launch_account: None,
             resumed_without_launch_options: false,
         }
     }
@@ -1850,6 +1863,7 @@ mod tests {
                     placeholder_launch_options()
                 ),
                 resumed_without_options: false,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
             })
         );
@@ -1883,6 +1897,7 @@ mod tests {
                     placeholder_launch_options()
                 ),
                 resumed_without_options: false,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started {
                     session: seeded_session("claude")
                 }
@@ -1906,6 +1921,7 @@ mod tests {
         use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
 
         let flagged = |launch_options| super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_account: None,
             resumed_without_launch_options: true,
             ..launch_options_session("claude", launch_options)
         };
@@ -1915,6 +1931,7 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Paired {
                     process: ProcessInstance::unknown_start(4242),
                     session: seeded_session("claude").unwrap()
@@ -1932,6 +1949,7 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Paired {
                     process: ProcessInstance::unknown_start(4242),
                     session: seeded_session("claude").unwrap()
@@ -1955,6 +1973,7 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
             })
         );
@@ -1994,6 +2013,7 @@ mod tests {
                 agent: crate::detect::Agent::Claude,
                 options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started {
                     session: seeded_session("claude")
                 }
@@ -2032,6 +2052,7 @@ mod tests {
                     agent: crate::detect::Agent::Codex,
                     options: AgentLaunchOptions::Known(placeholder_launch_options()),
                     resumed_without_options: bare_resume,
+                    account: None,
                     launch: crate::terminal::SeededLaunch::Started {
                         session: seeded_session("codex")
                     }
@@ -2060,6 +2081,7 @@ mod tests {
                 agent: crate::detect::Agent::Codex,
                 options: AgentLaunchOptions::Known(placeholder_launch_options()),
                 resumed_without_options: false,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Saved(seeded_session("codex").unwrap())
             })
         );
@@ -2303,6 +2325,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
@@ -2401,6 +2424,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
@@ -2437,6 +2461,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
 
@@ -2455,6 +2480,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let mut resumed = HashSet::new();
@@ -2491,6 +2517,7 @@ mod tests {
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
 
         pane.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_account: None,
             resumed_without_launch_options: true,
             ..launch_options_session("codex", None)
         });
@@ -2528,6 +2555,7 @@ mod tests {
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
                 launch_options: None,
+                launch_account: None,
                 resumed_without_launch_options: false,
             });
             let (events, _rx) = mpsc::channel(32);
@@ -2620,6 +2648,7 @@ mod tests {
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
                                 launch_options: None,
+                                launch_account: None,
                                 resumed_without_launch_options: false,
                             }),
                             agent_resume: None,
@@ -2790,6 +2819,7 @@ mod tests {
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
                 launch_options: None,
+                launch_account: None,
                 resumed_without_launch_options: false,
             }),
             agent_resume: None,
@@ -2945,6 +2975,7 @@ mod tests {
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
                                 launch_options: None,
+                                launch_account: None,
                                 resumed_without_launch_options: false,
                             }),
                             agent_resume: None,
@@ -3174,6 +3205,41 @@ mod tests {
             .expect("the restored pane should save a conversation")
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_saved_launch_account_survives_restore_and_the_next_save() {
+        for (agent, account, options) in [
+            (
+                "claude",
+                "claude:a@example.com",
+                Some(placeholder_launch_options()),
+            ),
+            ("codex", "codex:b@example.com", None),
+        ] {
+            let mut session = launch_options_session(agent, options.clone());
+            session.launch_account = Some(account.into());
+            for resume in [true, false] {
+                let saved =
+                    saved_after_restore(&single_pane_snapshot(session.clone()), resume, |_| {});
+                assert_eq!(
+                    saved.launch_account.as_deref(),
+                    Some(account),
+                    "{agent} {resume}"
+                );
+                assert_eq!(saved.launch_options, options, "{agent} {resume}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_saved_launch_account_of_another_agent_is_dropped() {
+        let mut session = launch_options_session("claude", Some(placeholder_launch_options()));
+        session.launch_account = Some("codex:b@example.com".into());
+        let saved = saved_after_restore(&single_pane_snapshot(session), false, |_| {});
+        assert_eq!(saved.launch_account, None);
+    }
+
     /// Detection reads a Claude the user started by hand with a bypass option,
     /// whose command line resumes `resumed`.
     fn observe_hand_started_bypass(terminal: &mut TerminalState, resumed: Option<&str>) {
@@ -3221,6 +3287,7 @@ mod tests {
     #[cfg(unix)]
     async fn a_restore_without_resume_keeps_the_saved_launch_for_a_later_resume() {
         let flagged = super::super::snapshot::PaneAgentSessionSnapshot {
+            launch_account: None,
             resumed_without_launch_options: true,
             ..launch_options_session("claude", None)
         };
@@ -3243,6 +3310,7 @@ mod tests {
     ) {
         for flagged in [false, true] {
             let snapshot = single_pane_snapshot(super::super::snapshot::PaneAgentSessionSnapshot {
+                launch_account: None,
                 resumed_without_launch_options: flagged,
                 ..launch_options_session("claude", Some(placeholder_launch_options()))
             });
@@ -3385,6 +3453,7 @@ mod tests {
                         agent: crate::detect::Agent::Claude,
                         options: not_recorded,
                         resumed_without_options: true,
+                        account: None,
                         launch: crate::terminal::SeededLaunch::Started {
                             session: crate::agent_resume::AgentSessionRef::id("claude-session"),
                         },
@@ -3498,6 +3567,7 @@ mod tests {
                             placeholder_launch_options(),
                         ),
                         resumed_without_options: false,
+                        account: None,
                         launch: crate::terminal::SeededLaunch::Started {
                             session: seeded_session("claude"),
                         },
@@ -3656,6 +3726,7 @@ mod tests {
                     placeholder_launch_options(),
                 ),
                 resumed_without_options: false,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started {
                     session: crate::agent_resume::AgentSessionRef::id("claude-session"),
                 },

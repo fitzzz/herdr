@@ -1047,6 +1047,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started { session: None },
             });
             app.terminals.insert(terminal_id, terminal_state);
@@ -1358,6 +1359,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started { session: None },
             });
             let area = Rect::new(0, 0, 40, 8);
@@ -1422,6 +1424,7 @@ mod tests {
                     crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                 ),
                 resumed_without_options: true,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started { session: None },
             });
         let area = Rect::new(0, 0, 40, 8);

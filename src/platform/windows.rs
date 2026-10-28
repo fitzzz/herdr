@@ -1459,6 +1459,11 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
 }
 
+/// A process's environment is not read on Windows.
+pub(crate) fn process_environment_value(_pid: u32, _name: &str) -> Option<Option<String>> {
+    None
+}
+
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
     let process_parameters = read_process_parameters(process.0)?;

@@ -156,6 +156,11 @@ pub struct PaneAgentSessionSnapshot {
     /// repeat them. Absent in files from older Herdr versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_options: Option<Vec<String>>,
+    /// The `agent-accounts` account the Claude or Codex process ran under
+    /// (`AGENT_ACCOUNTS_ID`), so restore can run it on that account again.
+    /// Absent when unknown and in files from older Herdr versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_account: Option<String>,
     /// The agent was resumed by a restore that fell back to the bare resume
     /// command, so its launch options are not known. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -398,6 +403,7 @@ fn capture_tab(
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
                         launch_options: terminal.launch_options_for_session(&authority.agent_label),
+                        launch_account: terminal.launch_account_for_session(&authority.agent_label),
                         resumed_without_launch_options: terminal
                             .resumed_without_launch_options_for_session(&authority.agent_label),
                     });
@@ -412,6 +418,7 @@ fn capture_tab(
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
                     launch_options: terminal.launch_options_for_session(&session.agent),
+                    launch_account: terminal.launch_account_for_session(&session.agent),
                     resumed_without_launch_options: terminal
                         .resumed_without_launch_options_for_session(&session.agent),
                 })
@@ -1570,6 +1577,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "session-1".into(),
             launch_options: Some(vec!["-c".into(), "placeholder_key=placeholder".into()]),
+            launch_account: None,
             resumed_without_launch_options: false,
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -1589,7 +1597,19 @@ mod tests {
             r#"{"source":"herdr:claude","agent":"claude","kind":"id","value":"session-1"}"#;
         let old: PaneAgentSessionSnapshot = serde_json::from_str(old_json).unwrap();
         assert_eq!(old.launch_options, None);
+        assert_eq!(old.launch_account, None);
         assert_eq!(old.value, "session-1");
+        assert!(!json.contains("launch_account"));
+        let with_account = PaneAgentSessionSnapshot {
+            launch_account: Some("claude:a@example.com".into()),
+            ..old
+        };
+        let json = serde_json::to_string(&with_account).unwrap();
+        assert!(json.contains(r#""launch_account":"claude:a@example.com""#));
+        assert_eq!(
+            serde_json::from_str::<PaneAgentSessionSnapshot>(&json).unwrap(),
+            with_account
+        );
     }
 
     #[test]
@@ -1609,6 +1629,7 @@ mod tests {
                         crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
                     ),
                     resumed_without_options: flagged,
+                    account: None,
                     launch: crate::terminal::SeededLaunch::Started {
                         session: crate::agent_resume::AgentSessionRef::id("session-1"),
                     },
@@ -1638,6 +1659,7 @@ mod tests {
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "session-1".into(),
             launch_options: None,
+            launch_account: None,
             resumed_without_launch_options: true,
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -1648,6 +1670,7 @@ mod tests {
         );
 
         let unflagged = PaneAgentSessionSnapshot {
+            launch_account: None,
             resumed_without_launch_options: false,
             ..session
         };

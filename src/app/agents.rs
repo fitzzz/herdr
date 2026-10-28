@@ -242,6 +242,7 @@ impl App {
                 agent: kind,
                 options,
                 resumed_without_options: false,
+                account: None,
                 launch: crate::terminal::SeededLaunch::Started {
                     session: persisted_agent_session
                         .as_ref()

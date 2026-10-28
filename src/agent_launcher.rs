@@ -56,6 +56,31 @@ impl Drop for TestDirectory {
     }
 }
 
+/// The launcher restore runs a Claude or Codex agent through to put it back
+/// on `account`, as `agent-accounts` itself relaunches one:
+/// `<executable> run <agent> --account <account> -- <resume arguments>`,
+/// with the account required so a missing login stops the launch instead of
+/// choosing another account.
+pub(crate) fn account_launcher(
+    executable: &std::path::Path,
+    agent: &str,
+    account: &str,
+) -> AgentLauncher {
+    AgentLauncher {
+        executable: executable.to_string_lossy().into_owned(),
+        prefix_args: ["run", agent, "--account", account, "--"]
+            .map(String::from)
+            .to_vec(),
+        env: [
+            (crate::agent_resume::LAUNCH_ACCOUNT_ENV, account),
+            ("AGENT_ACCOUNTS_REQUIRED", "1"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect(),
+    }
+}
+
 impl AgentLauncher {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if !std::path::Path::new(&self.executable).is_absolute()

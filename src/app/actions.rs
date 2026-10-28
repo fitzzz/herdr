@@ -1447,6 +1447,7 @@ impl AppState {
                 agent,
                 process,
                 argv,
+                account,
             } => {
                 if let Some(options) =
                     crate::agent_resume::launch_options_from_process_argv(agent, argv.as_deref())
@@ -1461,6 +1462,9 @@ impl AppState {
                             options,
                             resumed_session.as_deref(),
                         );
+                        if let Some(account) = account {
+                            terminal.observe_agent_account(process, account);
+                        }
                         None
                     });
                 }
@@ -3520,6 +3524,7 @@ mod tests {
                 "--permission-mode".into(),
                 option.into(),
             ]),
+            account: None,
         });
     }
 
@@ -3529,6 +3534,7 @@ mod tests {
             agent: Agent::Claude,
             process: ProcessInstance::unknown_start(process_id),
             argv: Some(argv.iter().map(|arg| arg.to_string()).collect()),
+            account: None,
         });
     }
 
@@ -3639,6 +3645,7 @@ mod tests {
                     "--permission-mode".into(),
                     "bypassPermissions".into(),
                 ]),
+                account: None,
             });
             assert_eq!(
                 saved_claude_restore(&state, pane_id),
@@ -3967,6 +3974,7 @@ mod tests {
                 "--model".into(),
                 "placeholder-model".into(),
             ]),
+            account: None,
         });
 
         let terminal_id = state.workspaces[0].panes[&pane_id]

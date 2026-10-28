@@ -706,6 +706,27 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     cmdline_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
 }
 
+/// The value of one environment variable of a process: `None` when the
+/// environment cannot be read, `Some(None)` when the variable is not set.
+/// Only `name` is copied out; every other value is left unread. Inside WSL
+/// the read is skipped, since it can block on an exiting process as the
+/// command line read does.
+pub(crate) fn process_environment_value(pid: u32, name: &str) -> Option<Option<String>> {
+    if running_inside_wsl() {
+        return None;
+    }
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(environ_value(&environ, name))
+}
+
+/// The value of `name` in a NUL-separated `NAME=value` list.
+fn environ_value(environ: &[u8], name: &str) -> Option<String> {
+    environ.split(|&byte| byte == 0).find_map(|entry| {
+        let value = entry.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+        Some(String::from_utf8_lossy(value).into_owned())
+    })
+}
+
 /// Splits `/proc/<pid>/cmdline` into arguments. Every argument ends in a NUL,
 /// so only the empty part after the final one is dropped; empty arguments
 /// such as `--append-system-prompt ''` stay in place.
@@ -2254,6 +2275,25 @@ mod tests {
         assert_eq!(cmdline_argv(b"claude"), Some(vec!["claude".to_string()]));
         assert_eq!(cmdline_argv(b""), None);
         assert_eq!(cmdline_argv(b"\0"), None);
+    }
+
+    #[test]
+    fn environ_value_copies_only_the_named_variable() {
+        let environ =
+            b"HOME=/home/a\0AGENT_ACCOUNTS_ID=claude:a@b.c\0AGENT_ACCOUNTS_ID_OLD=x\0SECRET=s\0";
+        assert_eq!(
+            environ_value(environ, "AGENT_ACCOUNTS_ID").as_deref(),
+            Some("claude:a@b.c")
+        );
+        assert_eq!(
+            environ_value(b"AGENT_ACCOUNTS_ID_OLD=x\0", "AGENT_ACCOUNTS_ID"),
+            None
+        );
+        assert_eq!(
+            environ_value(b"AGENT_ACCOUNTS_ID=\0", "AGENT_ACCOUNTS_ID").as_deref(),
+            Some("")
+        );
+        assert_eq!(environ_value(b"", "AGENT_ACCOUNTS_ID"), None);
     }
 
     #[test]
