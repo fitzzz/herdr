@@ -9549,11 +9549,14 @@ mod tests {
         }
 
         /// What the server knows about a report's sender: its reporter, or
-        /// nothing, when it could not read or place the sender.
+        /// nothing, when it could not read or place the sender of a
+        /// conversation report, or the report is a state report, which
+        /// carries no evidence.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Sender {
             Reporter(Process),
             Unidentified,
+            StateReport,
         }
 
         impl Sender {
@@ -9562,14 +9565,14 @@ mod tests {
                     Self::Reporter(process) => {
                         SessionReportEvidence::Reporter(vec![process.instance()])
                     }
-                    Self::Unidentified => SessionReportEvidence::Unidentified,
+                    Self::Unidentified | Self::StateReport => SessionReportEvidence::Unidentified,
                 }
             }
 
             fn named(self) -> Option<Process> {
                 match self {
                     Self::Reporter(process) => Some(process),
-                    Self::Unidentified => None,
+                    Self::Unidentified | Self::StateReport => None,
                 }
             }
         }
@@ -9603,6 +9606,7 @@ mod tests {
                     Sender::Reporter(Process::Q),
                     Sender::Reporter(Process::P2),
                     Sender::Unidentified,
+                    Sender::StateReport,
                 ] {
                     for accepted in [true, false] {
                         events.push(Event::Report(conversation, sender, accepted));
@@ -9796,12 +9800,23 @@ mod tests {
                     } else {
                         model.sequence
                     };
-                    let took = report_as_the_server_does(
-                        terminal,
-                        conversation.session(),
-                        sequence,
-                        &sender.evidence(),
-                    );
+                    let took = match sender {
+                        // `pane.report_agent` carrying the conversation.
+                        Sender::StateReport => terminal
+                            .set_agent_session_ref(
+                                "herdr:claude".into(),
+                                "claude".into(),
+                                Some(conversation.session()),
+                                Some(sequence),
+                            )
+                            .is_some(),
+                        Sender::Reporter(_) | Sender::Unidentified => report_as_the_server_does(
+                            terminal,
+                            conversation.session(),
+                            sequence,
+                            &sender.evidence(),
+                        ),
+                    };
                     if took != accepted {
                         return Err(format!("the report was accepted: {took}"));
                     }
