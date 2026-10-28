@@ -1049,7 +1049,8 @@ An unknown or mismatched result is not permission to retry or create a replaceme
 
 Same-identity recovery reapplies the launcher to Herdr's existing canonical
 native resume arguments. A confirmed replacement clears the binding; temporary
-missing observations retain it. Missing or invalid launchers refuse recovery.
+missing observations retain it. Missing or invalid launchers refuse recovery, as does
+a launcher command longer than the pane's shell takes in one line.
 Launcher-bearing disk snapshots use JSON version 4 and handoff manifests use
 version 2; ordinary snapshots/manifests remain 3/1. Older binaries reject these
 new versions. Preserve the original state backups before any downgrade; do not
