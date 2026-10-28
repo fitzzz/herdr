@@ -30,7 +30,7 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
 | FR-7 | src/terminal/state.rs | terminal::state::tests::an_unbound_seed_is_not_confirmed_by_a_report_with_no_readable_sender; terminal::state::tests::a_first_observed_process_does_not_take_a_conversation_a_state_report_set (both end with a readable report that pairs the process again) | N/A: it needs a later readable report from the same agent, which a live run cannot force reliably; the automated tests cover it. |
 | FR-8 | src/terminal/state.rs | terminal::state::tests::a_conversation_reported_from_outside_the_pane_is_not_paired_with_the_job; terminal::state::tests::a_report_whose_walk_failed_is_not_paired_with_the_job; terminal::state::tests::a_report_from_a_child_agent_in_the_same_job_is_not_paired_with_its_parent | N/A: no separate user surface; the saved session file is the surface the FR-4 live case reads. |
 | FR-9 | src/terminal/state.rs (`exhaustive_pairing` module) | terminal::state::tests::exhaustive_pairing::exhaustive_pairing_saves_options_only_beside_their_process_conversation: 289,650 sequences up to length 4, 0 failing; the job senders and the known-limit exclusion are gone and `StateReport` events are in the alphabet (`w1/exhaustive-1.log`) | N/A: the exhaustive test is the verification itself. The oracle learns state-report acceptance from the terminal (review finding r1-2) and still checks pairing against the conversation the terminal holds. |
-| FR-10 | tests only, no production code | At base `34018fa6` with the new tests spliced in, 5 of 5 fail (`w1/base-check.log`), including 1,571 failing sequences from `[StateReport(S), Observe(P, Nothing)]`; at the fix commit (now `32baedef`) the four focused tests and the exhaustive test pass (`w1/focused-head.log`: 606 passed) | N/A: the base check is the verification itself; see `w1/base-check.log`. |
+| FR-10 | tests only, no production code | At base `34018fa6` with the new tests spliced in, 5 of 5 fail (`w1/base-check.log`), including 1,571 failing sequences from `[StateReport(S), Observe(P, Nothing)]`; at the fix commit the four focused tests and the exhaustive test pass (`w1/focused-head.log`: 606 passed) | N/A: the base check is the verification itself; see `w1/base-check.log`. |
 | FR-11 | docs/next/website/src/content/docs/session-state.mdx, ja/session-state.mdx, zh-cn/session-state.mdx: the foreground-job cause is replaced by "the report did not reach Herdr over its local API socket" | just docs-contract-test: 7 pass; maintenance-test includes scripts.test_docs_translation_parity: pass (`checks-ci.log`, `checks-docs.log`) | N/A: documentation only; checked by just docs-contract-test and the translation parity test. |
 | FR-12 | no change: the branch touches only src/app/actions.rs, src/app/api/panes.rs, src/persist/restore.rs, src/persist/snapshot.rs and src/terminal/state.rs | N/A: no code can test an absence of edits; the diff shows no hook, integration asset, API schema, codec, fixture or protocol version change | N/A: verified by the diff. |
 | FR-13 | docs/prds/2026-10-19-restore-agent-launch-options/2026-10-19-restore-agent-launch-options-prd-claude.md, Change Log entry of 2026-10-28 07:44:29 EDT | N/A: documentation only | N/A: a documentation record, not a user surface. |
@@ -39,7 +39,7 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
 ### Change Log
 
 - 2026-10-28 07:52:10 EDT - Started implementation of the PRD as written; no change request yet.
-- 2026-10-28 10:16:24 EDT - Verification complete for the fix commit (then `b76db804`, now `32baedef`). `just ci` passed (fmt and clippy
+- 2026-10-28 10:16:24 EDT - Verification complete for the fix commit (originally `b76db804`, rebased twice since). `just ci` passed (fmt and clippy
   clean, 4,298 tests passed and 15 skipped, maintenance, UI hot-path and integration-asset suites) and
   `just docs-contract-test` passed. `just check`'s `windows-lint` did not run because this machine has
   no Windows SDK, the same limit T-2 recorded; no Windows-only code changed. The five new or extended
@@ -72,6 +72,13 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
     `Unidentified` in its two test callers and removing the derive and its `#[default]` attribute. FR-1 to
     FR-14 stay as they were; the fix changes no behavior, and the focused suites and `just ci` were
     rerun for the new head.
+- 2026-10-28 14:23:38 EDT - `origin/main` advanced to `860ab1df` (PR #13: launcher prefix and OpenCode
+  launch-option replay) before the pull request could merge, and GitHub marked it conflicting. The
+  branch was rebased onto it. The conflicts were in `src/app/actions.rs`, `src/app/api/panes.rs` and
+  `src/terminal/state.rs`: the resolution keeps main's new launcher-prefix test and its wording that
+  names OpenCode where the agent list is described, and drops the foreground-job read and variant as
+  this task does. `just ci` passes at the new head (4,320 tests passed, 15 skipped) and
+  `just docs-contract-test` passes.
 
 ## Introduction/Overview
 
