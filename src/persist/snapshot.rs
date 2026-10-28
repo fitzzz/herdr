@@ -1507,7 +1507,7 @@ mod tests {
             });
         }
         // A restored conversation is paired with a process whose command line
-        // resumes it; one a live agent reported, with the process seen next.
+        // resumes it; one a live agent reported, with its reporter.
         if let Some((agent, options)) = launch {
             terminal.observe_agent_launch(
                 agent,
@@ -1515,6 +1515,13 @@ mod tests {
                 options,
                 (!hook_authority).then_some("session-1"),
             );
+            if hook_authority {
+                terminal.sync_agent_launch_session(
+                    &crate::terminal::SessionReportEvidence::Reporter(vec![
+                        ProcessInstance::unknown_start(4242),
+                    ]),
+                );
+            }
         }
         (state, root)
     }
