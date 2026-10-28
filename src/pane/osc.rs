@@ -538,6 +538,23 @@ impl AgentOscStateTracker {
         self.terminal_title = title;
     }
 
+    #[cfg(unix)]
+    pub(super) fn handoff_agent_osc_state(&self) -> crate::handoff_runtime::HandoffAgentOscState {
+        crate::handoff_runtime::HandoffAgentOscState {
+            title: self.latest_title.clone(),
+            progress: self.latest_progress.clone(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn seed_handoff_agent_osc_state(
+        &mut self,
+        state: crate::handoff_runtime::HandoffAgentOscState,
+    ) {
+        self.latest_title = state.title;
+        self.latest_progress = state.progress;
+    }
+
     /// Returns the latest retained OSC title, or `""` if none has been seen or
     /// the last title was an empty clear.
     #[allow(dead_code)] // used by terminal.rs; full call chain wired in Stage C
@@ -1059,6 +1076,41 @@ mod tests {
 
         assert_eq!(tracker.terminal_title(), Some("✳ restored title"));
         assert_eq!(tracker.latest_title(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_agent_osc_state_round_trips_title_and_progress() {
+        let mut exporter = AgentOscStateTracker::default();
+        exporter.observe("\x1b]0;修复🙂标题\x07\x1b]9;4;3;\x07".as_bytes());
+        let state = exporter.handoff_agent_osc_state();
+
+        let mut importer = AgentOscStateTracker::default();
+        importer.seed_handoff_agent_osc_state(state);
+
+        assert_eq!(importer.latest_title(), "修复🙂标题");
+        assert_eq!(importer.latest_progress(), "4;3;");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_agent_osc_state_keeps_cleared_evidence_empty() {
+        let mut exporter = AgentOscStateTracker::default();
+        exporter.observe(b"\x1b]0;previous agent\x07");
+        exporter.clear_retained();
+        let state = exporter.handoff_agent_osc_state();
+        assert_eq!(
+            state,
+            crate::handoff_runtime::HandoffAgentOscState::default()
+        );
+
+        let mut importer = AgentOscStateTracker::default();
+        importer.seed_terminal_title(exporter.terminal_title().map(str::to_string));
+        importer.seed_handoff_agent_osc_state(state);
+
+        assert_eq!(importer.terminal_title(), Some("previous agent"));
+        assert_eq!(importer.latest_title(), "");
+        assert_eq!(importer.latest_progress(), "");
     }
 
     #[test]

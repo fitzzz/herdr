@@ -930,6 +930,9 @@ fn restore_tab(
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                     }
+                    // The imported runtime already holds the title; title syncs
+                    // only follow a change, so publish it now.
+                    terminal.set_terminal_title(runtime.terminal_title());
                 }
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
@@ -3326,6 +3329,21 @@ mod tests {
         snapshot: &SessionSnapshot,
         record: impl FnOnce(&mut TerminalState),
     ) -> TerminalState {
+        handed_off_after_output(snapshot, b"", |_| {}, record)
+            .await
+            .0
+    }
+
+    /// Like `handed_off`, after the old pane printed `output` and with the
+    /// exported runtime state passed through `export`; also returns the OSC
+    /// title the restored runtime holds for agent detection.
+    #[cfg(unix)]
+    async fn handed_off_after_output(
+        snapshot: &SessionSnapshot,
+        output: &[u8],
+        export: impl FnOnce(&mut crate::handoff_runtime::HandoffRuntimeState),
+        record: impl FnOnce(&mut TerminalState),
+    ) -> (TerminalState, String) {
         let (events, _events_rx) = mpsc::channel(32);
         let (workspaces, mut terminals, runtimes) = restore(
             snapshot,
@@ -3347,11 +3365,13 @@ mod tests {
         let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
         let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
         let runtime = runtimes.values().next().unwrap();
+        runtime.test_process_pty_bytes(output);
         runtime
             .pause_handoff_reader(std::time::Duration::from_secs(2))
             .unwrap();
         let mut state = runtime.handoff_runtime_state(pane_id.raw());
         state.agent_launch = agent_launch;
+        export(&mut state);
         let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
         let mut imports = HashMap::from([(
             pane_id.raw(),
@@ -3377,9 +3397,65 @@ mod tests {
             Arc::new(RenderSignal::new()),
         )
         .unwrap();
+        let agent_osc_title = restored_runtimes
+            .values()
+            .next()
+            .map(TerminalRuntime::agent_osc_title)
+            .unwrap_or_default();
         drop(restored_runtimes);
         drop(runtimes);
-        restored_terminals.into_values().next().unwrap()
+        (
+            restored_terminals.into_values().next().unwrap(),
+            agent_osc_title,
+        )
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_the_terminal_title_for_the_api_and_detection() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+
+        let (terminal, agent_osc_title) = handed_off_after_output(
+            &snapshot,
+            "\x1b]0;修复🙂标题\x07".as_bytes(),
+            |_| {},
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(terminal.terminal_title.as_deref(), Some("修复🙂标题"));
+        assert_eq!(agent_osc_title, "修复🙂标题");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_an_empty_terminal_title_empty() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+
+        let (terminal, agent_osc_title) =
+            handed_off_after_output(&snapshot, b"\x1b]0;set\x07\x1b]0;\x07", |_| {}, |_| {}).await;
+
+        assert_eq!(terminal.terminal_title, None);
+        assert_eq!(agent_osc_title, "");
+    }
+
+    /// An exporter that predates the separate agent OSC evidence sends only
+    /// the displayed title, which then stands in for the evidence.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_from_an_older_exporter_seeds_detection_from_the_title() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+
+        let (terminal, agent_osc_title) = handed_off_after_output(
+            &snapshot,
+            b"\x1b]0;codex idle\x07",
+            |state| state.agent_osc = None,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(terminal.terminal_title.as_deref(), Some("codex idle"));
+        assert_eq!(agent_osc_title, "codex idle");
     }
 
     /// The report evidence of a pane whose foreground job runs these Claude

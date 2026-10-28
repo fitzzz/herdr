@@ -2352,6 +2352,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
             terminal_title: self.terminal_title(),
+            agent_osc: Some(self.terminal.handoff_agent_osc_state()),
             initial_history_ansi: None,
             agent_state: None,
             agent_launch: None,
@@ -2567,6 +2568,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi,
             input_state,
             terminal_title,
+            agent_osc,
             initial_history_ansi,
             agent_state: _,
             agent_launch: _,
@@ -2598,7 +2600,14 @@ impl PaneRuntime {
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
         let _ = pane_terminal.apply_host_terminal_appearance(host_terminal_appearance);
+        // An exporter that predates `agent_osc` kept no separate evidence, so
+        // its displayed title is the best evidence of the same agent process.
+        let agent_osc = agent_osc.unwrap_or_else(|| crate::handoff_runtime::HandoffAgentOscState {
+            title: terminal_title.clone(),
+            progress: None,
+        });
         pane_terminal.seed_terminal_title(terminal_title);
+        pane_terminal.seed_handoff_agent_osc_state(agent_osc);
         if let Some(input_state) = input_state {
             pane_terminal.seed_handoff_input_state(input_state);
         }
