@@ -339,12 +339,12 @@ pub fn composer_match(
     )
 }
 
-pub fn queued_evidence_supported(agent: Option<Agent>) -> bool {
-    agent.is_some_and(manifest::queued_evidence_supported)
+pub fn composer_evidence_supported(agent: Option<Agent>) -> bool {
+    agent.is_some_and(manifest::composer_evidence_supported)
 }
 
-pub fn composer_text_occurrences(haystack: &str, needle: &str) -> usize {
-    manifest::composer_text_occurrences(haystack, needle)
+pub fn queued_evidence_supported(agent: Option<Agent>) -> bool {
+    agent.is_some_and(manifest::queued_evidence_supported)
 }
 
 pub fn composer_queued_evidence(

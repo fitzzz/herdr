@@ -121,6 +121,24 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
             check.validate_catalog(website, bundled_manifests, engine_version=3)
 
+    def test_rejects_published_manifest_above_released_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundled = root / "bundled"
+            website = root / "website"
+            bundled.mkdir()
+            website.mkdir()
+            content = manifest("codex", "2026.06.10.1").replace(
+                "min_engine_version = 1", "min_engine_version = 4"
+            )
+            (bundled / "codex.toml").write_text(content)
+            (website / "codex.toml").write_text(content)
+            (website / "index.toml").write_text(catalog())
+
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=4)
+            with self.assertRaisesRegex(check.CheckError, "released engine"):
+                check.validate_catalog(website, bundled_manifests, engine_version=4)
+
     def test_rejects_mutated_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             bundled, website = staged_grok_dirs(Path(tmp))

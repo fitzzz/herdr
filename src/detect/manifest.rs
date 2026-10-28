@@ -129,37 +129,20 @@ pub enum ComposerState {
 }
 
 impl ComposerState {
-    // Kept for manifest diagnostics; the API only needs the state and reason.
-    #[allow(dead_code)]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SelectionList => "selection_list",
-            Self::PartialCommand => "partial_command",
-            Self::Draft => "draft",
-            Self::QueuedEvidence => "queued_evidence",
-        }
-    }
-
     /// Short, agent-neutral reason used when Herdr refuses to write a prompt.
-    pub fn refusal_reason(self) -> &'static str {
+    pub fn refusal_reason(self) -> Option<&'static str> {
         match self {
-            Self::SelectionList => "a selection list is open",
-            Self::PartialCommand => "a slash command is already in the input box",
-            Self::Draft => "unsent typed text is present in the agent's input box",
-            Self::QueuedEvidence => "a queued message is already present",
+            Self::SelectionList => Some("a selection list is open"),
+            Self::PartialCommand => Some("a slash command is already in the input box"),
+            Self::Draft => Some("unsent typed text is present in the agent's input box"),
+            Self::QueuedEvidence => None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-// Provenance fields are part of the public engine contract and are read by tests
-// and future diagnostics; the API currently only needs `state`.
-#[allow(dead_code)]
 pub struct ComposerMatch {
-    pub id: String,
     pub state: ComposerState,
-    pub priority: i32,
-    pub region: String,
     pub region_text: String,
 }
 
@@ -530,12 +513,13 @@ pub fn composer_match(agent: Agent, input: DetectionInput<'_>) -> Option<Compose
         }
     }
     best.map(|(rule, region_text)| ComposerMatch {
-        id: rule.id.clone(),
         state: rule.state.into(),
-        priority: rule.priority,
-        region: rule.region.clone(),
         region_text,
     })
+}
+
+pub fn composer_evidence_supported(agent: Agent) -> bool {
+    load_manifest(agent).is_some_and(|loaded| !loaded.manifest.composer.is_empty())
 }
 
 pub fn queued_evidence_supported(agent: Agent) -> bool {
@@ -1164,7 +1148,7 @@ fn validate_rule_gate(
     rule: &ManifestRule,
     complexity: &mut ManifestComplexity,
 ) -> Result<(), String> {
-    validate_gate(&manifest_gate_from_rule(rule), "rule", 0, complexity, false)
+    validate_gate(&manifest_gate_from_rule(rule), "rule", 0, complexity)
 }
 
 fn validate_composer_rule(
@@ -1182,14 +1166,11 @@ fn validate_composer_rule(
             rule.id
         ));
     }
-    let allow_empty =
-        rule.requires_submitted_text && rule.state == ManifestComposerState::QueuedEvidence;
     validate_gate(
         &manifest_gate_from_composer_rule(rule),
         "composer rule",
         0,
         complexity,
-        allow_empty,
     )
     .map_err(|err| format!("composer rule {} has invalid matcher gates: {err}", rule.id))?;
     Ok(())
@@ -1200,7 +1181,6 @@ fn validate_gate(
     context: &str,
     depth: usize,
     complexity: &mut ManifestComplexity,
-    allow_empty: bool,
 ) -> Result<(), String> {
     if depth > MAX_GATE_DEPTH {
         return Err(format!("{context} exceeds max gate depth {MAX_GATE_DEPTH}"));
@@ -1210,16 +1190,16 @@ fn validate_gate(
         return Err(format!("manifest exceeds max gate count {MAX_TOTAL_GATES}"));
     }
     validate_matcher_limits(gate, context, complexity)?;
-    if !allow_empty && !gate_has_positive_matcher(gate) {
+    if !gate_has_positive_matcher(gate) {
         return Err(format!("{context} must contain a positive matcher"));
     }
     validate_regex_patterns(&gate.regex, context, "regex")?;
     validate_regex_patterns(&gate.line_regex, context, "line_regex")?;
     for nested in &gate.all {
-        validate_gate(nested, "all gate", depth + 1, complexity, false)?;
+        validate_gate(nested, "all gate", depth + 1, complexity)?;
     }
     for nested in &gate.any {
-        validate_gate(nested, "any gate", depth + 1, complexity, false)?;
+        validate_gate(nested, "any gate", depth + 1, complexity)?;
     }
     for nested in &gate.not_gate {
         if !gate_has_any_matcher(nested) {
@@ -1249,10 +1229,10 @@ fn validate_not_gate(
     validate_regex_patterns(&gate.regex, "not gate", "regex")?;
     validate_regex_patterns(&gate.line_regex, "not gate", "line_regex")?;
     for nested in &gate.all {
-        validate_gate(nested, "not all gate", depth + 1, complexity, false)?;
+        validate_gate(nested, "not all gate", depth + 1, complexity)?;
     }
     for nested in &gate.any {
-        validate_gate(nested, "not any gate", depth + 1, complexity, false)?;
+        validate_gate(nested, "not any gate", depth + 1, complexity)?;
     }
     for nested in &gate.not_gate {
         validate_not_gate(nested, depth + 1, complexity)?;
@@ -1327,6 +1307,7 @@ fn validate_region_name(spec: &str) -> Result<(), String> {
         | "last_non_empty_above_prompt_box"
         | "after_last_horizontal_rule"
         | "current_prompt_line"
+        | "queued_input_block"
         | "osc_title"
         | "osc_progress" => Ok(()),
         _ if region_count(trimmed, "bottom_lines").is_some()
@@ -1545,6 +1526,7 @@ fn region<'a>(input: DetectionInput<'a>, spec: &str) -> &'a str {
         "last_non_empty_above_prompt_box" => last_non_empty_line(above_prompt_box(content)),
         "after_last_horizontal_rule" => after_last_horizontal_rule(content),
         "current_prompt_line" => current_prompt_line(content),
+        "queued_input_block" => queued_input_block(content),
         _ => {
             if let Some(count) = region_count(trimmed, "bottom_lines") {
                 return bottom_lines(content, count);
@@ -1691,6 +1673,19 @@ fn current_prompt_line(content: &str) -> &str {
         .rev()
         .find(|line| codex_prompt_line(line))
         .unwrap_or("")
+}
+
+fn queued_input_block(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(index) = lines.iter().rposition(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("queued follow-up inputs")
+            || lower.contains("messages to be submitted after next tool call")
+            || lower.contains("messages to be submitted at end of turn")
+    }) else {
+        return "";
+    };
+    slice_from_line_index(content, &lines, index)
 }
 
 fn codex_block_marker_line(line: &str) -> bool {

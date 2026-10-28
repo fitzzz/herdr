@@ -53,7 +53,7 @@ REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
     r"before_current_prompt_marker|current_prompt_block_marker|after_current_prompt_block_marker|"
     r"prompt_box_body|above_prompt_box|last_non_empty_above_prompt_box|after_last_horizontal_rule|"
-    r"current_prompt_line|"
+    r"current_prompt_line|queued_input_block|"
     r"osc_title|osc_progress|"
     r"bottom_lines\([1-9][0-9]*\)|bottom_non_empty_lines\([1-9][0-9]*\)|"
     r"top_non_empty_lines\([1-9][0-9]*\))$"
@@ -68,6 +68,10 @@ MAX_MATCHERS_PER_GATE = 32
 MAX_TOTAL_MATCHERS = 1024
 MAX_MATCHER_CHARS = 512
 
+# The newest engine that released clients carry. Published manifests must stay
+# loadable by that engine; a newer-engine manifest waits behind a staging entry.
+RELEASED_MANIFEST_ENGINE_VERSION = 3
+
 # Keep engine-2 clients on the OSC-capable manifest until an engine-3 release
 # can consume top_non_empty_lines. Remove this entry when the distribution
 # publishes the bundled Grok manifest.
@@ -76,6 +80,13 @@ STAGED_PUBLISHED_MANIFESTS = {
         "2026.09.18.2",
         "2026.09.18.1",
         "0f31b111144900b02f303577d27587f72d58d8c505185a682bd7887f822316ee",
+    ),
+    # Codex's engine-4 composer rules stay bundled until a released client
+    # carries engine 4. Published clients keep the engine-3 catalog manifest.
+    "codex": (
+        "2026.10.27.1",
+        "2026.10.11.1",
+        "d25cfddb5434259303fb0ac27b5b0e6d0558408e6901ee112bcd53de02bcda13",
     ),
 }
 
@@ -221,12 +232,11 @@ def validate_composer(path: Path, index: int, rule: object, complexity: dict[str
         raise CheckError(
             f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state queued_evidence"
         )
-    allow_empty = requires_submitted_text and state == "queued_evidence"
     validate_gate(
         path,
         f"composer rule {rule_id}",
         rule,
-        require_positive=not allow_empty,
+        require_positive=True,
         depth=0,
         complexity=complexity,
         allowed_keys=COMPOSER_KEYS,
@@ -397,6 +407,13 @@ def validate_catalog(
         if manifest["id"] != agent_id:
             raise CheckError(f"{manifest_path}: id {manifest['id']} does not match catalog {agent_id}")
         seen[agent_id] = rel_path
+
+        if manifest["min_engine_version"] > RELEASED_MANIFEST_ENGINE_VERSION:
+            raise CheckError(
+                f"{manifest_path}: published manifest requires engine "
+                f"{manifest['min_engine_version']} but released engine is "
+                f"{RELEASED_MANIFEST_ENGINE_VERSION}; stage it instead"
+            )
 
         bundled_path, bundled_manifest = bundled[agent_id]
         cmp = compare_versions(manifest["version"], bundled_manifest["version"], manifest_path)

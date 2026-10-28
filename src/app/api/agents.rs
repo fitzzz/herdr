@@ -267,7 +267,10 @@ impl App {
                 format!(
                     "agent {} is not at an empty prompt: {}",
                     params.target,
-                    composer.state.refusal_reason()
+                    composer
+                        .state
+                        .refusal_reason()
+                        .unwrap_or("the composer is not ready")
                 ),
             ));
         }
@@ -746,7 +749,86 @@ mod tests {
         );
     }
 
-    fn codex_agent_with_screen(screen: &[u8]) -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+    struct ManifestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for ManifestGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            crate::detect::manifest::reload_manifests();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn install_codex_composer_manifest() -> ManifestGuard {
+        let lock = crate::config::test_config_env_lock().lock().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-t3-app-manifest-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir
+            .join(crate::config::app_dir_name())
+            .join("agent-detection");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("codex.toml"),
+            r#"id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 4
+updated_at = "2026-06-10T12:00:00Z"
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "selection"
+state = "selection_list"
+priority = 3
+region = "whole_recent"
+contains = ["TEST-SELECTION"]
+
+[[composer]]
+id = "partial"
+state = "partial_command"
+priority = 2
+region = "whole_recent"
+contains = ["TEST-PARTIAL"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+priority = 1
+region = "whole_recent"
+contains = ["TEST-DRAFT"]
+"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        crate::detect::manifest::reload_manifests();
+        ManifestGuard {
+            _lock: lock,
+            previous,
+            dir,
+        }
+    }
+
+    fn codex_agent_with_screen(
+        screen: &[u8],
+    ) -> (App, tokio::sync::mpsc::Receiver<Bytes>, ManifestGuard) {
+        let guard = install_codex_composer_manifest();
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -760,14 +842,12 @@ mod tests {
                 80, 24, 0, screen, 4,
             );
         app.state.insert_test_runtime(pane_id, runtime);
-        (app, rx)
+        (app, rx, guard)
     }
 
     #[tokio::test]
     async fn agent_prompt_refuses_a_codex_selection_list_without_writing() {
-        let (mut app, mut rx) = codex_agent_with_screen(
-            b"  Select Model and Effort\n\n  enter select \xc2\xb7 esc back\n",
-        );
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-SELECTION\n");
 
         let response = run_deferred_agent_prompt(
             &mut app,
@@ -791,7 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_prompt_refuses_a_partial_slash_command_without_writing() {
-        let (mut app, mut rx) = codex_agent_with_screen(b"\xe2\x80\xba /mo\n");
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-PARTIAL\n");
 
         let response = run_deferred_agent_prompt(
             &mut app,
@@ -815,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_prompt_refuses_unsent_typed_text_without_writing() {
-        let (mut app, mut rx) = codex_agent_with_screen(b"\xe2\x80\xba draft\n");
+        let (mut app, mut rx, _guard) = codex_agent_with_screen(b"TEST-DRAFT\n");
 
         let response = run_deferred_agent_prompt(
             &mut app,

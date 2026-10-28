@@ -160,5 +160,10 @@ not = [{ regex = ['(?m)^›[ \t]+Ask Codex to do anything[ \t]*$'] }]
 id = "queued_message"
 state = "queued_evidence"
 priority = 100
-region = "whole_recent"
+region = "queued_input_block"
 requires_submitted_text = true
+any = [
+  { contains = ["Queued follow-up inputs"] },
+  { contains = ["Messages to be submitted after next tool call"] },
+  { contains = ["Messages to be submitted at end of turn"] },
+]

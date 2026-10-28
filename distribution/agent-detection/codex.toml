@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.10.27.1"
-min_engine_version = 4
-updated_at = "2026-10-27T18:00:00Z"
+version = "2026.10.11.1"
+min_engine_version = 3
+updated_at = "2026-10-11T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -127,38 +127,3 @@ not = [
   { regex = ['(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)'] },
   { contains = ["Action Required"] },
 ]
-
-# Composer evidence: the agent's own input box, independent of agent status.
-# Captured from codex-cli 0.163.0 with `herdr agent read --source detection --format text`.
-
-[[composer]]
-id = "selection_list"
-state = "selection_list"
-priority = 1000
-region = "bottom_non_empty_lines(16)"
-all = [
-  { regex = ['(?m)^\s*(?:Select Model and Effort|Select Reasoning Level)\s*$'] },
-  { contains = ["enter select · esc back"] },
-]
-
-[[composer]]
-id = "partial_command"
-state = "partial_command"
-priority = 900
-region = "current_prompt_line"
-regex = ['(?m)^›[ \t]+/[^\r\n]*$']
-
-[[composer]]
-id = "draft_text"
-state = "draft"
-priority = 600
-region = "current_prompt_line"
-regex = ['(?m)^›[ \t]+[^/\r\n][^\r\n]*$']
-not = [{ regex = ['(?m)^›[ \t]+Ask Codex to do anything[ \t]*$'] }]
-
-[[composer]]
-id = "queued_message"
-state = "queued_evidence"
-priority = 100
-region = "whole_recent"
-requires_submitted_text = true

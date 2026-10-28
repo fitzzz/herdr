@@ -838,10 +838,7 @@ contains = ["/"]
             },
         )
         .expect("composer match");
-        assert_eq!(matched.id, "high");
         assert_eq!(matched.state, ComposerState::PartialCommand);
-        assert_eq!(matched.priority, 10);
-        assert_eq!(matched.region, "current_prompt_line");
         assert_eq!(matched.region_text, "› /draft");
     });
 }
@@ -855,15 +852,18 @@ fn queued_evidence_skipped_by_composer_match_and_matches_needle() {
 id = "queued"
 state = "queued_evidence"
 priority = 100
-region = "whole_recent"
+region = "queued_input_block"
 requires_submitted_text = true
+contains = ["Queued follow-up inputs"]
 "#,
         ));
-        let screen = "› first\n\nQueued follow-up inputs\n  Hello World\n";
+        let queued = "› first\n\nQueued follow-up inputs\n  Hello World\n";
+        let composer_only = "› Hello World\n";
+        let needle_before_block = "Hello World\n\nQueued follow-up inputs\n  Other text\n";
         assert!(composer_match(
             Agent::Codex,
             DetectionInput {
-                screen,
+                screen: queued,
                 osc_title: "",
                 osc_progress: "",
             },
@@ -873,7 +873,7 @@ requires_submitted_text = true
         assert!(composer_queued_evidence(
             Agent::Codex,
             DetectionInput {
-                screen,
+                screen: queued,
                 osc_title: "",
                 osc_progress: "",
             },
@@ -882,7 +882,7 @@ requires_submitted_text = true
         assert!(composer_queued_evidence(
             Agent::Codex,
             DetectionInput {
-                screen,
+                screen: queued,
                 osc_title: "",
                 osc_progress: "",
             },
@@ -891,7 +891,25 @@ requires_submitted_text = true
         assert!(!composer_queued_evidence(
             Agent::Codex,
             DetectionInput {
-                screen,
+                screen: composer_only,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "hello world",
+        ));
+        assert!(!composer_queued_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen: needle_before_block,
+                osc_title: "",
+                osc_progress: "",
+            },
+            "hello world",
+        ));
+        assert!(!composer_queued_evidence(
+            Agent::Codex,
+            DetectionInput {
+                screen: queued,
                 osc_title: "",
                 osc_progress: "",
             },
