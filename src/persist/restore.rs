@@ -705,6 +705,7 @@ fn restore_tab(
                 &cwd,
                 saved_history,
                 &mut agent_restore,
+                saved_pane.and_then(|pane| pane.agent_launcher.as_ref()),
             )
         };
         if let Some(plan) = startup.restore_plan.as_mut() {
@@ -1060,6 +1061,7 @@ fn pane_restore_startup<'a>(
     cwd: &std::path::Path,
     history: Option<&'a PaneHistorySnapshot>,
     agent_restore: &mut AgentRestoreState<'_>,
+    launcher: Option<&crate::agent_launcher::BoundAgentLauncher>,
 ) -> PaneRestoreStartup<'a> {
     // Native agent resume owns the conversation history. If a pane has a
     // resumable agent session and resume is enabled, do not replay saved pane
@@ -1070,9 +1072,9 @@ fn pane_restore_startup<'a>(
     } else if let Some(resume) = reported_resume {
         (Some(reported_resume_from_snapshot(resume).plan(cwd)), None)
     } else {
-        match session
-            .and_then(|session| restore_plan_for_snapshot(session, true, &agent_restore.shell))
-        {
+        match session.and_then(|session| {
+            restore_plan_for_snapshot(session, true, &agent_restore.shell, launcher)
+        }) {
             Some((plan, outcome)) => (Some(plan), outcome),
             None => (None, None),
         }
@@ -1132,6 +1134,7 @@ fn restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
     shell: &str,
+    launcher: Option<&crate::agent_launcher::BoundAgentLauncher>,
 ) -> Option<(
     crate::agent_resume::AgentResumePlan,
     Option<crate::agent_resume::LaunchOptionsRestore>,
@@ -1140,16 +1143,40 @@ fn restore_plan_for_snapshot(
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
+    // A launcher that passes its prefix arguments on to the agent adds them
+    // again, so the copy the agent's command line showed is not repeated.
+    let launch_options = session.launch_options.as_deref().map(|options| {
+        launcher.map_or(options, |binding| {
+            options
+                .strip_prefix(binding.launcher.prefix_args.as_slice())
+                .unwrap_or(options)
+        })
+    });
     let planned = crate::agent_resume::plan_with_launch_options(
         &session.source,
         &session.agent,
         &persisted.session_ref,
-        session.launch_options.as_deref(),
+        launch_options,
     )?;
-    // The pane's shell must take the typed command in one line; otherwise the
-    // options cannot be repeated and restore falls back to the bare command.
-    let fits = crate::platform::interactive_shell_restore_command(&planned.0.argv, shell)
-        .is_some_and(|command| crate::platform::interactive_shell_accepts_line(&command, shell));
+    // The pane's shell must take the typed command, through the saved
+    // launcher when there is one, in one line; otherwise the options cannot
+    // be repeated and restore falls back to the bare command. A launcher that
+    // cannot be encoded is reported when the restore starts.
+    let fits = match launcher {
+        Some(binding) => binding
+            .launcher
+            .command(planned.0.argv.get(1..).unwrap_or_default(), shell)
+            .map_or(true, |command| {
+                crate::platform::interactive_shell_accepts_line(
+                    &crate::platform::shell_restore_line(command),
+                    shell,
+                )
+            }),
+        None => crate::platform::interactive_shell_restore_command(&planned.0.argv, shell)
+            .is_some_and(|command| {
+                crate::platform::interactive_shell_accepts_line(&command, shell)
+            }),
+    };
     if planned.1 != Some(crate::agent_resume::LaunchOptionsRestore::Kept) || fits {
         return Some(planned);
     }
@@ -1272,7 +1299,7 @@ fn take_restore_plan_for_snapshot(
     resume_agents_on_restore: bool,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore, "sh")
+    restore_plan_for_snapshot(session, resume_agents_on_restore, "sh", None)
         .map(|(plan, _)| plan)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
@@ -1583,9 +1610,9 @@ mod tests {
             resumed_without_launch_options: false,
         };
 
-        assert!(restore_plan_for_snapshot(&session, false, "sh").is_none());
+        assert!(restore_plan_for_snapshot(&session, false, "sh", None).is_none());
         assert_eq!(
-            restore_plan_for_snapshot(&session, true, "sh")
+            restore_plan_for_snapshot(&session, true, "sh", None)
                 .unwrap()
                 .0
                 .argv,
@@ -1600,7 +1627,7 @@ mod tests {
             launch_options: None,
             resumed_without_launch_options: false,
         };
-        assert!(restore_plan_for_snapshot(&unsupported_path, true, "sh").is_none());
+        assert!(restore_plan_for_snapshot(&unsupported_path, true, "sh", None).is_none());
     }
 
     #[test]
@@ -1655,6 +1682,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(startup.restore_plan.is_some());
@@ -1689,6 +1717,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
         let duplicate = pane_restore_startup(
             Some(&session),
@@ -1696,6 +1725,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(first.restore_plan.is_some());
@@ -1744,6 +1774,7 @@ mod tests {
             std::path::Path::new("/a"),
             None,
             &mut agent_restore,
+            None,
         )
     }
 
@@ -2057,6 +2088,7 @@ mod tests {
             &session_with_a_long_restore_line(),
             true,
             "placeholder-shell",
+            None,
         )
         .expect("restore should plan the bare command");
         assert_eq!(
@@ -2072,7 +2104,7 @@ mod tests {
     #[test]
     fn restore_plan_keeps_a_long_line_for_bash_on_linux() {
         let (plan, outcome) =
-            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash")
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash", None)
                 .expect("restore should plan the command with its options");
         assert_eq!(
             outcome,
@@ -2087,7 +2119,7 @@ mod tests {
         use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
 
         let (plan, outcome) =
-            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash")
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash", None)
                 .expect("restore should plan the bare command");
         assert_eq!(
             outcome,
@@ -2114,15 +2146,125 @@ mod tests {
         };
         let at_limit = crate::platform::CANONICAL_LINE_MAX_BYTES - overhead;
         let (_, outcome) =
-            restore_plan_for_snapshot(&session(at_limit - 1), true, "placeholder-shell").unwrap();
+            restore_plan_for_snapshot(&session(at_limit - 1), true, "placeholder-shell", None)
+                .unwrap();
         assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
         let (_, outcome) =
-            restore_plan_for_snapshot(&session(at_limit), true, "placeholder-shell").unwrap();
+            restore_plan_for_snapshot(&session(at_limit), true, "placeholder-shell", None).unwrap();
         assert_eq!(
             outcome,
             Some(LaunchOptionsRestore::NotKept(
                 LaunchOptionsUnavailable::ExceedsResumeLimits
             ))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sh_launcher(
+        prefix_args: Vec<String>,
+        env_value_len: usize,
+    ) -> crate::agent_launcher::BoundAgentLauncher {
+        crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "claude".into(),
+            session: None,
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/bin/sh".into(),
+                prefix_args,
+                env: [("T2_PLACEHOLDER".into(), "a".repeat(env_value_len))].into(),
+            },
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_measures_the_launcher_line_it_types() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let session = launch_options_session(
+            "claude",
+            Some(vec!["--model".into(), "claude-haiku-5-5".into()]),
+        );
+        let bare_line_len = |launcher: &crate::agent_launcher::BoundAgentLauncher| {
+            let args = ["--resume".to_string(), "claude-session".to_string()];
+            crate::platform::shell_restore_line(
+                launcher
+                    .launcher
+                    .command(&args, "placeholder-shell")
+                    .unwrap(),
+            )
+            .len()
+        };
+        // The bare launcher line is one byte under the shell's limit, so the
+        // options push it over while the plain line stays short.
+        let env_value_len =
+            crate::platform::CANONICAL_LINE_MAX_BYTES - 1 - bare_line_len(&sh_launcher(vec![], 0));
+        let launcher = sh_launcher(vec![], env_value_len);
+        assert_eq!(
+            bare_line_len(&launcher),
+            crate::platform::CANONICAL_LINE_MAX_BYTES - 1
+        );
+
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session, true, "placeholder-shell", None).unwrap();
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session, true, "placeholder-shell", Some(&launcher))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_does_not_repeat_the_launcher_prefix_the_agent_showed() {
+        let prefix = vec!["--effort".to_string(), "low".to_string()];
+        let session = launch_options_session(
+            "claude",
+            Some(vec![
+                "--effort".into(),
+                "low".into(),
+                "--model".into(),
+                "claude-haiku-5-5".into(),
+            ]),
+        );
+        let launcher = sh_launcher(prefix, 0);
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session, true, "bash", Some(&launcher)).unwrap();
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
+        assert_eq!(
+            plan.argv,
+            [
+                "claude",
+                "--model",
+                "claude-haiku-5-5",
+                "--resume",
+                "claude-session"
+            ]
+        );
+        // Without a launcher the same options are the agent's own.
+        let (plan, _) = restore_plan_for_snapshot(&session, true, "bash", None).unwrap();
+        assert_eq!(
+            plan.argv,
+            [
+                "claude",
+                "--effort",
+                "low",
+                "--model",
+                "claude-haiku-5-5",
+                "--resume",
+                "claude-session"
+            ]
         );
     }
 
@@ -2146,6 +2288,7 @@ mod tests {
             std::path::Path::new("/a"),
             None,
             &mut agent_restore,
+            None,
         );
         assert_eq!(
             startup.restore_plan.unwrap().argv,
@@ -2193,6 +2336,7 @@ mod tests {
             project_a,
             Some(&history),
             &mut agent_restore,
+            None,
         );
         let plan = startup.restore_plan.expect("reported resume plan");
         assert_eq!(plan.agent, "pi");
@@ -2204,13 +2348,32 @@ mod tests {
             agent: "prime-agent".into(),
             argv: vec!["prime-agent".into(), "--continue".into()],
         };
-        let first = pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let first = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert_eq!(first.restore_plan.unwrap().argv, custom.argv);
-        let other_project =
-            pane_restore_startup(None, Some(&custom), project_b, None, &mut agent_restore);
+        let other_project = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_b,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert!(other_project.restore_plan.is_some());
-        let duplicate =
-            pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let duplicate = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert!(duplicate.restore_plan.is_none());
         assert!(duplicate.duplicate_agent_session);
 
@@ -2226,6 +2389,7 @@ mod tests {
             project_a,
             Some(&history),
             &mut disabled,
+            None,
         );
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
@@ -2258,6 +2422,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(startup.restore_plan.is_none());

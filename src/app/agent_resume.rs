@@ -235,6 +235,7 @@ impl App {
 
         // The pane runs the configured shell, so the command is quoted for it.
         let shell = crate::pane::pane_shell(&self.state.default_shell);
+        let native_args = plan.argv.get(1..).unwrap_or_default();
         let resume_command = if let Some(binding) = &plan.launcher {
             let session = self
                 .state
@@ -247,11 +248,20 @@ impl App {
                         session.agent == binding.agent && &session.session_ref == expected
                     })
                 });
+            // A line longer than the shell takes is cut, and a cut launcher
+            // line can run something else, so it is not typed.
             let command = if identity_matches {
                 binding
                     .launcher
-                    .command(plan.argv.get(1..).unwrap_or_default(), &shell)
+                    .command(native_args, &shell)
                     .map(crate::platform::shell_restore_line)
+                    .and_then(|command| {
+                        if crate::platform::interactive_shell_accepts_line(&command, &shell) {
+                            Ok(command)
+                        } else {
+                            Err("Saved launcher command is longer than this shell takes in one line. Shorten the launcher's arguments or environment and restart this session.".into())
+                        }
+                    })
             } else {
                 Err("Saved launcher does not match the native conversation identity".into())
             };
@@ -351,9 +361,7 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             if let Some(mut binding) = plan.launcher {
                 binding.observed = false;
-                binding.argv = binding
-                    .launcher
-                    .argv(plan.argv.get(1..).unwrap_or_default());
+                binding.argv = binding.launcher.argv(native_args);
                 binding.argv_origin = crate::agent_launcher::LauncherArgvOrigin::CanonicalResume;
                 terminal.agent_launcher = Some(binding);
             }
@@ -588,6 +596,56 @@ mod tests {
             .unwrap()
             .contains("launcher"));
         assert!(app.state.terminals[&id].pending_agent_resume_plan.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_launcher_line_longer_than_the_shell_takes_is_not_typed() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("launcher-too-long")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        // A shell held to the canonical line limit on every platform.
+        app.state.default_shell = "dash".into();
+        let id = app.state.terminals.keys().next().unwrap().clone();
+        let binding = crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "claude".into(),
+            session: None,
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/bin/sh".into(),
+                prefix_args: vec![],
+                env: [(
+                    "T2_PLACEHOLDER".into(),
+                    "a".repeat(crate::platform::CANONICAL_LINE_MAX_BYTES),
+                )]
+                .into(),
+            },
+        };
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.agent_launcher = Some(binding.clone());
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--resume".into(), "same-uuid".into()],
+            dedupe_key: "fixture".into(),
+            launcher: Some(binding.clone()),
+        });
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            0,
+            "no shell was started to type a cut line"
+        );
+        let terminal = &app.state.terminals[&id];
+        assert!(terminal
+            .restore_error
+            .as_deref()
+            .unwrap()
+            .contains("longer than this shell takes"));
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert_eq!(terminal.agent_launcher.as_ref(), Some(&binding));
     }
 
     #[cfg(unix)]
