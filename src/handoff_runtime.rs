@@ -29,6 +29,10 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// Absent from runtimes written before this field existed, and when no
+    /// process was bound to the pane's launch yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_launch: Option<crate::terminal::state::HandoffAgentLaunch>,
     /// Acknowledged input stream state. Exported only after the PTY writer
     /// quiesced, so every admitted write is already on the PTY.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +84,9 @@ pub(crate) struct ImportedHandoffPlaceholder {
 
 /// A continuing live runtime or a captured unavailable placeholder. Absence
 /// is explicit and can never be inferred from a missing live-runtime entry.
+// One import is made per pane, once per handoff, so the size difference
+// between its variants costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum HandoffImport {
     Runtime(ImportedHandoffRuntime),
@@ -102,5 +109,57 @@ impl HandoffImport {
             Self::Runtime(runtime) => runtime.observation_epoch.as_deref(),
             Self::Unavailable(placeholder) => Some(&placeholder.observation_epoch),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::HandoffRuntimeState;
+    use crate::terminal::state::HandoffAgentLaunch;
+
+    #[test]
+    fn a_runtime_state_written_before_the_agent_launch_field_still_loads() {
+        let older = serde_json::json!({
+            "pane_id": 1,
+            "child_pid": 2,
+            "rows": 24,
+            "cols": 80,
+            "cell_width_px": 0,
+            "cell_height_px": 0,
+        });
+        let state: HandoffRuntimeState =
+            serde_json::from_value(older).expect("an older runtime state should still load");
+        assert_eq!(state.agent_launch, None);
+
+        let confirmed = Some(HandoffAgentLaunch::Confirmed {
+            process_id: 4242,
+            process_started: Some(1234),
+        });
+        let state = HandoffRuntimeState {
+            agent_launch: confirmed,
+            ..state
+        };
+        let loaded: HandoffRuntimeState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(loaded.agent_launch, confirmed);
+
+        // A launch written before the start time was carried loads with none.
+        let older_launch = serde_json::json!({"assumed": {"process_id": 4242}});
+        assert_eq!(
+            serde_json::from_value::<HandoffAgentLaunch>(older_launch).unwrap(),
+            HandoffAgentLaunch::Assumed {
+                process_id: 4242,
+                process_started: None,
+            }
+        );
+        // A launch with no start time read is written as before.
+        assert_eq!(
+            serde_json::to_value(HandoffAgentLaunch::Confirmed {
+                process_id: 4242,
+                process_started: None,
+            })
+            .unwrap(),
+            serde_json::json!({"confirmed": {"process_id": 4242}})
+        );
     }
 }

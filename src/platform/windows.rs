@@ -958,6 +958,17 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     }
 }
 
+/// cmd.exe reads at most 8191 characters from one typed line.
+const CMD_MAX_LINE_CHARS: usize = 8191;
+
+/// Whether the pane's shell can take `command` as one typed line.
+pub(crate) fn interactive_shell_accepts_line(command: &str, shell_name: &str) -> bool {
+    let shell_name = shell_name.to_ascii_lowercase();
+    shell_name.contains("powershell")
+        || shell_name.contains("pwsh")
+        || command.encode_utf16().count() <= CMD_MAX_LINE_CHARS
+}
+
 fn powershell_agent_script(argv: &[String]) -> Option<String> {
     let (program, args) = argv.split_first()?;
     if args.is_empty() {
@@ -1636,6 +1647,7 @@ fn foreground_process_from_entry(entry: &WindowsProcessEntry) -> super::Foregrou
         argv0: command.argv0.clone(),
         argv: command.argv.clone(),
         cmdline: command.cmdline.clone(),
+        started: command.creation_time,
     }
 }
 
@@ -2371,6 +2383,27 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
             TerminateProcess(process.0, 1);
         }
     }
+}
+
+/// The id of the process on the other end of a local API connection, the
+/// named pipe's client process.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    stream.peer_creds().ok()?.pid()
+}
+
+/// A process, when it started and the id of its parent; Windows has no
+/// process groups. A process that started after the cached snapshot, such as
+/// the CLI that sent a report, is read from a fresh one.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
+    let read = |snapshot: &ProcessSnapshot| {
+        snapshot.entry(pid).map(|entry| super::AncestorProcess {
+            process: foreground_process_from_entry(entry),
+            parent: entry.parent_pid,
+            process_group: None,
+        })
+    };
+    read(&cached_foreground_processes()).or_else(|| read(&fresh_foreground_processes()))
 }
 
 pub fn process_exists(pid: u32) -> bool {
@@ -3287,6 +3320,69 @@ mod tests {
         assert_eq!(
             String::from_utf16(&utf16).unwrap(),
             "if((Get-Command pi -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& pi '' 'two words' '100%' 'wow!' 'a''b' '--model'}else{Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b --model' -NoNewWindow -Wait}"
+        );
+    }
+
+    #[test]
+    fn cmd_restore_line_must_fit_the_cmd_line_limit() {
+        assert!(super::interactive_shell_accepts_line(
+            &"a".repeat(8191),
+            "cmd.exe"
+        ));
+        assert!(!super::interactive_shell_accepts_line(
+            &"a".repeat(8192),
+            "cmd.exe"
+        ));
+        assert!(!super::interactive_shell_accepts_line(
+            &"a".repeat(8192),
+            r"C:\Windows\System32\cmd.exe"
+        ));
+        for shell in [
+            "powershell.exe",
+            "pwsh",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        ] {
+            assert!(super::interactive_shell_accepts_line(
+                &"a".repeat(20_000),
+                shell
+            ));
+        }
+        // About 1.7 KB of options already overflows cmd once encoded.
+        let argv = std::iter::once("claude".to_string())
+            .chain(["--append-system-prompt".into(), "p".repeat(1700)])
+            .chain(["--resume".into(), "placeholder-session".into()])
+            .collect::<Vec<_>>();
+        let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
+        assert!(!super::interactive_shell_accepts_line(&command, "cmd.exe"));
+        let command = super::interactive_shell_command(&argv, "pwsh").unwrap();
+        assert!(super::interactive_shell_accepts_line(&command, "pwsh"));
+    }
+
+    #[test]
+    fn cmd_restore_command_keeps_ampersands_and_spaced_values_in_one_argument() {
+        use base64::Engine as _;
+
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            "one & two".into(),
+            "--resume".into(),
+            "placeholder-session".into(),
+        ];
+        let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
+        assert!(!command.contains('&'), "{command}");
+        assert!(!command.contains("one two"), "{command}");
+        let encoded = command.split_whitespace().last().unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            String::from_utf16(&utf16).unwrap(),
+            "if((Get-Command claude -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& claude '--append-system-prompt' 'one & two' '--resume' 'placeholder-session'}else{Start-Process -FilePath claude -ArgumentList '--append-system-prompt \"one & two\" --resume placeholder-session' -NoNewWindow -Wait}"
         );
     }
 

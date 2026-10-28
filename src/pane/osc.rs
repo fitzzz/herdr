@@ -934,6 +934,7 @@ mod tests {
                 argv0: Some("zsh".to_string()),
                 argv: Some(vec!["zsh".to_string()]),
                 cmdline: Some("zsh".to_string()),
+                started: None,
             }],
         }
     }
@@ -1397,6 +1398,7 @@ mod tests {
                     argv0: Some("droid".to_string()),
                     argv: Some(vec!["droid".to_string()]),
                     cmdline: Some("droid".to_string()),
+                    started: None,
                 }],
             }),
         ));

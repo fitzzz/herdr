@@ -43,6 +43,41 @@ pub struct ForegroundProcess {
     pub argv0: Option<String>,
     pub argv: Option<Vec<String>>,
     pub cmdline: Option<String>,
+    /// When the process started, as [`ProcessInstance::started`].
+    pub started: Option<u64>,
+}
+
+/// One running process, told apart from a later process given the same id by
+/// when it started. `started` is in the platform's own units and compared only
+/// on this host; it is `None` where the platform could not read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessInstance {
+    pub pid: u32,
+    pub started: Option<u64>,
+}
+
+impl ProcessInstance {
+    /// A process whose start time is unknown, so it matches by id alone.
+    #[cfg(test)]
+    pub fn unknown_start(pid: u32) -> Self {
+        Self { pid, started: None }
+    }
+
+    /// Whether `other` is this process: the same id and, when both start
+    /// times are known, the same start time.
+    pub fn is(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && (self.started.is_none() || other.started.is_none() || self.started == other.started)
+    }
+}
+
+/// A process read while walking up from another, with the id of its parent
+/// and its process group, `None` where the platform has no process groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorProcess {
+    pub process: ForegroundProcess,
+    pub parent: u32,
+    pub process_group: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,24 +443,34 @@ fn normalized_process_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn is_powershell_process_name(name: &str) -> bool {
-    matches!(
-        normalized_process_name(name).as_str(),
-        "pwsh" | "powershell"
-    )
+/// The line a restore types into a pane's shell to resume an agent. On Unix it
+/// starts with one space, so bash (`HISTCONTROL=ignorespace`), zsh
+/// (`HIST_IGNORE_SPACE`) and fish keep the saved options out of the shell's
+/// history; the space counts toward the line the shell must take.
+pub(crate) fn interactive_shell_restore_command(
+    argv: &[String],
+    shell_name: &str,
+) -> Option<String> {
+    interactive_shell_command(argv, shell_name).map(shell_restore_line)
+}
+
+/// A restore command as typed: with the leading space on Unix that keeps it
+/// out of the shell's history, as `interactive_shell_restore_command` says.
+pub(crate) fn shell_restore_line(command: String) -> String {
+    let prefix = if cfg!(windows) { "" } else { " " };
+    format!("{prefix}{command}")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn interactive_unix_shell_command(
-    argv: &[String],
-    shell_name: &str,
-    quote_posix_arg: fn(&str) -> String,
-) -> Option<String> {
-    let quote = if is_powershell_process_name(shell_name) {
-        quote_powershell_arg
-    } else {
-        quote_posix_arg
+pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
+    let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
+        "pwsh" | "powershell" => quote_powershell_arg,
+        "fish" | "xonsh" => quote_fish_arg,
+        "csh" | "tcsh" => quote_csh_arg,
+        "nu" => quote_nu_arg,
+        "elvish" => quote_elvish_arg,
+        // Unknown names, including wrappers, keep POSIX quoting.
+        _ => quote_posix_arg,
     };
     let mut parts = argv.iter();
     let mut command = quote(parts.next()?);
@@ -434,6 +479,102 @@ pub(crate) fn interactive_unix_shell_command(
         command.push_str(&quote(part));
     }
     Some(command)
+}
+
+/// Inside fish single quotes, and in the Python string literals xonsh reads,
+/// `\\` and `\'` are escapes, so every backslash is doubled and every quote
+/// escaped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_fish_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// csh and tcsh expand `!` history references even inside single quotes, so a
+/// `!` is closed out of the quotes and escaped there, like a quote is.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_csh_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''").replace('!', "'\\!'"))
+}
+
+/// Nushell single quotes cannot hold a quote, so a value goes in double
+/// quotes, where `\\` and `\"` are escapes and `$` is literal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_nu_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Inside elvish single quotes only a quote is special, and it is doubled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn quote_elvish_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn quote_posix_arg(value: &str) -> String {
+    if is_plain_unix_word(value) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn is_plain_unix_word(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
+}
+
+/// Whether the pane's shell can take `command` as one typed line. A shell in
+/// this platform's `LINE_EDITING_SHELLS` edits its own line and takes any
+/// length; any other shell, a wrapper script included, reads the line in the
+/// terminal's canonical mode, which keeps only `CANONICAL_LINE_MAX_BYTES` of
+/// it. `shell` is the pane's shell program, a path or a name looked up on
+/// `PATH`, resolved through symlinks only when the line is too long for
+/// canonical mode.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn interactive_shell_accepts_line(command: &str, shell: &str) -> bool {
+    if command.len() <= CANONICAL_LINE_MAX_BYTES {
+        return true;
+    }
+    if LINE_EDITING_SHELLS.is_empty() {
+        return false;
+    }
+    let program = if shell.contains('/') {
+        Some(std::path::PathBuf::from(shell))
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(shell))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+    let resolved = program.and_then(|program| std::fs::canonicalize(program).ok());
+    let name = resolved
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .map_or(
+            std::borrow::Cow::Borrowed(shell),
+            std::ffi::OsStr::to_string_lossy,
+        );
+    LINE_EDITING_SHELLS.contains(&normalized_process_name(&name).as_str())
 }
 
 pub(crate) fn launcher_executable_available(path: &std::path::Path) -> bool {
@@ -454,12 +595,11 @@ pub(crate) fn launcher_executable_available(path: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn unix_agent_launcher_command(
     argv: &[String],
     env: &std::collections::BTreeMap<String, String>,
     shell: &str,
-    quote: fn(&str) -> String,
 ) -> Option<String> {
     if argv.is_empty() {
         return None;
@@ -469,12 +609,17 @@ pub(crate) fn unix_agent_launcher_command(
         .chain(env.iter().map(|(key, value)| format!("{key}={value}")))
         .chain(argv.iter().cloned())
         .collect();
-    let command = interactive_unix_shell_command(&command_argv, shell, quote)?;
-    Some(if is_powershell_process_name(shell) {
-        format!("& {command}")
-    } else {
-        command
-    })
+    let command = interactive_unix_shell_command(&command_argv, shell)?;
+    Some(
+        if matches!(
+            normalized_process_name(shell).as_str(),
+            "pwsh" | "powershell"
+        ) {
+            format!("& {command}")
+        } else {
+            command
+        },
+    )
 }
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
@@ -641,6 +786,53 @@ mod tests {
         assert!(!take_terminal_resize_signal());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn canonical_shell_accepts_line_only_within_its_limit() {
+        let dir = std::env::temp_dir().join(format!("herdr-accepts-line-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        let bash = dir.join("bash");
+        std::fs::write(&bash, "").expect("placeholder shell should be written");
+        let sh = dir.join("sh");
+        let wrapper = dir.join("placeholder-shell");
+        std::os::unix::fs::symlink(&bash, &sh).expect("sh link should be created");
+        std::fs::write(&wrapper, "").expect("placeholder wrapper should be written");
+        let to_text = |path: &std::path::Path| path.to_string_lossy().into_owned();
+
+        let at_limit = "a".repeat(CANONICAL_LINE_MAX_BYTES);
+        let over_limit = "a".repeat(CANONICAL_LINE_MAX_BYTES + 1);
+        for shell in [
+            "dash",
+            "ksh",
+            "csh",
+            "/no/such/sh",
+            to_text(&wrapper).as_str(),
+        ] {
+            assert!(interactive_shell_accepts_line(&at_limit, shell), "{shell}");
+            assert!(
+                !interactive_shell_accepts_line(&over_limit, shell),
+                "{shell}"
+            );
+        }
+        // Only shells this platform knows to edit their own line take more:
+        // bash, zsh and fish on Linux, none on macOS.
+        for (shell, name) in [
+            ("bash", "bash"),
+            ("zsh", "zsh"),
+            ("fish", "fish"),
+            (to_text(&bash).as_str(), "bash"),
+            (to_text(&sh).as_str(), "bash"),
+        ] {
+            assert!(interactive_shell_accepts_line(&at_limit, shell), "{shell}");
+            assert_eq!(
+                interactive_shell_accepts_line(&over_limit, shell),
+                LINE_EDITING_SHELLS.contains(&name),
+                "{shell}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pane_shell_process_names_reject_exec_replacement_programs() {
         for shell in ["bash", "-zsh", "/bin/fish", "pwsh", "powershell.exe"] {
@@ -694,6 +886,43 @@ mod tests {
         assert_eq!(parse_agent_env_hint(b"HERDR_AGENT=not-an-agent\0"), None);
     }
 
+    fn placeholder_restore_argv() -> [String; 5] {
+        [
+            "claude",
+            "--model",
+            "placeholder",
+            "--resume",
+            "placeholder-id",
+        ]
+        .map(String::from)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_command_starts_with_a_space_that_keeps_it_out_of_shell_history() {
+        let argv = placeholder_restore_argv();
+        for shell in ["bash", "zsh", "fish", "sh"] {
+            assert_eq!(
+                interactive_shell_restore_command(&argv, shell),
+                interactive_shell_command(&argv, shell).map(|command| format!(" {command}")),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restore_command_is_the_shell_command_unchanged_on_windows() {
+        let argv = placeholder_restore_argv();
+        for shell in ["pwsh", "powershell", "cmd", "bash"] {
+            assert_eq!(
+                interactive_shell_restore_command(&argv, shell),
+                interactive_shell_command(&argv, shell),
+                "{shell}"
+            );
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interactive_shell_command_quotes_for_posix_and_powershell() {
@@ -714,6 +943,106 @@ mod tests {
             interactive_shell_command(&argv, "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_quotes_backslashes_for_fish() {
+        let argv = vec![
+            "claude".into(),
+            "--settings".into(),
+            r#"{"pattern":"\\d"}"#.into(),
+            r"trailing\".into(),
+            "a'b".into(),
+        ];
+        assert_eq!(
+            interactive_shell_command(&argv, "fish").as_deref(),
+            Some(r#"claude --settings '{"pattern":"\\\\d"}' 'trailing\\' 'a\'b'"#)
+        );
+        assert_eq!(
+            interactive_shell_command(&argv, "/usr/bin/fish"),
+            interactive_shell_command(&argv, "fish")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_escapes_history_for_csh_and_tcsh() {
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            "wow! a'b".into(),
+            "plain".into(),
+        ];
+        for shell in ["csh", "tcsh", "-tcsh"] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(r"claude --append-system-prompt 'wow'\!' a'\''b' plain"),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_quotes_apostrophes_for_nu_elvish_and_xonsh() {
+        let argv = vec![
+            "claude".into(),
+            "--append-system-prompt".into(),
+            r#"don't "dq" \d $HOME"#.into(),
+            "plain".into(),
+        ];
+        for (shell, expected) in [
+            (
+                "nu",
+                r#"claude --append-system-prompt "don't \"dq\" \\d $HOME" plain"#,
+            ),
+            (
+                "/usr/bin/nu",
+                r#"claude --append-system-prompt "don't \"dq\" \\d $HOME" plain"#,
+            ),
+            (
+                "elvish",
+                r#"claude --append-system-prompt 'don''t "dq" \d $HOME' plain"#,
+            ),
+            (
+                "xonsh",
+                r#"claude --append-system-prompt 'don\'t "dq" \\d $HOME' plain"#,
+            ),
+        ] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(expected),
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interactive_shell_command_keeps_posix_quoting_for_sh_family_and_unknown_shells() {
+        let argv = vec![
+            "claude".into(),
+            r#"{"pattern":"\\d"}"#.into(),
+            "wow!".into(),
+            "a'b".into(),
+        ];
+        for shell in [
+            "bash",
+            "zsh",
+            "sh",
+            "/bin/sh",
+            "dash",
+            "ksh",
+            "mksh",
+            "my-shell-wrapper",
+        ] {
+            assert_eq!(
+                interactive_shell_command(&argv, shell).as_deref(),
+                Some(r#"claude '{"pattern":"\\d"}' 'wow!' 'a'\''b'"#),
+                "{shell}"
+            );
+        }
     }
 
     #[test]

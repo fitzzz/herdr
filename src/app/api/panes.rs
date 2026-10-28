@@ -1593,6 +1593,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentSessionParams,
+        peer_ancestry: Option<&[crate::platform::AncestorProcess]>,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1612,6 +1613,7 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let evidence = self.session_report_evidence(ws_idx, pane_id, &agent_label, peer_ancestry);
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1621,6 +1623,7 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            evidence,
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
@@ -1633,6 +1636,63 @@ impl App {
             params.seq.filter(|_| applied),
             applied.then_some(params.resume_argv).flatten(),
         )
+    }
+
+    /// What the server can tell, as a Claude or Codex conversation report
+    /// arrives, about which process sent it: read here, once per report, so a
+    /// launch record pairs the conversation only on that evidence. The agent
+    /// process in `peer_ancestry`, the process on the other end of the API
+    /// connection and its parents, is the reporter when the walk places it in
+    /// the pane; otherwise the report stays undecided. Only when the server
+    /// could not read that process does the pane's foreground job show which
+    /// Claude or Codex processes could have sent the report.
+    fn session_report_evidence(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        agent_label: &str,
+        peer_ancestry: Option<&[crate::platform::AncestorProcess]>,
+    ) -> crate::terminal::SessionReportEvidence {
+        use crate::detect::ReportSender;
+        use crate::terminal::SessionReportEvidence;
+        let Some(agent @ (crate::detect::Agent::Claude | crate::detect::Agent::Codex)) =
+            crate::detect::parse_agent_label(agent_label)
+        else {
+            return Default::default();
+        };
+        let pane_process = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .and_then(crate::terminal::TerminalRuntime::child_pid);
+        if let Some(ancestry) = peer_ancestry {
+            return match pane_process
+                .map(|pane_process| crate::detect::report_sender(ancestry, agent, pane_process))
+            {
+                Some(ReportSender::Agent(reporter)) => SessionReportEvidence::Reporter(reporter),
+                Some(ReportSender::Unidentified) | None => SessionReportEvidence::Unidentified,
+            };
+        }
+        let foreground_agents = pane_process
+            .and_then(crate::detect::foreground_job)
+            .map(|job| {
+                job.processes
+                    .iter()
+                    .filter(|process| {
+                        matches!(
+                            crate::detect::identify_agent_process(process),
+                            Some((
+                                crate::detect::Agent::Claude | crate::detect::Agent::Codex,
+                                _
+                            ))
+                        )
+                    })
+                    .map(|process| crate::platform::ProcessInstance {
+                        pid: process.pid,
+                        started: process.started,
+                    })
+                    .collect()
+            });
+        SessionReportEvidence::ForegroundAgents(foreground_agents)
     }
 
     /// A resume command belongs to the session it was reported with, so it is

@@ -89,6 +89,15 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
+    /// Process detection read the command line of a new Claude or Codex
+    /// process, read with when it started. `argv` is `None` where the
+    /// platform does not read it.
+    AgentLaunchObserved {
+        pane_id: PaneId,
+        agent: Agent,
+        process: crate::platform::ProcessInstance,
+        argv: Option<Vec<String>>,
+    },
     /// The current Codex input screen is visible during managed startup.
     CodexPromptObserved { pane_id: PaneId, ready: bool },
     /// Fallback detector state changed in a pane.
@@ -119,6 +128,7 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        evidence: crate::terminal::SessionReportEvidence,
     },
     /// A reporter supplied the command that resumes its own session.
     AgentResumeReported {

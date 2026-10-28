@@ -170,6 +170,8 @@ impl App {
         }
         let persisted_agent_session =
             crate::agent_resume::persisted_session_from_launch_args(kind, &params.args);
+        let launch_options =
+            crate::agent_resume::launch_options_from_agent_args(kind, &params.args);
         let conflicts = self.agent_name_conflicts(&name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -234,6 +236,18 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
+        }
+        if let Some(options) = launch_options {
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: kind,
+                options,
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: persisted_agent_session
+                        .as_ref()
+                        .map(|session| session.session_ref.clone()),
+                },
+            });
         }
         if let Some(launcher) = launcher {
             let binding = crate::agent_launcher::BoundAgentLauncher {

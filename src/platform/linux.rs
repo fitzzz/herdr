@@ -31,6 +31,16 @@ pub(crate) use shutdown::monitor_host_shutdown;
 mod migration;
 pub(crate) use migration::*;
 
+/// A shell that reads its line in the terminal's canonical mode gets at most
+/// this many bytes of a typed line: the n_tty line buffer is 4096 bytes
+/// (`N_TTY_BUF_SIZE` in the kernel's `include/linux/tty.h`) and its last byte
+/// is kept for the newline. A pty probe on Linux 7.2 confirmed it: 4095 bytes
+/// arrive whole, and a longer line is cut to its first 4095.
+pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 4095;
+/// Shells that edit their own line and so take a typed line of any length:
+/// the line waits in the n_tty buffer until the shell reads it in raw mode
+/// (bash took a 9,000-character line in the pty probe).
+pub(crate) const LINE_EDITING_SHELLS: &[&str] = &["bash", "zsh", "fish"];
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -90,6 +100,7 @@ struct ProcGroupMember {
     pid: u32,
     comm: String,
     state: char,
+    started: Option<u64>,
 }
 
 pub(crate) fn launch_executable() -> std::io::Result<PathBuf> {
@@ -316,7 +327,7 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
 }
 
 pub(crate) fn scrollback_editor_argv(path: &std::path::Path) -> std::io::Result<Vec<String>> {
-    let quoted_path = shell_quote(&path.display().to_string());
+    let quoted_path = super::quote_posix_arg(&path.display().to_string());
     let command = format!(
         r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
     );
@@ -324,7 +335,7 @@ pub(crate) fn scrollback_editor_argv(path: &std::path::Path) -> std::io::Result<
 }
 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
-    super::interactive_unix_shell_command(argv, shell_name, shell_quote)
+    super::interactive_unix_shell_command(argv, shell_name)
 }
 
 pub(crate) fn agent_launcher_command(
@@ -332,23 +343,7 @@ pub(crate) fn agent_launcher_command(
     env: &std::collections::BTreeMap<String, String>,
     shell: &str,
 ) -> Option<String> {
-    super::unix_agent_launcher_command(argv, env, shell, shell_quote)
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
-        return value.to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
+    super::unix_agent_launcher_command(argv, env, shell)
 }
 
 /// Collect the foreground terminal job for a given child PID.
@@ -398,6 +393,7 @@ fn foreground_job_from_members(
                 argv0: None,
                 cmdline: argv.as_ref().map(|parts| parts.join(" ")),
                 argv,
+                started: member.started,
             }
         })
         .collect::<Vec<_>>();
@@ -633,12 +629,19 @@ fn numeric_file_name(entry: &std::fs::DirEntry) -> Option<u32> {
 }
 
 fn live_process_group_member(process_group_id: u32, pid: u32) -> Option<ProcGroupMember> {
-    let (pgrp, comm, state) = process_pgrp_comm_and_state(pid)?;
-    (pgrp > 0 && pgrp as u32 == process_group_id).then_some(ProcGroupMember { pid, comm, state })
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (pgrp, comm, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    (pgrp > 0 && pgrp as u32 == process_group_id).then(|| ProcGroupMember {
+        pid,
+        comm,
+        state,
+        started: stat_field_after_comm(&stat, STAT_STARTTIME),
+    })
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
-    let (pgrp, name, state) = process_pgrp_comm_and_state(process_group_id)?;
+    let stat = std::fs::read_to_string(format!("/proc/{process_group_id}/stat")).ok()?;
+    let (pgrp, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
     if pgrp as u32 != process_group_id {
         return None;
     }
@@ -654,6 +657,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
             argv0: None,
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: stat_field_after_comm(&stat, STAT_STARTTIME),
         }],
     })
 }
@@ -699,16 +703,23 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
 }
 
 fn process_argv(pid: u32) -> Option<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmdline_argv(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// Splits `/proc/<pid>/cmdline` into arguments. Every argument ends in a NUL,
+/// so only the empty part after the final one is dropped; empty arguments
+/// such as `--append-system-prompt ''` stay in place.
+fn cmdline_argv(bytes: &[u8]) -> Option<Vec<String>> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
     if bytes.is_empty() {
         return None;
     }
-    let parts: Vec<String> = bytes
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
+    Some(
+        bytes
+            .split(|&b| b == 0)
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect(),
+    )
 }
 
 /// Get the current working directory of a process.
@@ -773,6 +784,46 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
             libc::kill(pid as i32, sig);
         }
     }
+}
+
+/// The id of the process on the other end of a local API connection.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+    u32::try_from(stream.peer_creds().ok()?.pid()?).ok()
+}
+
+/// A process, when it started and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (pgrp, name, state) = process_pgrp_comm_and_state_from_stat(&stat)?;
+    let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
+        .then(|| process_argv(pid))
+        .flatten();
+    Some(super::AncestorProcess {
+        process: ForegroundProcess {
+            pid,
+            name,
+            argv0: None,
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
+            started: stat_field_after_comm(&stat, STAT_STARTTIME),
+        },
+        parent: stat_field_after_comm(&stat, STAT_PPID)?.try_into().ok()?,
+        process_group: u32::try_from(pgrp).ok().filter(|pgrp| *pgrp > 0),
+    })
+}
+
+/// `/proc/<pid>/stat` fields counted from the state after the command name:
+/// field 4 (ppid) and field 22 (starttime, in clock ticks since boot).
+const STAT_PPID: usize = 1;
+const STAT_STARTTIME: usize = 19;
+
+fn stat_field_after_comm(stat: &str, index: usize) -> Option<u64> {
+    stat.get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(index)?
+        .parse()
+        .ok()
 }
 
 pub fn process_exists(pid: u32) -> bool {
@@ -1328,6 +1379,7 @@ mod tests {
                     pid,
                     comm: (*comm).to_string(),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1385,6 +1437,7 @@ mod tests {
                     pid,
                     comm: format!("p{pid}"),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1438,6 +1491,7 @@ mod tests {
                     pid,
                     comm: format!("p{pid}"),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1522,6 +1576,7 @@ mod tests {
                     pid,
                     comm: "leader".to_string(),
                     state: 'S',
+                    started: None,
                 })
             },
         )
@@ -1533,6 +1588,7 @@ mod tests {
                 pid: 200,
                 comm: "leader".to_string(),
                 state: 'S',
+                started: None,
             }]
         );
     }
@@ -1559,6 +1615,7 @@ mod tests {
                             pid,
                             comm: format!("member-{pid}"),
                             state: 'S',
+                            started: None,
                         })
                         .filter(|_| process_group_id == 200)
                 },
@@ -1592,11 +1649,13 @@ mod tests {
                     pid: 200,
                     comm: "codex".to_string(),
                     state: 'D',
+                    started: None,
                 },
                 ProcGroupMember {
                     pid: 201,
                     comm: "helper".to_string(),
                     state: 'S',
+                    started: None,
                 },
             ],
             true,
@@ -1623,11 +1682,13 @@ mod tests {
                     pid: 200,
                     comm: "codex".to_string(),
                     state: 'S',
+                    started: None,
                 },
                 ProcGroupMember {
                     pid: 201,
                     comm: "node".to_string(),
                     state: 'S',
+                    started: None,
                 },
             ],
             true,
@@ -2166,6 +2227,33 @@ mod tests {
         let args = std::fs::read_to_string(&path).expect("args file");
         let _ = std::fs::remove_file(&path);
         assert_eq!(args, "--app-name\nHerdr\n--\n-danger\nbody\n");
+    }
+
+    #[test]
+    fn cmdline_argv_keeps_empty_arguments() {
+        assert_eq!(
+            cmdline_argv(b"claude\0--append-system-prompt\0\0--permission-mode\0plan\0"),
+            Some(
+                [
+                    "claude",
+                    "--append-system-prompt",
+                    "",
+                    "--permission-mode",
+                    "plan"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
+        // A trailing empty argument stays; only the terminator is dropped.
+        assert_eq!(
+            cmdline_argv(b"codex\0\0"),
+            Some(vec!["codex".to_string(), String::new()])
+        );
+        // A rewritten title without the final terminator still reads.
+        assert_eq!(cmdline_argv(b"claude"), Some(vec!["claude".to_string()]));
+        assert_eq!(cmdline_argv(b""), None);
+        assert_eq!(cmdline_argv(b"\0"), None);
     }
 
     #[test]

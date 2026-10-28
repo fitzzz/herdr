@@ -463,6 +463,12 @@ fn handle_connection_with_stop(
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         method_body => {
+            let peer_ancestry = matches!(method_body, Method::PaneReportAgentSession(_))
+                .then(|| crate::platform::local_stream_peer_process_id(&stream))
+                .flatten()
+                .map(|process_id| {
+                    crate::detect::process_ancestry(process_id, crate::platform::process_and_parent)
+                });
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let response = handle_request(
                 Request {
@@ -473,6 +479,7 @@ fn handle_connection_with_stop(
                 capabilities,
                 server_stop,
                 Some(response_write_rx),
+                peer_ancestry,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             let _ = response_write_tx.send(());
@@ -527,6 +534,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    peer_ancestry: Option<Vec<crate::platform::AncestorProcess>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
@@ -568,7 +576,15 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
+    dispatch_to_app(
+        request,
+        api_tx,
+        None,
+        response_write_complete,
+        None,
+        None,
+        peer_ancestry,
+    )
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -1030,7 +1046,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None, None, None)
 }
 
 pub(super) fn dispatch_projection_to_app_with_timeout(
@@ -1039,7 +1055,7 @@ pub(super) fn dispatch_projection_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None, Some(projection))
+    dispatch_to_app(request, api_tx, timeout, None, None, Some(projection), None)
 }
 
 pub(super) fn dispatch_to_app_with_caller_timeout(
@@ -1054,6 +1070,7 @@ pub(super) fn dispatch_to_app_with_caller_timeout(
         None,
         Some(("timeout", "timed out waiting for agent status")),
         None,
+        None,
     )
 }
 
@@ -1064,12 +1081,14 @@ fn dispatch_to_app(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     timeout_response: Option<(&str, &str)>,
     projection: Option<crate::api::ApiRequestProjection>,
+    peer_ancestry: Option<Vec<crate::platform::AncestorProcess>>,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         projection,
+        peer_ancestry,
         respond_to,
         response_write_complete,
     }) {
@@ -1507,6 +1526,7 @@ mod tests {
             }),
             None,
             None,
+            None,
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1527,6 +1547,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            None,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1542,6 +1563,7 @@ mod tests {
             &tx,
             None,
             Some(&stop),
+            None,
             None,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
@@ -1559,6 +1581,7 @@ mod tests {
             },
             &tx,
             default_capabilities(),
+            None,
             None,
             None,
         );
@@ -1579,8 +1602,9 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(request_for_thread, &tx, None, None, None, None)
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");

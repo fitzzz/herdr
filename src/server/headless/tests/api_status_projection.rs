@@ -5,6 +5,7 @@ fn project_status(server: &mut HeadlessServer, request: api::schema::Request) ->
     server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         request,
         projection: Some(api::ApiRequestProjection::PaneAgentStatus),
+        peer_ancestry: None,
         respond_to,
         response_write_complete: None,
     });

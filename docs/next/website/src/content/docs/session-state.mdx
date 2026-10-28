@@ -92,8 +92,8 @@ Native session restore requires these Herdr integration versions or newer:
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
-| Claude Code | `6` | `claude --resume <id>` |
-| Codex | `5` | `codex resume <id>` |
+| Claude Code | `6` | `claude <launch options> --resume <id>` |
+| Codex | `5` | `codex resume <id> <launch options>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
 | Grok CLI | `2` | `grok --resume <id>` |
 | GitHub Copilot CLI | `2` | `copilot --resume=<id>` |
@@ -107,6 +107,10 @@ Native session restore requires these Herdr integration versions or newer:
 | Kilo Code CLI | `1` | `kilo --session <id>` |
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
+
+Claude Code and Codex come back with the options they were launched with, such as the permission or approval mode, sandbox, model, effort, extra directories, allowed tools and `-c` overrides. Herdr reads them from the running agent's command line and saves them as given in its session file. It leaves out the parts that pick or start a conversation, such as `--resume`, `--continue` or `codex resume --last`, as well as a one-time prompt and print-and-exit mode; the saved session id takes their place. Herdr types the restore command with a leading space, so fish, bash with `HISTCONTROL=ignorespace` and zsh with `HIST_IGNORE_SPACE` leave it out of their history. Herdr quotes each option for the pane's shell, so text with apostrophes or quotes comes back exactly.
+
+When Herdr does not know an agent's launch options, it resumes the conversation with the bare command shown without `<launch options>` and shows `launch options not kept` in the pane's top border, or in a row at the top of the pane when it has no top border, until that agent exits, so you can relaunch it in the mode you need. This happens for session files saved by an older Herdr, inside WSL where Herdr does not read agent command lines, on macOS when the agent's command line has an empty argument such as `--append-system-prompt ''`, when the command line shows only empty arguments after the program name, when the agent was launched with an option Herdr does not recognize, and when the options do not fit the restore command limits of 64 arguments and 8 KiB without control characters such as line breaks, or the typed resume command, including the launcher for an agent started through an external launcher, is longer than the pane's shell takes in one line: 8,191 characters in Windows Command Prompt, 4,095 bytes on Linux in a shell other than bash, zsh or fish, and 1,023 bytes in any shell on macOS. Herdr exempts bash, zsh and fish on Linux because they edit the line themselves; a bash started with line editing turned off, such as `bash --noediting`, also takes only 4,095 bytes, and a longer restore line is cut. It also happens when the last restore did not resume the pane's agent, because resume was turned off or the typed command started no agent, and you then started an agent there by hand: Herdr does not save that agent's options beside the earlier conversation. The same happens when an agent started without naming its conversation id, such as `claude --continue`, `claude --resume` with the picker or `codex resume --last`, replaces the pane's agent before Herdr has seen the earlier one exit, or when Herdr cannot tell which process reported an agent's conversation change, such as when another Claude Code or Codex process runs in the same foreground job, when the agent's hook exited before Herdr could read which process ran it, or when Herdr cannot trace the process that ran the hook back into the pane, such as an agent another agent started in the background whose shell has since exited. Herdr also stops saving an agent's options beside its conversation when another Claude Code or Codex process reports that same conversation, until the agent reports that conversation again itself, for example after Claude Code compacts it. A conversation reported by an agent Herdr does not watch, such as a Claude started from the pane agent's own shell tool, is saved without options.
 
 Run `herdr integration status` to check installed integration versions. Reinstall outdated integrations with `herdr integration install <agent>`.
 

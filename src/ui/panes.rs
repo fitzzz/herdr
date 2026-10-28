@@ -7,9 +7,7 @@ use ratatui::{
 };
 
 use super::scrollbar::{pane_view_scroll_metrics, render_pane_scrollbar, should_show_scrollbar};
-#[cfg(test)]
-use super::text::display_width;
-use super::text::truncate_end;
+use super::text::{display_width, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
 use crate::app::AppState;
@@ -22,13 +20,58 @@ pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
         .is_some_and(|metrics| metrics.offset_from_bottom > 0)
 }
 
-fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<String> {
+/// Shown beside a pane whose agent a restore resumed without its launch options.
+const LAUNCH_OPTIONS_NOT_KEPT: &str = "launch options not kept";
+
+fn pane_border_title(
+    label: &str,
+    marker: Option<&str>,
+    pane_width: u16,
+    _focused: bool,
+) -> Option<String> {
     let label = label.trim();
-    if label.is_empty() || pane_width <= 4 {
+    if pane_width <= 4 {
         return None;
     }
-    let max_label_width = pane_width.saturating_sub(4) as usize;
-    Some(format!(" {} ", truncate_end(label, max_label_width)))
+    let max_width = pane_width.saturating_sub(4) as usize;
+    let text = match (label.is_empty(), marker) {
+        (true, None) => return None,
+        (false, None) => truncate_end(label, max_width),
+        // The marker stays whole: the label gives up its room first.
+        (false, Some(marker)) if max_width > display_width(marker) + 3 => {
+            let label = truncate_end(label, max_width - display_width(marker) - 3);
+            format!("{label} · {marker}")
+        }
+        (_, Some(marker)) => truncate_end(marker, max_width),
+    };
+    Some(format!(" {text} "))
+}
+
+/// The area inside a pane's borders that holds its terminal. A pane whose
+/// agent was resumed without its launch options and has no top border to show
+/// that on gives up its first row to the marker.
+pub(crate) fn pane_content_rect(
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+    tab: &crate::workspace::Tab,
+    pane_id: crate::layout::PaneId,
+    rect: Rect,
+    borders: Borders,
+) -> Rect {
+    let inner = pane_inner_rect(rect, borders);
+    let marker_row = !borders.contains(Borders::TOP)
+        && inner.height > 1
+        && tab
+            .terminal_id(pane_id)
+            .and_then(|terminal_id| terminals.get(terminal_id))
+            .is_some_and(crate::terminal::TerminalState::resumed_without_launch_options);
+    if marker_row {
+        Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1)
+    } else {
+        inner
+    }
 }
 
 // Full view computation reaches this helper for active and background panes.
@@ -46,7 +89,7 @@ fn terminal_inner_rect(rt: &TerminalRuntime, pane_inner: Rect, pane_scrollbars: 
     )
 }
 
-pub(crate) fn pane_inner_rect(area: Rect, borders: Borders) -> Rect {
+fn pane_inner_rect(area: Rect, borders: Borders) -> Rect {
     if borders.is_empty() {
         area
     } else {
@@ -224,7 +267,7 @@ pub(super) fn resize_tab_panes(
             } else {
                 Borders::NONE
             };
-            let pane_inner = pane_inner_rect(area, borders);
+            let pane_inner = pane_content_rect(&app.terminals, tab, focused_id, area, borders);
             let inner_rect = terminal_inner_rect(rt, pane_inner, app.pane_scrollbars);
             if !app.direct_attach_resize_locks.contains(terminal_id) {
                 rt.resize(
@@ -244,7 +287,7 @@ pub(super) fn resize_tab_panes(
         app.pane_gaps,
         app.pane_outer_borders,
     ) {
-        let pane_inner = pane_inner_rect(info.rect, info.borders);
+        let pane_inner = pane_content_rect(&app.terminals, tab, info.id, info.rect, info.borders);
 
         if let Some((terminal_id, rt)) =
             runtime_for_tab_pane(app, terminal_runtimes, workspace_index, tab, info.id)
@@ -289,7 +332,7 @@ pub(super) fn compute_pane_infos_for_tab(
         } else {
             Borders::NONE
         };
-        let pane_inner = pane_inner_rect(area, borders);
+        let pane_inner = pane_content_rect(&app.terminals, tab, focused_id, area, borders);
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
@@ -326,7 +369,7 @@ pub(super) fn compute_pane_infos_for_tab(
     );
 
     for info in &mut pane_infos {
-        let pane_inner = pane_inner_rect(info.rect, info.borders);
+        let pane_inner = pane_content_rect(&app.terminals, tab, info.id, info.rect, info.borders);
 
         let mut inner_rect = pane_inner;
         let mut scrollbar_rect = None;
@@ -469,10 +512,19 @@ fn render_pane_borders(
     split_borders: &[crate::layout::SplitBorder],
     frame: &mut Frame,
 ) {
-    if !app.pane_borders.draws_borders() || pane_infos.iter().all(|info| info.borders.is_empty()) {
-        return;
+    if app.pane_borders.draws_borders() && pane_infos.iter().any(|info| !info.borders.is_empty()) {
+        render_pane_border_lines(app, pane_infos, split_borders, frame);
     }
+    // Titles also cover the marker row of panes drawn without a top border.
+    render_pane_border_titles(app, ws, pane_infos, frame);
+}
 
+fn render_pane_border_lines(
+    app: &AppState,
+    pane_infos: &[PaneInfo],
+    split_borders: &[crate::layout::SplitBorder],
+    frame: &mut Frame,
+) {
     let mut cells = std::collections::HashMap::<(u16, u16), LineCell>::new();
     for info in pane_infos {
         add_pane_border_cells(&mut cells, info);
@@ -505,8 +557,6 @@ fn render_pane_borders(
         };
         cell.set_style(Style::default().fg(color));
     }
-
-    render_pane_border_titles(app, ws, pane_infos, frame);
 }
 
 fn add_split_border_cells(
@@ -640,27 +690,48 @@ fn render_pane_border_titles(
     let buf = frame.buffer_mut();
     let area = buf.area;
     for info in pane_infos {
-        if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
+        // A pane without a top border shows only the marker, on the row its
+        // view computation reserved above the terminal.
+        let (y, start_x, title_width) = if info.borders.contains(Borders::TOP) {
+            (info.rect.y, info.rect.x.saturating_add(1), info.rect.width)
+        } else {
+            let inner = pane_inner_rect(info.rect, info.borders);
+            if info.inner_rect.y <= inner.y {
+                continue;
+            }
+            (inner.y, inner.x, inner.width.saturating_add(2))
+        };
+        if title_width <= 4 {
             continue;
         }
-        let Some(title) = ws
+        let Some(terminal) = ws
             .pane_state(info.id)
             .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
         else {
             continue;
         };
-        let y = info.rect.y;
+        let label = info
+            .borders
+            .contains(Borders::TOP)
+            .then(|| terminal.border_label(app.show_agent_labels_on_pane_borders))
+            .flatten();
+        let marker = terminal
+            .resumed_without_launch_options()
+            .then_some(LAUNCH_OPTIONS_NOT_KEPT);
+        let Some(title) = pane_border_title(
+            label.as_deref().unwrap_or_default(),
+            marker,
+            title_width,
+            info.is_focused,
+        ) else {
+            continue;
+        };
         if y < area.y || y >= area.y.saturating_add(area.height) {
             continue;
         }
-        let start_x = info.rect.x.saturating_add(1);
-        let end_x = info
-            .rect
-            .x
-            .saturating_add(info.rect.width)
-            .saturating_sub(1)
+        let end_x = start_x
+            .saturating_add(title_width)
+            .saturating_sub(2)
             .min(area.x.saturating_add(area.width));
         if start_x >= end_x {
             continue;
@@ -891,28 +962,28 @@ mod tests {
     #[test]
     fn pane_border_title_trims_and_truncates() {
         assert_eq!(
-            pane_border_title(" claude ", 20, false).as_deref(),
+            pane_border_title(" claude ", None, 20, false).as_deref(),
             Some(" claude ")
         );
         assert_eq!(
-            pane_border_title(" claude ", 20, true).as_deref(),
+            pane_border_title(" claude ", None, 20, true).as_deref(),
             Some(" claude ")
         );
-        assert_eq!(pane_border_title("", 20, false), None);
+        assert_eq!(pane_border_title("", None, 20, false), None);
         assert_eq!(
-            pane_border_title("abcdef", 8, false).as_deref(),
+            pane_border_title("abcdef", None, 8, false).as_deref(),
             Some(" abc… ")
         );
         assert_eq!(
-            pane_border_title("abcdef", 8, true).as_deref(),
+            pane_border_title("abcdef", None, 8, true).as_deref(),
             Some(" abc… ")
         );
-        assert_eq!(pane_border_title("abcdef", 4, false), None);
+        assert_eq!(pane_border_title("abcdef", None, 4, false), None);
     }
 
     #[test]
     fn pane_border_title_truncates_cjk_by_display_width() {
-        let title = pane_border_title("1 模块组织（已定）", 12, false).unwrap();
+        let title = pane_border_title("1 模块组织（已定）", None, 12, false).unwrap();
 
         assert_eq!(title, " 1 模块… ");
         assert!(display_width(title.as_str()) <= 10);
@@ -948,6 +1019,53 @@ mod tests {
         assert_eq!(buffer[(4, 0)].symbol(), "模");
         assert_eq!(buffer[(5, 0)].symbol(), " ");
         assert_eq!(buffer[(6, 0)].symbol(), "块");
+    }
+
+    #[test]
+    fn pane_border_title_marks_agents_resumed_without_launch_options() {
+        let render = |label: Option<&str>, resumed_without_options: bool| {
+            let mut app = AppState::test_new();
+            app.view.terminal_area = Rect::new(0, 0, 60, 3);
+            let ws = Workspace::test_new("test");
+            let pane_id = ws.tabs[0].root_pane;
+            app.view.pane_infos = vec![PaneInfo {
+                id: pane_id,
+                rect: Rect::new(0, 0, 60, 3),
+                inner_rect: Rect::default(),
+                scrollbar_rect: None,
+                borders: Borders::ALL,
+                is_focused: false,
+            }];
+            let terminal_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+            let mut terminal_state = TerminalState::new(terminal_id.clone(), "/tmp".into());
+            if let Some(label) = label {
+                terminal_state.set_manual_label(label.into());
+            }
+            terminal_state.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                resumed_without_options,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
+            });
+            app.terminals.insert(terminal_id, terminal_state);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 3)).unwrap();
+            terminal
+                .draw(|frame| render_view_pane_borders(&app, &ws, &[], frame))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..60)
+                .map(|x| buffer[(x, 0)].symbol().to_string())
+                .collect::<String>()
+        };
+
+        assert!(render(Some("claude"), true).contains(" claude · launch options not kept "));
+        assert!(render(None, true).contains(" launch options not kept "));
+        assert!(!render(Some("claude"), false).contains("launch options not kept"));
+        assert!(render(Some("claude"), false).contains(" claude "));
+        assert!(!render(None, false).contains("launch options not kept"));
     }
 
     #[test]
@@ -1206,6 +1324,146 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(1, 1)].style().fg, Some(app.palette.accent));
         assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.overlay0));
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn pane_without_top_border_reserves_a_marker_row_until_the_agent_exits() {
+        for (borders, outer) in [
+            (PaneBordersConfig::Auto, true),
+            (PaneBordersConfig::Off, true),
+            (PaneBordersConfig::Always, false),
+        ] {
+            let mut app = AppState::test_new();
+            app.pane_borders = borders;
+            app.pane_outer_borders = outer;
+            app.workspaces = vec![Workspace::test_new("test")];
+            app.active = Some(0);
+            app.ensure_test_terminals();
+            let root = app.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.workspaces[0].terminal_id(root).unwrap().clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
+            });
+            let area = Rect::new(0, 0, 40, 8);
+            let render = |app: &mut AppState| {
+                app.view.pane_infos = compute_pane_infos(
+                    app,
+                    &TerminalRuntimeRegistry::new(),
+                    area,
+                    false,
+                    crate::kitty_graphics::HostCellSize::default(),
+                );
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+                terminal
+                    .draw(|frame| render_view_pane_borders(app, &app.workspaces[0], &[], frame))
+                    .unwrap();
+                (
+                    app.view.pane_infos[0].inner_rect,
+                    row_text(terminal.backend().buffer(), 0),
+                )
+            };
+
+            let (inner, top_row) = render(&mut app);
+            assert_eq!(app.view.pane_infos[0].borders, Borders::NONE, "{borders:?}");
+            assert_eq!(inner, Rect::new(0, 1, 40, 7), "{borders:?}");
+            assert!(
+                top_row.starts_with(" launch options not kept "),
+                "{top_row:?}"
+            );
+
+            app.terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state_with_visible_blocker(
+                    Some(crate::detect::Agent::Claude),
+                    crate::detect::AgentState::Idle,
+                    false,
+                    false,
+                    true,
+                );
+            let (inner, top_row) = render(&mut app);
+            assert_eq!(inner, area, "{borders:?}");
+            assert!(!top_row.contains("launch options not kept"), "{top_row:?}");
+        }
+    }
+
+    #[test]
+    fn pane_with_top_border_keeps_the_marker_in_its_title() {
+        let mut app = AppState::test_new();
+        app.pane_borders = PaneBordersConfig::Always;
+        app.workspaces = vec![Workspace::test_new("test")];
+        app.active = Some(0);
+        app.ensure_test_terminals();
+        let root = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].terminal_id(root).unwrap().clone();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Unavailable(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+                ),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Started { session: None },
+            });
+        let area = Rect::new(0, 0, 40, 8);
+        app.view.pane_infos = compute_pane_infos(
+            &app,
+            &TerminalRuntimeRegistry::new(),
+            area,
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        assert_eq!(app.view.pane_infos[0].inner_rect, Rect::new(1, 1, 38, 6));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| render_view_pane_borders(&app, &app.workspaces[0], &[], frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(row_text(buffer, 0).contains(" launch options not kept "));
+        assert!(!row_text(buffer, 1).contains("launch options not kept"));
+    }
+
+    #[test]
+    fn pane_border_title_keeps_the_whole_marker_beside_a_long_label() {
+        let marker = Some(LAUNCH_OPTIONS_NOT_KEPT);
+        assert_eq!(
+            pane_border_title("a placeholder label that is long", marker, 40, false).as_deref(),
+            Some(" a placeho… · launch options not kept ")
+        );
+        assert_eq!(
+            pane_border_title("claude", marker, 60, false).as_deref(),
+            Some(" claude · launch options not kept ")
+        );
+        // Too narrow for a label: the marker alone, truncated only when it
+        // does not fit by itself.
+        assert_eq!(
+            pane_border_title("claude", marker, 28, false).as_deref(),
+            Some(" launch options not kept ")
+        );
+        assert_eq!(
+            pane_border_title("claude", marker, 12, false).as_deref(),
+            Some(" launch … ")
+        );
     }
 
     #[tokio::test]

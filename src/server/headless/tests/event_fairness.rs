@@ -101,6 +101,7 @@ fn worktree_list_completion_keeps_metadata_and_plugin_servicing_linear() {
                 projection: None,
                 respond_to: respond_to.clone(),
                 response_write_complete: None,
+                peer_ancestry: None,
             })
             .unwrap();
     }
@@ -140,6 +141,7 @@ fn queue_requests(server: &mut HeadlessServer, count: usize) -> std::sync::mpsc:
         sender
             .send(api::ApiRequestMessage {
                 projection: None,
+                peer_ancestry: None,
                 request: api::schema::Request {
                     id: index.to_string(),
                     method: api::schema::Method::WorkspaceList(api::schema::EmptyParams::default()),
@@ -247,6 +249,7 @@ async fn server_loop_drains_api_backlog_and_runs_scheduled_work() {
         sender
             .send(api::ApiRequestMessage {
                 projection: None,
+                peer_ancestry: None,
                 request: api::schema::Request {
                     id: index.to_string(),
                     method,

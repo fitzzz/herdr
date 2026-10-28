@@ -1140,8 +1140,8 @@ mod tests {
         let mut app = test_app();
         app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
 
-        let response =
-            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+        let response = app.handle_api_request_after_internal_events_drained(
+            crate::api::schema::Request {
                 id: "notify".into(),
                 method: crate::api::schema::Method::NotificationShow(
                     crate::api::schema::NotificationShowParams {
@@ -1151,7 +1151,9 @@ mod tests {
                         sound: crate::api::schema::NotificationShowSound::None,
                     },
                 ),
-            });
+            },
+            None,
+        );
 
         let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
@@ -1176,8 +1178,8 @@ mod tests {
         let mut app = test_app();
         app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
 
-        let response =
-            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+        let response = app.handle_api_request_after_internal_events_drained(
+            crate::api::schema::Request {
                 id: "notify".into(),
                 method: crate::api::schema::Method::NotificationShow(
                     crate::api::schema::NotificationShowParams {
@@ -1187,7 +1189,9 @@ mod tests {
                         sound: crate::api::schema::NotificationShowSound::None,
                     },
                 ),
-            });
+            },
+            None,
+        );
 
         let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
@@ -1212,8 +1216,8 @@ mod tests {
             target: None,
         });
 
-        let response =
-            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+        let response = app.handle_api_request_after_internal_events_drained(
+            crate::api::schema::Request {
                 id: "notify".into(),
                 method: crate::api::schema::Method::NotificationShow(
                     crate::api::schema::NotificationShowParams {
@@ -1223,7 +1227,9 @@ mod tests {
                         sound: crate::api::schema::NotificationShowSound::None,
                     },
                 ),
-            });
+            },
+            None,
+        );
 
         let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
@@ -1245,8 +1251,8 @@ mod tests {
         app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
         app.mark_api_notification_shown(Instant::now());
 
-        let response =
-            app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
+        let response = app.handle_api_request_after_internal_events_drained(
+            crate::api::schema::Request {
                 id: "notify".into(),
                 method: crate::api::schema::Method::NotificationShow(
                     crate::api::schema::NotificationShowParams {
@@ -1256,7 +1262,9 @@ mod tests {
                         sound: crate::api::schema::NotificationShowSound::None,
                     },
                 ),
-            });
+            },
+            None,
+        );
 
         let parsed: crate::api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
@@ -3079,6 +3087,52 @@ mod tests {
         assert_eq!(
             app.state.terminals[&terminal_id].agent_name.as_deref(),
             Some("worker")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_start_records_codex_launch_options() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("agent-start-launch-options");
+        let root = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, root).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let (runtime, _receiver) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_agent_start_launch_options".into(),
+            method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                name: "worker".into(),
+                kind: "codex".into(),
+                pane_id,
+                args: vec![
+                    "--model".into(),
+                    "placeholder-model".into(),
+                    "resume".into(),
+                    "codex-session".into(),
+                ],
+                timeout_ms: Some(4_000),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started");
+        let terminal = &app.state.terminals[&terminal_id];
+        let launch = terminal
+            .agent_launch()
+            .expect("launch options should be seeded");
+        assert_eq!(launch.agent, crate::detect::Agent::Codex);
+        assert_eq!(launch.process(), None);
+        assert_eq!(
+            terminal.launch_options_for_session("codex"),
+            Some(vec!["--model".to_string(), "placeholder-model".to_string()])
         );
     }
 

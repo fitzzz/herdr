@@ -29,6 +29,17 @@ pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_proce
 #[cfg(test)]
 mod config_file_tests;
 
+/// A shell that reads its line in the terminal's canonical mode gets at most
+/// this many bytes of a typed line: `sys/syslimits.h` defines `MAX_CANON` as
+/// 1024 bytes per canonical input line, and one of them is the newline.
+pub(crate) const CANONICAL_LINE_MAX_BYTES: usize = 1023;
+/// Shells that take a typed line longer than `CANONICAL_LINE_MAX_BYTES`. Herdr
+/// types the line right after the shell starts, before it enters raw mode,
+/// and whether the BSD line discipline holds the excess until then is not
+/// tested on a Mac, so every shell, bash, zsh and fish included, takes the
+/// canonical limit.
+pub(crate) const LINE_EDITING_SHELLS: &[&str] = &[];
+
 pub(crate) fn config_file_link_count(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(path)?.nlink())
@@ -198,7 +209,7 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
 }
 
 pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>> {
-    let quoted_path = shell_quote(&path.display().to_string());
+    let quoted_path = super::quote_posix_arg(&path.display().to_string());
     let command = format!(
         r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
     );
@@ -206,7 +217,7 @@ pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>
 }
 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
-    super::interactive_unix_shell_command(argv, shell_name, shell_quote)
+    super::interactive_unix_shell_command(argv, shell_name)
 }
 
 pub(crate) fn agent_launcher_command(
@@ -214,23 +225,7 @@ pub(crate) fn agent_launcher_command(
     env: &std::collections::BTreeMap<String, String>,
     shell: &str,
 ) -> Option<String> {
-    super::unix_agent_launcher_command(argv, env, shell, shell_quote)
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(
-                    ch,
-                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
-                )
-        })
-    {
-        return value.to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
+    super::unix_agent_launcher_command(argv, env, shell)
 }
 
 #[repr(C)]
@@ -452,6 +447,7 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
             argv0: process_argv0_name(pid),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: Some(start_time_from_bsdinfo(&info)),
         });
     }
 
@@ -481,6 +477,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
             argv0: process_argv0_name(process_group_id),
             cmdline: argv.as_ref().map(|parts| parts.join(" ")),
             argv,
+            started: Some(start_time_from_bsdinfo(&info)),
         }],
     })
 }
@@ -1138,6 +1135,50 @@ pub fn signal_processes(pids: &[u32], signal: Signal) {
             libc::kill(pid as libc::c_int, sig);
         }
     }
+}
+
+/// The id of the process on the other end of a local API connection, from
+/// `LOCAL_PEERPID`: the socket credentials macOS keeps carry no process id.
+pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_fd().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (ret == 0 && pid > 0).then_some(pid as u32)
+}
+
+/// A process, when it started and the id of its parent.
+pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
+    let info = process_bsdinfo(pid)?;
+    let argv = process_argv(pid);
+    Some(super::AncestorProcess {
+        process: ForegroundProcess {
+            pid,
+            name: comm_from_bsdinfo(&info)?,
+            argv0: process_argv0_name(pid),
+            cmdline: argv.as_ref().map(|parts| parts.join(" ")),
+            argv,
+            started: Some(start_time_from_bsdinfo(&info)),
+        },
+        parent: info.pbi_ppid,
+        process_group: Some(info.pbi_pgid),
+    })
+}
+
+/// When a process started, in microseconds since the epoch.
+fn start_time_from_bsdinfo(info: &libc::proc_bsdinfo) -> u64 {
+    info.pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec)
 }
 
 pub fn process_exists(pid: u32) -> bool {

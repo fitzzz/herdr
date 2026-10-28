@@ -248,6 +248,48 @@ fn public_json_cannot_select_internal_status_projection() {
     assert_eq!(response["result"]["pane"]["terminal_id"], "term_1");
 }
 
+#[test]
+fn a_session_report_carries_the_process_that_sent_it() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "report",
+        "method": "pane.report_agent_session",
+        "params": {
+            "pane_id": "pane_1",
+            "source": "herdr:claude",
+            "agent": "claude",
+            "agent_session_id": "placeholder-session"
+        },
+        "peer_process_id": 1
+    }));
+    let request = test.app_request();
+    // This test is the process on the other end of the connection, read
+    // with its parents.
+    let ancestry = request.peer_ancestry.clone().unwrap_or_default();
+    assert_eq!(
+        ancestry.first().map(|sender| sender.process.pid),
+        Some(std::process::id())
+    );
+    assert_eq!(
+        ancestry.get(1).map(|parent| parent.process.pid),
+        ancestry.first().map(|sender| sender.parent)
+    );
+    reply(request, ResponseResult::Ok {});
+    assert_eq!(client.response()["id"], "report");
+
+    let mut client = test.connect();
+    client.send(json!({
+        "id": "other-method",
+        "method": "pane.get",
+        "params": {"pane_id": "pane_1"}
+    }));
+    let request = test.app_request();
+    assert_eq!(request.peer_ancestry, None);
+    reply_to_probe(request);
+    assert_eq!(client.response()["id"], "other-method");
+}
+
 fn reply_to_probe(request: ApiRequestMessage) {
     let result = match request.request.method {
         Method::PaneGet(_) => ResponseResult::PaneInfo {

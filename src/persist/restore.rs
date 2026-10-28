@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ratatui::layout::Direction;
 use tokio::sync::{mpsc, Notify};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::detect::AgentState;
 use crate::events::AppEvent;
@@ -26,10 +26,15 @@ use super::{
 struct AgentRestoreState<'a> {
     enabled: bool,
     resumed_sessions: &'a mut HashSet<String>,
+    /// The shell restored panes start, which the resume command is typed into.
+    shell: String,
 }
 
 struct PaneRestoreStartup<'a> {
     restore_plan: Option<crate::agent_resume::AgentResumePlan>,
+    /// Whether `restore_plan` repeats the agent's launch options; `None` for
+    /// agents that do not carry them and for reported resume commands.
+    launch_options_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
     initial_history_ansi: Option<&'a str>,
     duplicate_agent_session: bool,
     reserved_agent_session: Option<String>,
@@ -556,6 +561,16 @@ fn unavailable_restored_terminal(
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
         }
+        // Seed the saved options so the next save keeps them until the
+        // directory comes back.
+        if let Some(seed) = restored_agent_launch(
+            pane.agent_session.as_ref(),
+            None,
+            crate::terminal::SeededLaunch::Saved,
+            false,
+        ) {
+            terminal.seed_agent_launch(seed);
+        }
         if let Some(resume) = saved_reported_resume(pane) {
             terminal.restore_reported_resume(reported_resume_from_snapshot(resume));
         }
@@ -673,6 +688,7 @@ fn restore_tab(
             // deduplicate their native sessions or plan a resume/acquisition.
             PaneRestoreStartup {
                 restore_plan: None,
+                launch_options_restore: None,
                 initial_history_ansi: None,
                 duplicate_agent_session: false,
                 reserved_agent_session: None,
@@ -681,6 +697,7 @@ fn restore_tab(
             let mut agent_restore = AgentRestoreState {
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
+                shell: crate::pane::pane_shell(runtime_context.shell_config.default_shell),
             };
             pane_restore_startup(
                 saved_agent_session,
@@ -688,6 +705,7 @@ fn restore_tab(
                 &cwd,
                 saved_history,
                 &mut agent_restore,
+                saved_pane.and_then(|pane| pane.agent_launcher.as_ref()),
             )
         };
         if let Some(plan) = startup.restore_plan.as_mut() {
@@ -740,15 +758,69 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        // The handoff pane's agent runs on, paired as the old server left it.
+        #[cfg(unix)]
+        let handed_off_launch = imported_runtime
+            .as_ref()
+            .map(|imported| imported.state.agent_launch);
+        let saved_launch = |session| {
+            #[cfg(unix)]
+            if let Some(launch) = handed_off_launch {
+                return match launch {
+                    Some(crate::terminal::state::HandoffAgentLaunch::Confirmed {
+                        process_id,
+                        process_started,
+                    }) => crate::terminal::SeededLaunch::Paired {
+                        process: crate::platform::ProcessInstance {
+                            pid: process_id,
+                            started: process_started,
+                        },
+                        session,
+                    },
+                    Some(crate::terminal::state::HandoffAgentLaunch::Assumed {
+                        process_id,
+                        process_started,
+                    }) => crate::terminal::SeededLaunch::Assumed {
+                        process: crate::platform::ProcessInstance {
+                            pid: process_id,
+                            started: process_started,
+                        },
+                        session,
+                    },
+                    Some(crate::terminal::state::HandoffAgentLaunch::Saved) => {
+                        crate::terminal::SeededLaunch::Saved(session)
+                    }
+                    None => crate::terminal::SeededLaunch::Started {
+                        session: Some(session),
+                    },
+                };
+            }
+            crate::terminal::SeededLaunch::Saved(session)
+        };
         let pending_native_agent_restore = if was_imported {
             None
         } else {
             startup.restore_plan.clone()
         };
+        let restored_agent_launch = restored_agent_launch(
+            saved_agent_session,
+            startup
+                .launch_options_restore
+                .filter(|_| pending_native_agent_restore.is_some()),
+            saved_launch,
+            startup.duplicate_agent_session,
+        );
         if let Some(plan) = pending_native_agent_restore {
+            log_launch_options_restore(
+                *id,
+                &plan.agent,
+                saved_agent_session,
+                startup.launch_options_restore,
+            );
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
+            terminal.agent_launch_restore = startup.launch_options_restore;
             terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
@@ -776,6 +848,9 @@ fn restore_tab(
                     false,
                     std::time::Instant::now(),
                 );
+            }
+            if let Some(seed) = restored_agent_launch {
+                terminal.seed_agent_launch(seed);
             }
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
@@ -889,6 +964,9 @@ fn restore_tab(
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
                 }
+                if let Some(seed) = restored_agent_launch {
+                    terminal.seed_agent_launch(seed);
+                }
                 #[cfg(unix)]
                 if let Some(epoch) = observation_epoch {
                     terminal.begin_handoff_observation_epoch(epoch);
@@ -983,17 +1061,23 @@ fn pane_restore_startup<'a>(
     cwd: &std::path::Path,
     history: Option<&'a PaneHistorySnapshot>,
     agent_restore: &mut AgentRestoreState<'_>,
+    launcher: Option<&crate::agent_launcher::BoundAgentLauncher>,
 ) -> PaneRestoreStartup<'a> {
     // Native agent resume owns the conversation history. If a pane has a
     // resumable agent session and resume is enabled, do not replay saved pane
     // presentation history into that terminal, even when this pane is a
     // duplicate suppressed by session de-duplication.
-    let restore_plan = if !agent_restore.enabled {
-        None
+    let (restore_plan, launch_options_restore) = if !agent_restore.enabled {
+        (None, None)
     } else if let Some(resume) = reported_resume {
-        Some(reported_resume_from_snapshot(resume).plan(cwd))
+        (Some(reported_resume_from_snapshot(resume).plan(cwd)), None)
     } else {
-        session.and_then(|session| restore_plan_for_snapshot(session, true))
+        match session.and_then(|session| {
+            restore_plan_for_snapshot(session, true, &agent_restore.shell, launcher)
+        }) {
+            Some((plan, outcome)) => (Some(plan), outcome),
+            None => (None, None),
+        }
     };
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
@@ -1011,14 +1095,15 @@ fn pane_restore_startup<'a>(
             true
         }
     });
-    let restore_plan = if duplicate_agent_session {
-        None
+    let (restore_plan, launch_options_restore) = if duplicate_agent_session {
+        (None, None)
     } else {
-        restore_plan
+        (restore_plan, launch_options_restore)
     };
 
     PaneRestoreStartup {
         restore_plan,
+        launch_options_restore,
         initial_history_ansi: if has_native_agent_restore {
             None
         } else {
@@ -1048,12 +1133,141 @@ fn reported_resume_from_snapshot(
 fn restore_plan_for_snapshot(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
-) -> Option<crate::agent_resume::AgentResumePlan> {
+    shell: &str,
+    launcher: Option<&crate::agent_launcher::BoundAgentLauncher>,
+) -> Option<(
+    crate::agent_resume::AgentResumePlan,
+    Option<crate::agent_resume::LaunchOptionsRestore>,
+)> {
     if !resume_agents_on_restore {
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    // A launcher that passes its prefix arguments on to the agent adds them
+    // again, so the copy the agent's command line showed is not repeated.
+    let launch_options = session.launch_options.as_deref().map(|options| {
+        launcher.map_or(options, |binding| {
+            options
+                .strip_prefix(binding.launcher.prefix_args.as_slice())
+                .unwrap_or(options)
+        })
+    });
+    let planned = crate::agent_resume::plan_with_launch_options(
+        &session.source,
+        &session.agent,
+        &persisted.session_ref,
+        launch_options,
+    )?;
+    // The pane's shell must take the typed command, through the saved
+    // launcher when there is one, in one line; otherwise the options cannot
+    // be repeated and restore falls back to the bare command. A launcher that
+    // cannot be used is reported when the restore starts.
+    let fits = match launcher {
+        Some(binding) => {
+            binding.launcher.validate().is_err()
+                || binding
+                    .launcher
+                    .restore_line(planned.0.argv.get(1..).unwrap_or_default(), shell)
+                    .is_ok()
+        }
+        None => crate::platform::interactive_shell_restore_command(&planned.0.argv, shell)
+            .is_some_and(|command| {
+                crate::platform::interactive_shell_accepts_line(&command, shell)
+            }),
+    };
+    if planned.1 != Some(crate::agent_resume::LaunchOptionsRestore::Kept) || fits {
+        return Some(planned);
+    }
+    let (bare, _) = crate::agent_resume::plan_with_launch_options(
+        &session.source,
+        &session.agent,
+        &persisted.session_ref,
+        None,
+    )?;
+    Some((
+        bare,
+        Some(crate::agent_resume::LaunchOptionsRestore::NotKept(
+            crate::agent_resume::LaunchOptionsUnavailable::ExceedsResumeLimits,
+        )),
+    ))
+}
+
+/// The launch options a restored terminal starts with, seeded for the saved
+/// conversation, so a save before detection reads the agent's command line
+/// keeps them. The conversation runs in the resume command this restore types
+/// (`native_restore` is its outcome) or, without one, in `saved_launch`: a
+/// handoff pane's agent, which runs on, or nothing, when the restore does not
+/// resume the agent or the pane's directory is missing. Without a resume command the seed keeps the mark from
+/// the saved session. A native restore that fell back to the bare command keeps
+/// its options unknown, so the next save does not record the bare command as
+/// the agent's launch options.
+fn restored_agent_launch(
+    session: Option<&PaneAgentSessionSnapshot>,
+    native_restore: Option<crate::agent_resume::LaunchOptionsRestore>,
+    saved_launch: impl FnOnce(crate::agent_resume::AgentSessionRef) -> crate::terminal::SeededLaunch,
+    duplicate_agent_session: bool,
+) -> Option<crate::terminal::AgentLaunchSeed> {
+    if duplicate_agent_session {
+        return None;
+    }
+    let session = session?;
+    let agent = crate::detect::parse_agent_label(&session.agent)?;
+    let resumed_without_options = match native_restore {
+        Some(crate::agent_resume::LaunchOptionsRestore::NotKept(_)) => true,
+        Some(crate::agent_resume::LaunchOptionsRestore::Kept) => false,
+        None => session.resumed_without_launch_options,
+    };
+    let options = match (&session.launch_options, native_restore) {
+        (Some(saved), _) => crate::agent_resume::AgentLaunchOptions::Known(saved.clone()),
+        (None, Some(crate::agent_resume::LaunchOptionsRestore::NotKept(reason))) => {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(reason)
+        }
+        (None, _) if resumed_without_options => {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+            )
+        }
+        (None, _) => return None,
+    };
+    Some(crate::terminal::AgentLaunchSeed {
+        agent,
+        options,
+        resumed_without_options,
+        launch: match (
+            native_restore,
+            persisted_agent_session_from_snapshot(session)?.session_ref,
+        ) {
+            (Some(_), session) => crate::terminal::SeededLaunch::Started {
+                session: Some(session),
+            },
+            (None, session) => saved_launch(session),
+        },
+    })
+}
+
+fn log_launch_options_restore(
+    pane_id: PaneId,
+    agent: &str,
+    session: Option<&PaneAgentSessionSnapshot>,
+    outcome: Option<crate::agent_resume::LaunchOptionsRestore>,
+) {
+    match outcome {
+        Some(crate::agent_resume::LaunchOptionsRestore::Kept) => info!(
+            pane = pane_id.raw(),
+            agent,
+            option_count = session
+                .and_then(|session| session.launch_options.as_ref())
+                .map_or(0, Vec::len),
+            "agent resume keeps launch options"
+        ),
+        Some(crate::agent_resume::LaunchOptionsRestore::NotKept(reason)) => warn!(
+            pane = pane_id.raw(),
+            agent,
+            ?reason,
+            "agent resume without launch options"
+        ),
+        None => {}
+    }
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -1083,7 +1297,8 @@ fn take_restore_plan_for_snapshot(
     resume_agents_on_restore: bool,
     resumed_agent_sessions: &mut HashSet<String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
-    restore_plan_for_snapshot(session, resume_agents_on_restore)
+    restore_plan_for_snapshot(session, resume_agents_on_restore, "sh", None)
+        .map(|(plan, _)| plan)
         .filter(|plan| resumed_agent_sessions.insert(plan.dedupe_key.clone()))
 }
 
@@ -1287,6 +1502,7 @@ mod tests {
         );
     }
     use super::*;
+    use crate::platform::ProcessInstance;
 
     fn test_session_path(name: &str) -> String {
         std::env::current_dir()
@@ -1388,11 +1604,16 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
 
-        assert!(restore_plan_for_snapshot(&session, false).is_none());
+        assert!(restore_plan_for_snapshot(&session, false, "sh", None).is_none());
         assert_eq!(
-            restore_plan_for_snapshot(&session, true).unwrap().argv,
+            restore_plan_for_snapshot(&session, true, "sh", None)
+                .unwrap()
+                .0
+                .argv,
             vec!["pi", "--session", pi_session_path.as_str()]
         );
 
@@ -1401,8 +1622,10 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
-        assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+        assert!(restore_plan_for_snapshot(&unsupported_path, true, "sh", None).is_none());
     }
 
     #[test]
@@ -1413,6 +1636,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let mut resumed = HashSet::new();
 
@@ -1435,6 +1660,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1444,6 +1671,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let startup = pane_restore_startup(
@@ -1452,6 +1680,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(startup.restore_plan.is_some());
@@ -1466,6 +1695,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1475,6 +1706,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let first = pane_restore_startup(
@@ -1483,6 +1715,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
         let duplicate = pane_restore_startup(
             Some(&session),
@@ -1490,6 +1723,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(first.restore_plan.is_some());
@@ -1499,6 +1733,568 @@ mod tests {
         assert!(duplicate.duplicate_agent_session);
     }
 
+    fn launch_options_session(
+        agent: &str,
+        launch_options: Option<Vec<String>>,
+    ) -> super::super::snapshot::PaneAgentSessionSnapshot {
+        super::super::snapshot::PaneAgentSessionSnapshot {
+            source: format!("herdr:{agent}"),
+            agent: agent.into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: format!("{agent}-session"),
+            launch_options,
+            resumed_without_launch_options: false,
+        }
+    }
+
+    fn placeholder_launch_options() -> Vec<String> {
+        vec!["--model".into(), "placeholder-model".into()]
+    }
+
+    /// The conversation `launch_options_session(agent, ..)` saves.
+    fn seeded_session(agent: &str) -> Option<crate::agent_resume::AgentSessionRef> {
+        crate::agent_resume::AgentSessionRef::id(format!("{agent}-session"))
+    }
+
+    fn startup_for(
+        session: &super::super::snapshot::PaneAgentSessionSnapshot,
+        enabled: bool,
+        resumed: &mut HashSet<String>,
+    ) -> PaneRestoreStartup<'static> {
+        let mut agent_restore = AgentRestoreState {
+            enabled,
+            resumed_sessions: resumed,
+            shell: "sh".into(),
+        };
+        pane_restore_startup(
+            Some(session),
+            None,
+            std::path::Path::new("/a"),
+            None,
+            &mut agent_restore,
+            None,
+        )
+    }
+
+    #[test]
+    fn pane_restore_startup_resumes_with_saved_launch_options() {
+        for (agent, expected) in [
+            (
+                "claude",
+                vec![
+                    "claude",
+                    "--model",
+                    "placeholder-model",
+                    "--resume",
+                    "claude-session",
+                ],
+            ),
+            (
+                "codex",
+                vec![
+                    "codex",
+                    "resume",
+                    "codex-session",
+                    "--model",
+                    "placeholder-model",
+                ],
+            ),
+        ] {
+            let session = launch_options_session(agent, Some(placeholder_launch_options()));
+            let startup = startup_for(&session, true, &mut HashSet::new());
+            assert_eq!(startup.restore_plan.unwrap().argv, expected);
+            assert_eq!(
+                startup.launch_options_restore,
+                Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+            );
+        }
+    }
+
+    #[test]
+    fn pane_restore_startup_without_saved_launch_options_uses_bare_command() {
+        for (agent, expected) in [
+            ("claude", vec!["claude", "--resume", "claude-session"]),
+            ("codex", vec!["codex", "resume", "codex-session"]),
+        ] {
+            let session = launch_options_session(agent, None);
+            let startup = startup_for(&session, true, &mut HashSet::new());
+            assert_eq!(startup.restore_plan.unwrap().argv, expected);
+            assert_eq!(
+                startup.launch_options_restore,
+                Some(crate::agent_resume::LaunchOptionsRestore::NotKept(
+                    crate::agent_resume::LaunchOptionsUnavailable::NotRecorded
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn pane_restore_startup_with_launch_options_respects_disabled_resume_and_dedupe() {
+        let session = launch_options_session("claude", Some(placeholder_launch_options()));
+
+        let disabled = startup_for(&session, false, &mut HashSet::new());
+        assert!(disabled.restore_plan.is_none());
+        assert_eq!(disabled.launch_options_restore, None);
+        // A restore that types no resume command keeps the saved launch,
+        // which nothing runs.
+        assert_eq!(
+            restored_agent_launch(
+                Some(&session),
+                disabled.launch_options_restore,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options()
+                ),
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
+            })
+        );
+
+        let mut resumed = HashSet::new();
+        let first = startup_for(&session, true, &mut resumed);
+        let duplicate = startup_for(&session, true, &mut resumed);
+        assert!(first.restore_plan.is_some());
+        assert!(duplicate.restore_plan.is_none());
+        assert!(duplicate.duplicate_agent_session);
+        assert_eq!(duplicate.launch_options_restore, None);
+        assert_eq!(
+            restored_agent_launch(
+                Some(&session),
+                duplicate.launch_options_restore,
+                crate::terminal::SeededLaunch::Saved,
+                duplicate.duplicate_agent_session
+            ),
+            None
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&session),
+                first.launch_options_restore,
+                crate::terminal::SeededLaunch::Saved,
+                first.duplicate_agent_session
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options()
+                ),
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: seeded_session("claude")
+                }
+            })
+        );
+    }
+
+    /// The seed of a live handoff whose old server confirmed the conversation
+    /// for process 4242.
+    fn handed_off_to_4242(
+        session: crate::agent_resume::AgentSessionRef,
+    ) -> crate::terminal::SeededLaunch {
+        crate::terminal::SeededLaunch::Paired {
+            process: ProcessInstance::unknown_start(4242),
+            session,
+        }
+    }
+
+    #[test]
+    fn restored_agent_launch_keeps_the_mark_without_a_resume_command() {
+        use crate::agent_resume::{AgentLaunchOptions, LaunchOptionsUnavailable};
+
+        let flagged = |launch_options| super::super::snapshot::PaneAgentSessionSnapshot {
+            resumed_without_launch_options: true,
+            ..launch_options_session("claude", launch_options)
+        };
+        assert_eq!(
+            restored_agent_launch(Some(&flagged(None)), None, handed_off_to_4242, false),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Paired {
+                    process: ProcessInstance::unknown_start(4242),
+                    session: seeded_session("claude").unwrap()
+                }
+            })
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&flagged(Some(placeholder_launch_options()))),
+                None,
+                handed_off_to_4242,
+                false
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Paired {
+                    process: ProcessInstance::unknown_start(4242),
+                    session: seeded_session("claude").unwrap()
+                }
+            })
+        );
+        assert_eq!(
+            restored_agent_launch(Some(&flagged(None)), None, handed_off_to_4242, true),
+            None
+        );
+        // A pane restored without resuming its agent keeps the mark for the
+        // next save.
+        assert_eq!(
+            restored_agent_launch(
+                Some(&flagged(None)),
+                None,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("claude").unwrap())
+            })
+        );
+        // Without the mark, only saved options are seeded.
+        let unflagged = launch_options_session("claude", None);
+        assert_eq!(
+            restored_agent_launch(Some(&unflagged), None, handed_off_to_4242, false),
+            None
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&unflagged),
+                None,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_keeps_unknown_options_unknown_after_fallback() {
+        use crate::agent_resume::{
+            AgentLaunchOptions, LaunchOptionsRestore, LaunchOptionsUnavailable,
+        };
+
+        let without = launch_options_session("claude", None);
+        let not_recorded = LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::NotRecorded);
+        assert_eq!(
+            restored_agent_launch(
+                Some(&without),
+                Some(not_recorded),
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: AgentLaunchOptions::Unavailable(LaunchOptionsUnavailable::NotRecorded),
+                resumed_without_options: true,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: seeded_session("claude")
+                }
+            })
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&without),
+                None,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            restored_agent_launch(
+                Some(&without),
+                Some(not_recorded),
+                crate::terminal::SeededLaunch::Saved,
+                true
+            ),
+            None
+        );
+
+        let saved = launch_options_session("codex", Some(placeholder_launch_options()));
+        let too_long = LaunchOptionsRestore::NotKept(LaunchOptionsUnavailable::ExceedsResumeLimits);
+        for (outcome, bare_resume) in [(LaunchOptionsRestore::Kept, false), (too_long, true)] {
+            assert_eq!(
+                restored_agent_launch(
+                    Some(&saved),
+                    Some(outcome),
+                    crate::terminal::SeededLaunch::Saved,
+                    false
+                ),
+                Some(crate::terminal::AgentLaunchSeed {
+                    agent: crate::detect::Agent::Codex,
+                    options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                    resumed_without_options: bare_resume,
+                    launch: crate::terminal::SeededLaunch::Started {
+                        session: seeded_session("codex")
+                    }
+                }),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(
+            restored_agent_launch(
+                Some(&saved),
+                Some(LaunchOptionsRestore::Kept),
+                crate::terminal::SeededLaunch::Saved,
+                true
+            ),
+            None
+        );
+        // A restore that types no resume command keeps the saved options.
+        assert_eq!(
+            restored_agent_launch(
+                Some(&saved),
+                None,
+                crate::terminal::SeededLaunch::Saved,
+                false
+            ),
+            Some(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Codex,
+                options: AgentLaunchOptions::Known(placeholder_launch_options()),
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Saved(seeded_session("codex").unwrap())
+            })
+        );
+    }
+
+    /// A Claude session whose restore line is longer than any canonical limit.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn session_with_a_long_restore_line() -> super::super::snapshot::PaneAgentSessionSnapshot {
+        launch_options_session(
+            "claude",
+            Some(vec![
+                "--append-system-prompt".into(),
+                "placeholder ".repeat(400),
+            ]),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_falls_back_when_a_canonical_shell_cannot_take_the_line() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let (plan, outcome) = restore_plan_for_snapshot(
+            &session_with_a_long_restore_line(),
+            true,
+            "placeholder-shell",
+            None,
+        )
+        .expect("restore should plan the bare command");
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_plan_keeps_a_long_line_for_bash_on_linux() {
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash", None)
+                .expect("restore should plan the command with its options");
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
+        assert!(plan.argv.iter().any(|arg| arg == "--append-system-prompt"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_plan_falls_back_for_a_long_bash_line_on_macos() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session_with_a_long_restore_line(), true, "bash", None)
+                .expect("restore should plan the bare command");
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_line_counts_its_leading_space_toward_the_canonical_limit() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        // `claude --append-system-prompt <value> --resume claude-session`
+        // without the leading space is exactly as long as `value` allows.
+        let overhead = "claude --append-system-prompt  --resume claude-session".len();
+        let session = |value_len: usize| {
+            launch_options_session(
+                "claude",
+                Some(vec!["--append-system-prompt".into(), "a".repeat(value_len)]),
+            )
+        };
+        let at_limit = crate::platform::CANONICAL_LINE_MAX_BYTES - overhead;
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session(at_limit - 1), true, "placeholder-shell", None)
+                .unwrap();
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session(at_limit), true, "placeholder-shell", None).unwrap();
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sh_launcher(
+        prefix_args: Vec<String>,
+        env_value_len: usize,
+    ) -> crate::agent_launcher::BoundAgentLauncher {
+        crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: Vec::new(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            agent: "claude".into(),
+            session: None,
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/bin/sh".into(),
+                prefix_args,
+                env: [("T2_PLACEHOLDER".into(), "a".repeat(env_value_len))].into(),
+            },
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_measures_the_launcher_line_it_types() {
+        use crate::agent_resume::{LaunchOptionsRestore, LaunchOptionsUnavailable};
+
+        let session = launch_options_session(
+            "claude",
+            Some(vec!["--model".into(), "claude-haiku-5-5".into()]),
+        );
+        let bare_line_len = |launcher: &crate::agent_launcher::BoundAgentLauncher| {
+            let args = ["--resume".to_string(), "claude-session".to_string()];
+            crate::platform::shell_restore_line(
+                launcher
+                    .launcher
+                    .command(&args, "placeholder-shell")
+                    .unwrap(),
+            )
+            .len()
+        };
+        // The bare launcher line is one byte under the shell's limit, so the
+        // options push it over while the plain line stays short.
+        let env_value_len =
+            crate::platform::CANONICAL_LINE_MAX_BYTES - 1 - bare_line_len(&sh_launcher(vec![], 0));
+        let launcher = sh_launcher(vec![], env_value_len);
+        assert_eq!(
+            bare_line_len(&launcher),
+            crate::platform::CANONICAL_LINE_MAX_BYTES - 1
+        );
+
+        let (_, outcome) =
+            restore_plan_for_snapshot(&session, true, "placeholder-shell", None).unwrap();
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session, true, "placeholder-shell", Some(&launcher))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::ExceedsResumeLimits
+            ))
+        );
+        assert_eq!(plan.argv, ["claude", "--resume", "claude-session"]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn restore_plan_does_not_repeat_the_launcher_prefix_the_agent_showed() {
+        let prefix = vec!["--effort".to_string(), "low".to_string()];
+        let session = launch_options_session(
+            "claude",
+            Some(vec![
+                "--effort".into(),
+                "low".into(),
+                "--model".into(),
+                "claude-haiku-5-5".into(),
+            ]),
+        );
+        let launcher = sh_launcher(prefix, 0);
+        let (plan, outcome) =
+            restore_plan_for_snapshot(&session, true, "bash", Some(&launcher)).unwrap();
+        assert_eq!(
+            outcome,
+            Some(crate::agent_resume::LaunchOptionsRestore::Kept)
+        );
+        assert_eq!(
+            plan.argv,
+            [
+                "claude",
+                "--model",
+                "claude-haiku-5-5",
+                "--resume",
+                "claude-session"
+            ]
+        );
+        // Without a launcher the same options are the agent's own.
+        let (plan, _) = restore_plan_for_snapshot(&session, true, "bash", None).unwrap();
+        assert_eq!(
+            plan.argv,
+            [
+                "claude",
+                "--effort",
+                "low",
+                "--model",
+                "claude-haiku-5-5",
+                "--resume",
+                "claude-session"
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_restore_startup_reported_resume_ignores_saved_launch_options() {
+        let session = launch_options_session("claude", Some(placeholder_launch_options()));
+        let resume = super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            argv: vec!["claude".into(), "--continue".into()],
+        };
+        let mut resumed = HashSet::new();
+        let mut agent_restore = AgentRestoreState {
+            enabled: true,
+            resumed_sessions: &mut resumed,
+            shell: "sh".into(),
+        };
+        let startup = pane_restore_startup(
+            Some(&session),
+            Some(&resume),
+            std::path::Path::new("/a"),
+            None,
+            &mut agent_restore,
+            None,
+        );
+        assert_eq!(
+            startup.restore_plan.unwrap().argv,
+            vec!["claude", "--continue"]
+        );
+        assert_eq!(startup.launch_options_restore, None);
+    }
+
     #[test]
     fn pane_restore_startup_prefers_reported_resume_argv() {
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
@@ -1506,6 +2302,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
             source: "herdr:pi".into(),
@@ -1525,6 +2323,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let project_a = std::path::Path::new("/project-a");
@@ -1535,6 +2334,7 @@ mod tests {
             project_a,
             Some(&history),
             &mut agent_restore,
+            None,
         );
         let plan = startup.restore_plan.expect("reported resume plan");
         assert_eq!(plan.agent, "pi");
@@ -1546,13 +2346,32 @@ mod tests {
             agent: "prime-agent".into(),
             argv: vec!["prime-agent".into(), "--continue".into()],
         };
-        let first = pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let first = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert_eq!(first.restore_plan.unwrap().argv, custom.argv);
-        let other_project =
-            pane_restore_startup(None, Some(&custom), project_b, None, &mut agent_restore);
+        let other_project = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_b,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert!(other_project.restore_plan.is_some());
-        let duplicate =
-            pane_restore_startup(None, Some(&custom), project_a, None, &mut agent_restore);
+        let duplicate = pane_restore_startup(
+            None,
+            Some(&custom),
+            project_a,
+            None,
+            &mut agent_restore,
+            None,
+        );
         assert!(duplicate.restore_plan.is_none());
         assert!(duplicate.duplicate_agent_session);
 
@@ -1560,6 +2379,7 @@ mod tests {
         let mut disabled = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
         let startup = pane_restore_startup(
             None,
@@ -1567,6 +2387,7 @@ mod tests {
             project_a,
             Some(&history),
             &mut disabled,
+            None,
         );
         assert!(startup.restore_plan.is_none());
         assert_eq!(startup.initial_history_ansi, Some("RESTORED_HISTORY\r\n"));
@@ -1579,6 +2400,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1588,6 +2411,7 @@ mod tests {
         let mut agent_restore = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
+            shell: "sh".into(),
         };
 
         let startup = pane_restore_startup(
@@ -1596,6 +2420,7 @@ mod tests {
             std::path::Path::new("/a"),
             Some(&history),
             &mut agent_restore,
+            None,
         );
 
         assert!(startup.restore_plan.is_none());
@@ -1611,6 +2436,8 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1627,12 +2454,51 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_options: None,
+            resumed_without_launch_options: false,
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_none());
 
         assert!(restored_terminal_agent_session(Some(&session), true).is_none());
+    }
+
+    #[test]
+    fn unavailable_restored_terminal_keeps_saved_launch_options_for_the_next_save() {
+        let mut snapshot: SessionSnapshot = serde_json::from_str(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&1).unwrap();
+        let unavailable = |pane: &super::super::snapshot::PaneSnapshot| {
+            unavailable_restored_terminal(
+                Some(pane),
+                std::path::PathBuf::from("/placeholder/missing"),
+                "Saved directory is unavailable.".into(),
+            )
+        };
+
+        pane.agent_session = Some(launch_options_session(
+            "claude",
+            Some(placeholder_launch_options()),
+        ));
+        let terminal = unavailable(pane);
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        assert!(!terminal.resumed_without_launch_options_for_session("claude"));
+
+        pane.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+            resumed_without_launch_options: true,
+            ..launch_options_session("codex", None)
+        });
+        let terminal = unavailable(pane);
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
+        assert!(terminal.resumed_without_launch_options_for_session("codex"));
+        // No agent runs in the pane, so it shows no marker.
+        assert!(!terminal.resumed_without_launch_options());
     }
 
     #[tokio::test]
@@ -1661,6 +2527,8 @@ mod tests {
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
+                launch_options: None,
+                resumed_without_launch_options: false,
             });
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
@@ -1751,6 +2619,8 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                launch_options: None,
+                                resumed_without_launch_options: false,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -1919,6 +2789,8 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                launch_options: None,
+                resumed_without_launch_options: false,
             }),
             agent_resume: None,
             launch_argv: None,
@@ -2072,6 +2944,8 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                launch_options: None,
+                                resumed_without_launch_options: false,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -2145,6 +3019,679 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    fn single_pane_snapshot(
+        agent_session: super::super::snapshot::PaneAgentSessionSnapshot,
+    ) -> SessionSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(agent_session),
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_launcher: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn native_agent_restore_seeds_saved_launch_options_for_the_next_save() {
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "codex",
+            Some(placeholder_launch_options()),
+        ));
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        let launch = terminal
+            .agent_launch()
+            .expect("saved options should be seeded");
+        assert_eq!(launch.agent, crate::detect::Agent::Codex);
+        assert_eq!(launch.process(), None);
+        assert_eq!(
+            launch.options,
+            crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options())
+        );
+
+        // A save before detection reads the restored process keeps the options.
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        let session = saved.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .agent_session
+            .as_ref()
+            .unwrap();
+        assert_eq!(session.launch_options, Some(placeholder_launch_options()));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn native_agent_restore_without_saved_options_keeps_them_unknown() {
+        let snapshot = single_pane_snapshot(launch_options_session("claude", None));
+        let (_workspaces, mut terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values_mut().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        // The bare resume process Herdr types shows no options.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+            None,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    /// The conversation saved for the restored pane, with its launch options,
+    /// after `act` runs on its terminal.
+    fn saved_after_restore(
+        snapshot: &SessionSnapshot,
+        resume_agents_on_restore: bool,
+        act: impl FnOnce(&mut TerminalState),
+    ) -> super::super::snapshot::PaneAgentSessionSnapshot {
+        let (workspaces, mut terminals, runtimes) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            resume_agents_on_restore,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        act(terminals.values_mut().next().unwrap());
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        saved.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .agent_session
+            .clone()
+            .expect("the restored pane should save a conversation")
+    }
+
+    /// Detection reads a Claude the user started by hand with a bypass option,
+    /// whose command line resumes `resumed`.
+    fn observe_hand_started_bypass(terminal: &mut TerminalState, resumed: Option<&str>) {
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            crate::agent_resume::AgentLaunchOptions::Known(vec![
+                "--dangerously-skip-permissions".into()
+            ]),
+            resumed,
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_hand_started_agent_does_not_take_the_conversation_a_restore_without_resume_left() {
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "claude",
+            Some(placeholder_launch_options()),
+        ));
+        let saved = saved_after_restore(&snapshot, false, |terminal| {
+            observe_hand_started_bypass(terminal, None)
+        });
+        assert_eq!(saved.value, "claude-session");
+        assert_eq!(saved.launch_options, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_hand_started_agent_does_not_take_the_conversation_a_failed_resume_left() {
+        // The typed resume command started no agent (for example `claude` is
+        // missing from the restored shell's PATH).
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "claude",
+            Some(placeholder_launch_options()),
+        ));
+        let saved = saved_after_restore(&snapshot, true, |terminal| {
+            observe_hand_started_bypass(terminal, None)
+        });
+        assert_eq!(saved.value, "claude-session");
+        assert_eq!(saved.launch_options, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_restore_without_resume_keeps_the_saved_launch_for_a_later_resume() {
+        let flagged = super::super::snapshot::PaneAgentSessionSnapshot {
+            resumed_without_launch_options: true,
+            ..launch_options_session("claude", None)
+        };
+        let with_options = launch_options_session("claude", Some(placeholder_launch_options()));
+        for session in [with_options, flagged] {
+            let saved =
+                saved_after_restore(&single_pane_snapshot(session.clone()), false, |terminal| {
+                    // No agent runs, so the pane shows no marker.
+                    assert!(!terminal.resumed_without_launch_options());
+                });
+            assert_eq!(saved, session);
+            let resumed = saved_after_restore(&single_pane_snapshot(saved), true, |_| {});
+            assert_eq!(resumed, session);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_hand_started_agent_that_resumes_the_conversation_a_restore_without_resume_left_takes_it_with_its_own_options(
+    ) {
+        for flagged in [false, true] {
+            let snapshot = single_pane_snapshot(super::super::snapshot::PaneAgentSessionSnapshot {
+                resumed_without_launch_options: flagged,
+                ..launch_options_session("claude", Some(placeholder_launch_options()))
+            });
+            let saved = saved_after_restore(&snapshot, false, |terminal| {
+                observe_hand_started_bypass(terminal, Some("claude-session"))
+            });
+            assert_eq!(saved.value, "claude-session", "flagged {flagged}");
+            assert_eq!(
+                saved.launch_options,
+                Some(vec!["--dangerously-skip-permissions".into()]),
+                "flagged {flagged}"
+            );
+            assert!(!saved.resumed_without_launch_options, "flagged {flagged}");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_conversation_reported_in_a_pane_restored_without_resume_takes_no_saved_options() {
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "codex",
+            Some(placeholder_launch_options()),
+        ));
+        // A Codex started by hand reports its new conversation before
+        // detection reads its command line.
+        let saved = saved_after_restore(&snapshot, false, |terminal| {
+            terminal.set_detected_state(Some(crate::detect::Agent::Codex), AgentState::Idle);
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRef::id("fresh-session"),
+                Some(1),
+                Some("startup".into()),
+            );
+            terminal.sync_agent_launch_session(&Default::default());
+        });
+        assert_eq!(saved.value, "fresh-session");
+        assert_eq!(saved.launch_options, None);
+        assert!(!saved.resumed_without_launch_options);
+    }
+
+    /// The terminal a live handoff restores for the pane of `snapshot`, which
+    /// the old server restored without resuming its agent and then recorded
+    /// through `record`.
+    #[cfg(unix)]
+    async fn handed_off(
+        snapshot: &SessionSnapshot,
+        record: impl FnOnce(&mut TerminalState),
+    ) -> TerminalState {
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, mut terminals, runtimes) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values_mut().next().unwrap();
+        record(terminal);
+        let agent_launch = terminal.handoff_agent_launch();
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+        let runtime = runtimes.values().next().unwrap();
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut state = runtime.handoff_runtime_state(pane_id.raw());
+        state.agent_launch = agent_launch;
+        let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut imports = HashMap::from([(
+            pane_id.raw(),
+            crate::handoff_runtime::HandoffImport::Runtime(
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    preserved_terminal_id: None,
+                    observation_epoch: None,
+                    master_fd: unsafe {
+                        std::os::fd::FromRawFd::from_raw_fd(runtime.duplicate_handoff_fd().unwrap())
+                    },
+                    state,
+                },
+            ),
+        )]);
+        let (_, restored_terminals, restored_runtimes) = restore_handoff(
+            &snapshot,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        drop(restored_runtimes);
+        drop(runtimes);
+        restored_terminals.into_values().next().unwrap()
+    }
+
+    /// The report evidence of a pane whose foreground job runs these Claude
+    /// processes.
+    #[cfg(unix)]
+    fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
+        crate::terminal::SessionReportEvidence::ForegroundAgents(Some(
+            process_ids
+                .iter()
+                .map(|&pid| ProcessInstance::unknown_start(pid))
+                .collect(),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn set_claude_session(terminal: &mut TerminalState) {
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+        });
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_the_mark_of_a_resume_without_launch_options() {
+        let not_recorded = crate::agent_resume::AgentLaunchOptions::Unavailable(
+            crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+        );
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let handed_off_claude = |flagged: bool| {
+            let not_recorded = not_recorded.clone();
+            handed_off(&snapshot, move |terminal| {
+                set_claude_session(terminal);
+                if flagged {
+                    terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                        agent: crate::detect::Agent::Claude,
+                        options: not_recorded,
+                        resumed_without_options: true,
+                        launch: crate::terminal::SeededLaunch::Started {
+                            session: crate::agent_resume::AgentSessionRef::id("claude-session"),
+                        },
+                    });
+                }
+                // The bare resume command the restore typed.
+                terminal.observe_agent_launch(
+                    crate::detect::Agent::Claude,
+                    ProcessInstance::unknown_start(4242),
+                    crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+                    Some("claude-session"),
+                );
+            })
+        };
+
+        // The mark and the unknown options survive the handoff and the agent
+        // process seen again on the other side, whatever its command line
+        // says, because the agent kept running.
+        for resumed in [None, Some("claude-session")] {
+            let mut terminal = handed_off_claude(true).await;
+            assert!(terminal.pending_agent_resume_plan.is_none());
+            assert!(terminal.resumed_without_launch_options());
+            assert_eq!(
+                terminal.agent_launch().map(|launch| &launch.options),
+                Some(&not_recorded)
+            );
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                crate::agent_resume::AgentLaunchOptions::Known(Vec::new()),
+                resumed,
+            );
+            assert!(terminal.resumed_without_launch_options(), "{resumed:?}");
+            assert!(
+                terminal.resumed_without_launch_options_for_session("claude"),
+                "{resumed:?}"
+            );
+            assert_eq!(terminal.launch_options_for_session("claude"), None);
+        }
+
+        // Without the mark, a handoff behaves as before.
+        let terminal = handed_off_claude(false).await;
+        assert!(!terminal.resumed_without_launch_options());
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_agent_launch_options() {
+        // A Claude started by hand, whose conversation its report paired, and
+        // one whose command line resumes it.
+        for resumed in [None, Some("claude-session")] {
+            let mut terminal = handed_off(&snapshot_with_saved_pane_history().0, |terminal| {
+                terminal.observe_agent_launch(
+                    crate::detect::Agent::Claude,
+                    ProcessInstance::unknown_start(4242),
+                    crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                    resumed,
+                );
+                set_claude_session(terminal);
+                terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+            })
+            .await;
+            assert!(terminal.pending_agent_resume_plan.is_none());
+            let launch = terminal
+                .agent_launch()
+                .expect("handoff should keep options");
+            assert_eq!(launch.agent, crate::detect::Agent::Claude);
+            assert_eq!(
+                launch.options,
+                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options())
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(placeholder_launch_options())
+            );
+
+            // The agent keeps running, so the new server reads the same
+            // command line and keeps the pairing.
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                resumed,
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(placeholder_launch_options()),
+                "{resumed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_confirms_no_pairing_the_old_server_left_unconfirmed() {
+        let snapshot = single_pane_snapshot(launch_options_session(
+            "claude",
+            Some(placeholder_launch_options()),
+        ));
+        // A restore without resume, and a typed resume that started no agent.
+        for typed_resume in [false, true] {
+            let mut terminal = handed_off(&snapshot, |terminal| {
+                if typed_resume {
+                    terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                        agent: crate::detect::Agent::Claude,
+                        options: crate::agent_resume::AgentLaunchOptions::Known(
+                            placeholder_launch_options(),
+                        ),
+                        resumed_without_options: false,
+                        launch: crate::terminal::SeededLaunch::Started {
+                            session: seeded_session("claude"),
+                        },
+                    });
+                }
+            })
+            .await;
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(placeholder_launch_options()),
+                "typed resume {typed_resume}"
+            );
+            observe_hand_started_bypass(&mut terminal, None);
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "typed resume {typed_resume}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_confirms_the_pairing_for_the_old_process_only() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        // The old server paired Claude's report with its process.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                None,
+            );
+            set_claude_session(terminal);
+            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+        })
+        .await;
+        // That agent exited, and the user started another by hand.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(5151),
+            crate::agent_resume::AgentLaunchOptions::Known(vec![
+                "--dangerously-skip-permissions".into()
+            ]),
+            None,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_carries_no_pairing_reported_beside_another_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let observed = ProcessInstance {
+            pid: 4242,
+            started: Some(1),
+        };
+        for (case, in_job) in [
+            ("another process", ProcessInstance::unknown_start(4343)),
+            (
+                "the id reused later",
+                ProcessInstance {
+                    pid: 4242,
+                    started: Some(2),
+                },
+            ),
+        ] {
+            // The old server read Claude's report beside one other Claude
+            // before detection read process 4242.
+            let terminal = handed_off(&snapshot, |terminal| {
+                terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+                terminal.set_agent_session_ref_for_session_start(
+                    "herdr:claude".into(),
+                    "claude".into(),
+                    crate::agent_resume::AgentSessionRef::id("claude-session"),
+                    Some(1),
+                    Some("startup".into()),
+                );
+                terminal.sync_agent_launch_session(
+                    &crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![in_job])),
+                );
+                terminal.observe_agent_launch(
+                    crate::detect::Agent::Claude,
+                    observed,
+                    crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                    None,
+                );
+            })
+            .await;
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_a_confirmed_pairing_bound_to_its_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let report = |terminal: &mut TerminalState, id: &str, seq: u64, start: &str| {
+            terminal.set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id(id),
+                Some(seq),
+                Some(start.into()),
+            );
+        };
+        // A Claude started by hand reported its conversation as the lone agent
+        // in the job before detection read it, so the old server confirmed
+        // the pairing.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+            report(terminal, "claude-session", 1, "startup");
+            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                crate::agent_resume::AgentLaunchOptions::Known(placeholder_launch_options()),
+                None,
+            );
+        })
+        .await;
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // On the new server a child Claude in the same job resumes another
+        // conversation, and Herdr cannot tell which one reported it.
+        terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
+        report(&mut terminal, "claude-child", 2, "resume");
+        terminal.sync_agent_launch_session(&foreground_claude(&[4242, 4343]));
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_keeps_an_assumed_pairing_bound_to_its_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let unreadable = || {
+            crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::CommandLineUnreadable,
+            )
+        };
+        // The old server's restore typed the resume command with the saved
+        // options, and detection found its process before any report but
+        // could not read its command line, so the old server kept the seed's
+        // options and assumed the pairing.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            set_claude_session(terminal);
+            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+                agent: crate::detect::Agent::Claude,
+                options: crate::agent_resume::AgentLaunchOptions::Known(
+                    placeholder_launch_options(),
+                ),
+                resumed_without_options: false,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: crate::agent_resume::AgentSessionRef::id("claude-session"),
+                },
+            });
+            terminal.observe_agent_launch(
+                crate::detect::Agent::Claude,
+                ProcessInstance::unknown_start(4242),
+                unreadable(),
+                None,
+            );
+        })
+        .await;
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // The new server cannot read it either.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            unreadable(),
+            None,
+        );
+        assert_eq!(
+            terminal.launch_options_for_session("claude"),
+            Some(placeholder_launch_options())
+        );
+        // Then it reads a command line that starts a new conversation, so the
+        // restored one no longer pairs with that process.
+        terminal.observe_agent_launch(
+            crate::detect::Agent::Claude,
+            ProcessInstance::unknown_start(4242),
+            crate::agent_resume::AgentLaunchOptions::Known(vec!["--placeholder-new".into()]),
+            None,
+        );
+        assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
     #[tokio::test]

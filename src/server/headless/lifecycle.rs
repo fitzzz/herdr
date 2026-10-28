@@ -83,18 +83,13 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            handoff_runtime.agent_state = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .and_then(|terminal| terminal.handoff_agent_state());
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            handoff_runtime.agent_state =
+                terminal.and_then(|terminal| terminal.handoff_agent_state());
+            handoff_runtime.agent_launch =
+                terminal.and_then(|terminal| terminal.handoff_agent_launch());
+            let has_agent_session =
+                terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
             if !has_agent_session {
                 handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             }

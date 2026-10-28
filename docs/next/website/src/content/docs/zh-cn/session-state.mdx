@@ -93,8 +93,8 @@ Herdr 会恢复通过当前官方 Herdr 集成上报了原生会话引用的窗�
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
-| Claude Code | `6` | `claude --resume <id>` |
-| Codex | `5` | `codex resume <id>` |
+| Claude Code | `6` | `claude <launch options> --resume <id>` |
+| Codex | `5` | `codex resume <id> <launch options>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
 | Grok CLI | `2` | `grok --resume <id>` |
 | GitHub Copilot CLI | `2` | `copilot --resume=<id>` |
@@ -108,6 +108,10 @@ Herdr 会恢复通过当前官方 Herdr 集成上报了原生会话引用的窗�
 | Kilo Code CLI | `1` | `kilo --session <id>` |
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
+
+Claude Code 和 Codex 会带着启动时的选项恢复,例如权限或审批模式、沙箱、模型、effort、额外目录、允许的工具以及 `-c` 配置覆盖。Herdr 从正在运行的智能体命令行读取这些选项,并按原样保存到会话文件中。它不包括选择或开始会话的部分(例如 `--resume`、`--continue` 或 `codex resume --last`),也不包括一次性提示词和打印后退出模式;保存的会话 ID 会取代它们。Herdr 输入恢复命令时会在开头加一个空格,因此 fish、设置了 `HISTCONTROL=ignorespace` 的 bash 和设置了 `HIST_IGNORE_SPACE` 的 zsh 不会把它记入历史。Herdr 会按窗格的 shell 为每个选项加引号,因此含有撇号或引号的文本也会原样恢复。
+
+当 Herdr 不知道某个智能体的启动选项时,它会用不带 `<launch options>` 的基本恢复命令恢复会话,并在该智能体退出前于窗格上边框显示 `launch options not kept`(窗格没有上边框时,显示在窗格顶部的一行),方便你用需要的模式重新启动智能体。这种情况出现在旧版 Herdr 保存的会话文件、Herdr 不读取智能体命令行的 WSL 中、智能体命令行含有空参数(例如 `--append-system-prompt ''`)的 macOS 上、命令行在程序名之后只有空参数时、智能体使用了 Herdr 无法识别的选项启动,以及选项超出恢复命令限制(64 个参数、8 KiB、不含换行等控制字符),或要输入的恢复命令(通过外部启动器启动的智能体包含启动器)超过窗格 shell 一行能接收的长度(Windows 命令提示符为 8,191 个字符;Linux 上 bash、zsh、fish 以外的 shell 为 4,095 字节;macOS 上任何 shell 都为 1,023 字节)时。Herdr 在 Linux 上豁免 bash、zsh 和 fish,是因为它们自己编辑输入行;关闭行编辑启动的 bash(例如 `bash --noediting`)同样只接收 4,095 字节,更长的恢复命令会被截断。如果上一次恢复没有恢复该窗格的智能体(恢复功能已关闭,或输入的命令没有启动智能体),而你随后在那里手动启动了智能体,也会出现这种情况:Herdr 不会把该智能体的选项与之前的会话一起保存。如果未指定会话 ID 启动的智能体(例如 `claude --continue`、使用选择器的 `claude --resume` 或 `codex resume --last`)在 Herdr 确认前一个智能体退出之前替换了窗格中的智能体,或者 Herdr 无法判断智能体的会话变化是由哪个进程报告的(例如同一前台作业中另有 Claude Code 或 Codex 进程运行,智能体的钩子在 Herdr 读取是哪个进程运行了它之前就已退出,或者 Herdr 无法把运行钩子的进程追溯到该窗格,例如另一个智能体在后台启动、其 shell 已经退出的智能体),也会出现同样的情况。另外,如果另一个 Claude Code 或 Codex 进程报告了同一个会话,在原智能体自己再次报告该会话之前(例如 Claude Code 压缩该会话之后),Herdr 也不会再把它的选项与该会话一起保存。由 Herdr 未监视的智能体报告的会话(例如窗格智能体通过自己的 shell 工具启动的 Claude)会在不带选项的情况下保存。
 
 运行 `herdr integration status` 查看已安装的集成版本。用 `herdr integration install <agent>` 重新安装过期的集成。
 

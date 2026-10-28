@@ -894,12 +894,16 @@ impl App {
     #[cfg(test)]
     pub(crate) fn handle_api_request(&mut self, request: crate::api::schema::Request) -> String {
         self.drain_all_internal_events();
-        self.handle_api_request_after_internal_events_drained(request)
+        self.handle_api_request_after_internal_events_drained(request, None)
     }
 
+    /// `peer_ancestry` is the process that sent a `pane.report_agent_session`
+    /// over the local API socket and its parents, when the server could read
+    /// that process.
     pub(crate) fn handle_api_request_after_internal_events_drained(
         &mut self,
         request: crate::api::schema::Request,
+        peer_ancestry: Option<Vec<crate::platform::AncestorProcess>>,
     ) -> String {
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
@@ -1164,7 +1168,11 @@ impl App {
                 return self.handle_pane_report_agent(request.id, params);
             }
             Method::PaneReportAgentSession(params) => {
-                return self.handle_pane_report_agent_session(request.id, params);
+                return self.handle_pane_report_agent_session(
+                    request.id,
+                    params,
+                    peer_ancestry.as_deref(),
+                );
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
