@@ -29,7 +29,7 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
 | FR-6 | src/terminal/state.rs (command line, `Bound` confirmed carry and reporter arms kept) | terminal::state::tests::launcher_exec_in_the_same_process_records_the_agent_options; terminal::state::tests::seeded_agent_launch_binds_to_the_first_observed_process; terminal::state::tests::a_process_runs_the_conversation_it_was_last_shown_to_run; persist::restore::tests::live_handoff_keeps_a_confirmed_pairing_bound_to_its_process; persist::restore::tests::native_agent_restore_seeds_saved_launch_options_for_the_next_save; exhaustive pairing test | Yes: the command line and the `herdr agent start` seed were exercised live in case K; the live-handoff carry and external-launcher binding are covered by their automated tests only.
 | FR-7 | src/terminal/state.rs | terminal::state::tests::an_unbound_seed_is_not_confirmed_by_a_report_with_no_readable_sender; terminal::state::tests::a_first_observed_process_does_not_take_a_conversation_a_state_report_set (both end with a readable report that pairs the process again) | N/A: it needs a later readable report from the same agent, which a live run cannot force reliably; the automated tests cover it. |
 | FR-8 | src/terminal/state.rs | terminal::state::tests::a_conversation_reported_from_outside_the_pane_is_not_paired_with_the_job; terminal::state::tests::a_report_whose_walk_failed_is_not_paired_with_the_job; terminal::state::tests::a_report_from_a_child_agent_in_the_same_job_is_not_paired_with_its_parent | N/A: no separate user surface; the saved session file is the surface the FR-4 live case reads. |
-| FR-9 | src/terminal/state.rs (`exhaustive_pairing` module) | terminal::state::tests::exhaustive_pairing::exhaustive_pairing_saves_options_only_beside_their_process_conversation: 289,650 sequences up to length 4, 0 failing; the job senders and the known-limit exclusion are gone and `StateReport` events are in the alphabet (`w1/exhaustive-1.log`) | N/A: the exhaustive test is the verification itself. |
+| FR-9 | src/terminal/state.rs (`exhaustive_pairing` module) | terminal::state::tests::exhaustive_pairing::exhaustive_pairing_saves_options_only_beside_their_process_conversation: 289,650 sequences up to length 4, 0 failing; the job senders and the known-limit exclusion are gone and `StateReport` events are in the alphabet (`w1/exhaustive-1.log`) | N/A: the exhaustive test is the verification itself. The oracle learns state-report acceptance from the terminal (review finding r1-2) and still checks pairing against the conversation the terminal holds. |
 | FR-10 | tests only, no production code | At base `34018fa6` with the new tests spliced in, 5 of 5 fail (`w1/base-check.log`), including 1,571 failing sequences from `[StateReport(S), Observe(P, Nothing)]`; at the fix commit (now `32baedef`) the four focused tests and the exhaustive test pass (`w1/focused-head.log`: 606 passed) | N/A: the base check is the verification itself; see `w1/base-check.log`. |
 | FR-11 | docs/next/website/src/content/docs/session-state.mdx, ja/session-state.mdx, zh-cn/session-state.mdx: the foreground-job cause is replaced by "the report did not reach Herdr over its local API socket" | just docs-contract-test: 7 pass; maintenance-test includes scripts.test_docs_translation_parity: pass (`checks-ci.log`, `checks-docs.log`) | N/A: documentation only; checked by just docs-contract-test and the translation parity test. |
 | FR-12 | no change: the branch touches only src/app/actions.rs, src/app/api/panes.rs, src/persist/restore.rs, src/persist/snapshot.rs and src/terminal/state.rs | N/A: no code can test an absence of edits; the diff shows no hook, integration asset, API schema, codec, fixture or protocol version change | N/A: verified by the diff. |
@@ -60,6 +60,18 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
   filter and drops the foreground-job read, and the new tests now set `account: None`. `just ci`
   passes again (4,313 tests passed, 15 skipped); the live check ran on the pre-rebase binary, whose
   code for this path is the same.
+- 2026-10-28 10:38:09 EDT - Portal review round 1 on `c1dcd3d2...5f3b24e8` returned three P4 findings
+  and none of higher severity. Dispositions:
+  - r1-1 (upgrade handoff can carry a foreground-job pairing once): accepted as a known upgrade
+    limit and recorded under Assumptions; no code change, because dropping confirmed pairings at
+    handoff would lose every official-hook user's options at upgrade.
+  - r1-2 (the exhaustive oracle learns state-report acceptance): accepted as a deliberate test
+    bound and recorded under Assumptions; no code change, because state-report acceptance has its
+    own tests and the pairing check still uses the terminal's real conversation.
+  - cs-1 (the `Default` derive on `SessionReportEvidence` has only test callers): fixed by naming
+    `Unidentified` in its two test callers and removing the derive and its `#[default]` attribute. FR-1 to
+    FR-14 stay as they were; the fix changes no behavior, and the focused suites and `just ci` were
+    rerun for the new head.
 
 ## Introduction/Overview
 
@@ -211,6 +223,20 @@ All inferred (G61), each with its reason:
 - Users on Linux, macOS and Windows with the official hooks see no change. Inferred from code (outcome 5 above), not
   verified live in this interview.
 - Review follows the project's normal settings for a standalone task (K-6 revision 2); this PRD adds no gate (G48).
+- Known upgrade limit, inferred (review round 1 finding r1-1): a live handoff that upgrades a server
+  from a build before this change carries `HandoffAgentLaunch::Confirmed` without the kind of
+  evidence, so a pairing the old server confirmed through the removed foreground-job guess arrives as
+  a seed paired at handoff (`SeededLaunch::Paired`) and is recorded as a `ShownBy::Reporter` fact. A
+  later command-line read does not override it, so that one wrong pairing survives the handoff until
+  its process exits or another process reports. Dropping confirmed pairings at handoff would lose
+  the options of every official-hook user at upgrade, so this limit is accepted and recorded rather
+  than fixed here.
+- Testing bound, inferred (review round 1 finding r1-2): in the exhaustive pairing test the driver
+  reports whether the terminal took a state report, and the model applies that answer, so the oracle
+  checks the pairing of the conversation the terminal really holds and does not predict
+  `set_agent_session_ref` acceptance. State-report acceptance has its own tests, and modeling its
+  rules here would test that function again rather than this pairing change. A conversation
+  `Report`'s acceptance is still predicted, and a mismatch fails the test.
 
 ## Open Questions
 
