@@ -57,4 +57,10 @@ pub struct ServerCapabilities {
     /// means acceptance was observed.
     #[serde(default)]
     pub agent_prompt_outcome: bool,
+    /// Agent kinds whose restore repeats the options the agent was launched
+    /// with, read from its command line without what the prefix of the
+    /// launcher it was started through passed on. Absent on servers that do
+    /// not repeat them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_option_replay: Vec<String>,
 }

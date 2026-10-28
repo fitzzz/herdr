@@ -10891,6 +10891,13 @@
               "description": "Whether this server supports endpoint health probes.",
               "type": "boolean"
             },
+            "launch_option_replay": {
+              "description": "Agent kinds whose restore repeats the options the agent was launched\nwith, read from its command line without what the prefix of the\nlauncher it was started through passed on. Absent on servers that do\nnot repeat them.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "live_handoff": {
               "type": "boolean"
             },

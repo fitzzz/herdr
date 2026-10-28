@@ -781,6 +781,7 @@ fn success_response_round_trips() {
                 terminal_input_ack: false,
                 terminal_input_literal: false,
                 agent_prompt_outcome: false,
+                launch_option_replay: Vec::new(),
             }),
         },
     };

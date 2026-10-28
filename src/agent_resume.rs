@@ -165,8 +165,9 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
-/// The options a Claude, Codex or Grok process was launched with, without the parts
-/// that pick or start a conversation, a one-time prompt, or print-and-exit mode.
+/// The options a Claude, Codex, Grok or OpenCode process was launched with,
+/// without the parts that pick or start a conversation, a one-time prompt, or
+/// print-and-exit mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentLaunchOptions {
     Known(Vec<String>),
@@ -188,7 +189,8 @@ pub enum LaunchOptionsUnavailable {
     ExceedsResumeLimits,
 }
 
-/// Whether a Claude, Codex or Grok restore repeated the agent's launch options.
+/// Whether a Claude, Codex, Grok or OpenCode restore repeated the agent's
+/// launch options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchOptionsRestore {
     Kept,
@@ -228,9 +230,12 @@ pub fn launch_account(agent: crate::detect::Agent, value: &str) -> Option<String
 
 /// Launch options from a running process's full command line (`argv[0]`
 /// included). `None` for agents whose restore does not carry launch options.
+/// `launcher` is the launcher bound to the pane: the arguments its prefix
+/// passed on to the process it started are its own, not launch options.
 pub fn launch_options_from_process_argv(
     agent: crate::detect::Agent,
     argv: Option<&[String]>,
+    launcher: Option<&crate::agent_launcher::BoundAgentLauncher>,
 ) -> Option<AgentLaunchOptions> {
     if !carries_launch_options(agent) {
         return None;
@@ -245,10 +250,48 @@ pub fn launch_options_from_process_argv(
         ));
     };
     match agent_args_start(argv) {
-        Some(start) => launch_options_from_agent_args(agent, &argv[start..]),
+        Some(start) => {
+            let args = &argv[start..];
+            let supplied =
+                launcher.map_or(0, |binding| launcher_supplied_len(binding, agent, args));
+            launch_options_from_agent_args(agent, &args[supplied..])
+        }
         None => Some(AgentLaunchOptions::Unavailable(
             LaunchOptionsUnavailable::UnrecognizedCommand,
         )),
+    }
+}
+
+/// How many of an agent process's leading arguments `args` (after its
+/// executable) the bound launcher's prefix passed on, such as the options
+/// after `agent-accounts run claude --account <account> --`. The launcher
+/// passes them again on every restore, so they are not the agent's launch
+/// options. Only the process the binding started counts: its arguments end
+/// with the ones Herdr gave the launcher, and what comes before them ends the
+/// launcher's prefix. The launcher's own part, such as `run claude --account
+/// <account> --`, never reaches the agent.
+fn launcher_supplied_len(
+    binding: &crate::agent_launcher::BoundAgentLauncher,
+    agent: crate::detect::Agent,
+    args: &[String],
+) -> usize {
+    let prefix = &binding.launcher.prefix_args;
+    let native = match binding.argv.split_first() {
+        Some((executable, rest))
+            if *executable == binding.launcher.executable && rest.starts_with(prefix) =>
+        {
+            &rest[prefix.len()..]
+        }
+        _ => return 0,
+    };
+    if binding.agent != crate::detect::agent_label(agent) || !args.ends_with(native) {
+        return 0;
+    }
+    let supplied = &args[..args.len() - native.len()];
+    if prefix.ends_with(supplied) {
+        supplied.len()
+    } else {
+        0
     }
 }
 
@@ -263,6 +306,7 @@ pub fn launch_options_from_agent_args(
         crate::detect::Agent::Claude => parse_claude_args(args).map(|launch| launch.options),
         crate::detect::Agent::Codex => parse_codex_args(args).map(|launch| launch.options),
         crate::detect::Agent::Grok => parse_grok_args(args).map(|launch| launch.options),
+        crate::detect::Agent::OpenCode => parse_opencode_args(args).map(|launch| launch.options),
         _ => return None,
     };
     Some(match parsed {
@@ -294,9 +338,9 @@ fn option_name(arg: &str) -> &str {
     &arg[..end]
 }
 
-/// The conversation id a Claude, Codex or Grok process command line resumes
-/// (`claude --resume <id>`, `codex resume <id>`, `grok --resume <id>`), when
-/// it names one. A fork (`claude --resume <id> --fork-session`, the same in
+/// The conversation id a Claude, Codex, Grok or OpenCode process command line
+/// resumes (`claude --resume <id>`, `codex resume <id>`, `grok --resume <id>`,
+/// `opencode --session <id>`), when it names one. A fork (`claude --resume <id> --fork-session`, the same in
 /// Grok) runs a new conversation and names none; Codex forks with
 /// `codex fork`, which is not read as a resume.
 pub fn resumed_session_from_process_argv(
@@ -323,6 +367,7 @@ pub fn resumed_session_from_process_argv(
                 .filter(|launch| !launch.fork)?
                 .session_id
         }
+        crate::detect::Agent::OpenCode => parse_opencode_args(args).ok()?.session_id,
         _ => None,
     }
 }
@@ -336,12 +381,13 @@ pub fn plan_with_launch_options(
     launch_options: Option<&[String]>,
 ) -> Option<(AgentResumePlan, Option<LaunchOptionsRestore>)> {
     let bare = plan(source, agent, session_ref)?;
-    // Claude and Grok take options before `--resume <id>`; Codex after
-    // `resume <id>`.
-    let options_first = match (source, agent, session_ref.kind) {
+    // Claude and Grok take options before `--resume <id>`, OpenCode before
+    // `--session <id>`; Codex after `resume <id>`.
+    let session_flag = match (source, agent, session_ref.kind) {
         ("herdr:claude", "claude", AgentSessionRefKind::Id)
-        | ("herdr:grok", "grok", AgentSessionRefKind::Id) => true,
-        ("herdr:codex", "codex", AgentSessionRefKind::Id) => false,
+        | ("herdr:grok", "grok", AgentSessionRefKind::Id) => Some("--resume"),
+        ("herdr:opencode", "opencode", AgentSessionRefKind::Id) => Some("--session"),
+        ("herdr:codex", "codex", AgentSessionRefKind::Id) => None,
         _ => return Some((bare, None)),
     };
     let Some(options) = launch_options else {
@@ -357,13 +403,13 @@ pub fn plan_with_launch_options(
     }
 
     // Codex takes the id directly after `resume` so no option value can
-    // swallow it; Claude's and Grok's `--resume` starts with a dash, which
-    // ends any variadic option before it.
+    // swallow it; the other agents' flag starts with a dash, which ends any
+    // variadic option before it.
     let id = session_ref.value.clone();
-    let argv: Vec<String> = if options_first {
+    let argv: Vec<String> = if let Some(session_flag) = session_flag {
         std::iter::once(agent.to_string())
             .chain(options.iter().cloned())
-            .chain(["--resume".to_string(), id])
+            .chain([session_flag.to_string(), id])
             .collect()
     } else {
         ["codex".to_string(), "resume".to_string(), id]
@@ -390,7 +436,10 @@ pub fn plan_with_launch_options(
 pub fn carries_launch_options(agent: crate::detect::Agent) -> bool {
     matches!(
         agent,
-        crate::detect::Agent::Claude | crate::detect::Agent::Codex | crate::detect::Agent::Grok
+        crate::detect::Agent::Claude
+            | crate::detect::Agent::Codex
+            | crate::detect::Agent::Grok
+            | crate::detect::Agent::OpenCode
     )
 }
 
@@ -742,6 +791,29 @@ const GROK_SUBCOMMANDS: &[&str] = &[
     "wrap",
 ];
 
+/// Options of `opencode --help` 2.0.32, and `-m, --model` of the earlier
+/// OpenCode CLI, which 2.0.32 refuses at launch. The interactive command takes
+/// no option with more than one value.
+const OPENCODE_OPTIONS: &[LaunchOptionSpec] = &[
+    kept(&["--auto"], Flag),
+    kept(&["--standalone"], Flag),
+    kept(&["--server"], Value),
+    kept(&["-m", "--model"], Value),
+    kept(&["--log-level"], Value),
+    kept(&["--print-logs"], Flag),
+    // They pick or start a conversation; the saved session id takes their place.
+    dropped(&["-s", "--session"], Value),
+    dropped(&["-c", "--continue"], Flag),
+    // A one-time prompt.
+    dropped(&["--prompt"], Value),
+    // Asks for a command's arguments once.
+    dropped(&["--wizard"], Flag),
+    // Print help, the version or a completion script and exit.
+    dropped(&["--completions"], Value),
+    dropped(&["-h", "--help"], Flag),
+    dropped(&["-v", "--version"], Flag),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParserStyle {
     Commander,
@@ -1049,6 +1121,45 @@ fn parse_grok_args(args: &[String]) -> Result<GrokLaunch, ArgsRejected> {
                 index += 1;
             }
             LaunchArg::EndOfOptions => break,
+        }
+    }
+    Ok(launch)
+}
+
+#[derive(Debug, Default)]
+struct OpenCodeLaunch {
+    options: Vec<String>,
+    /// The conversation `--session <id>`, in any form, names: the one it
+    /// continues, or creates with that id.
+    session_id: Option<String>,
+}
+
+/// The launch options in an OpenCode command line: options in any order. An
+/// operand is a subcommand or the directory to start in, which restore does
+/// not repeat, so it makes the options unavailable.
+fn parse_opencode_args(args: &[String]) -> Result<OpenCodeLaunch, ArgsRejected> {
+    let mut launch = OpenCodeLaunch::default();
+    let mut index = 0;
+    let rejected = |reason, at| ArgsRejected { reason, at };
+    while index < args.len() {
+        match next_launch_arg(OPENCODE_OPTIONS, ParserStyle::Clap, &args[index..])
+            .map_err(|reason| rejected(reason, index))?
+        {
+            LaunchArg::Option { spec, len, value } => {
+                if spec.keep {
+                    launch.options.extend_from_slice(&args[index..index + len]);
+                }
+                if spec.names[0] == "-s" {
+                    launch.session_id = value.map(String::from);
+                }
+                index += len;
+            }
+            LaunchArg::Operand | LaunchArg::EndOfOptions => {
+                return Err(rejected(
+                    LaunchOptionsUnavailable::UnrecognizedCommand,
+                    index,
+                ));
+            }
         }
     }
     Ok(launch)
@@ -2405,7 +2516,8 @@ mod tests {
             assert_eq!(
                 launch_options_from_process_argv(
                     Agent::Claude,
-                    Some(&argv(&[argv0, "--model", "opus", "--resume", "id"]))
+                    Some(&argv(&[argv0, "--model", "opus", "--resume", "id"])),
+                    None
                 ),
                 Some(known(&["--model", "opus"])),
                 "{argv0}"
@@ -2420,7 +2532,8 @@ mod tests {
                     "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                     "--model",
                     "opus"
-                ]))
+                ])),
+                None
             ),
             Some(known(&["--model", "opus"]))
         );
@@ -2439,7 +2552,8 @@ mod tests {
                         "id",
                         "--cd",
                         "/placeholder"
-                    ]))
+                    ])),
+                    None
                 ),
                 Some(known(&["--no-daemon", "--cd", "/placeholder"])),
                 "{argv0}"
@@ -2460,7 +2574,7 @@ mod tests {
             let mut full = argv(runtime);
             full.extend(argv(&["resume", "id", "-m", "x"]));
             assert_eq!(
-                launch_options_from_process_argv(Agent::Codex, Some(&full)),
+                launch_options_from_process_argv(Agent::Codex, Some(&full), None),
                 Some(known(&["-m", "x"])),
                 "{runtime:?}"
             );
@@ -2474,7 +2588,7 @@ mod tests {
             &["python3", "/placeholder/claude.py"][..],
         ] {
             assert_eq!(
-                launch_options_from_process_argv(Agent::Claude, Some(&argv(shape))),
+                launch_options_from_process_argv(Agent::Claude, Some(&argv(shape)), None),
                 Some(unavailable(LaunchOptionsUnavailable::UnrecognizedCommand)),
                 "{shape:?}"
             );
@@ -2488,7 +2602,7 @@ mod tests {
         for agent in [Agent::Claude, Agent::Codex] {
             for shape in [&["claude", ""][..], &["claude", "", "", ""][..]] {
                 assert_eq!(
-                    launch_options_from_process_argv(agent, Some(&argv(shape))),
+                    launch_options_from_process_argv(agent, Some(&argv(shape)), None),
                     Some(unavailable(LaunchOptionsUnavailable::CommandLineUnreadable)),
                     "{agent:?} {shape:?}"
                 );
@@ -2497,13 +2611,14 @@ mod tests {
         // The program name alone is an agent launched without options, and an
         // empty value of an option stays a value.
         assert_eq!(
-            launch_options_from_process_argv(Agent::Claude, Some(&argv(&["claude"]))),
+            launch_options_from_process_argv(Agent::Claude, Some(&argv(&["claude"])), None),
             Some(known(&[]))
         );
         assert_eq!(
             launch_options_from_process_argv(
                 Agent::Claude,
-                Some(&argv(&["claude", "--append-system-prompt", ""]))
+                Some(&argv(&["claude", "--append-system-prompt", ""])),
+                None
             ),
             Some(known(&["--append-system-prompt", ""]))
         );
@@ -2574,7 +2689,7 @@ mod tests {
     fn unreadable_command_line_makes_options_unavailable() {
         for agent in [Agent::Claude, Agent::Codex] {
             assert_eq!(
-                launch_options_from_process_argv(agent, None),
+                launch_options_from_process_argv(agent, None, None),
                 Some(unavailable(LaunchOptionsUnavailable::CommandLineUnreadable))
             );
         }
@@ -2711,7 +2826,7 @@ mod tests {
                 launch_options_from_agent_args(agent, &argv(&["--model", "x"])),
                 None
             );
-            assert_eq!(launch_options_from_process_argv(agent, None), None);
+            assert_eq!(launch_options_from_process_argv(agent, None, None), None);
         }
     }
 
@@ -2727,13 +2842,13 @@ mod tests {
         ];
         let (plan, _) = restore("herdr:claude", "claude", "claude-session", Some(&claude));
         assert_eq!(
-            launch_options_from_process_argv(Agent::Claude, Some(&plan.argv)),
+            launch_options_from_process_argv(Agent::Claude, Some(&plan.argv), None),
             Some(known(&claude))
         );
         let codex = ["--no-daemon", "-c", "model_reasoning_effort=high"];
         let (plan, _) = restore("herdr:codex", "codex", "codex-session", Some(&codex));
         assert_eq!(
-            launch_options_from_process_argv(Agent::Codex, Some(&plan.argv)),
+            launch_options_from_process_argv(Agent::Codex, Some(&plan.argv), None),
             Some(known(&codex))
         );
         assert_eq!(
@@ -2782,7 +2897,7 @@ mod tests {
         assert_eq!(plan.argv, expected);
         assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
         assert_eq!(
-            launch_options_from_process_argv(Agent::Grok, Some(&plan.argv)),
+            launch_options_from_process_argv(Agent::Grok, Some(&plan.argv), None),
             Some(known(&full_access))
         );
         assert_eq!(
@@ -2935,5 +3050,366 @@ mod tests {
             &argv(&["resume", "codex-session"])
         )
         .is_none());
+    }
+
+    /// The launcher a pane is bound to after `agent.start_with_launcher` or a
+    /// restore through it gave the launcher `native` arguments.
+    fn bound_launcher(
+        agent: Agent,
+        prefix: &[&str],
+        native: &[String],
+    ) -> crate::agent_launcher::BoundAgentLauncher {
+        let launcher = crate::api::schema::AgentLauncher {
+            executable: "/usr/bin/placeholder-launcher".into(),
+            prefix_args: argv(prefix),
+            env: Default::default(),
+        };
+        crate::agent_launcher::BoundAgentLauncher {
+            observed: false,
+            argv: launcher.argv(native),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            launcher,
+            agent: crate::detect::agent_label(agent).into(),
+            session: None,
+        }
+    }
+
+    /// The command line of the agent a launcher started: its executable, the
+    /// part of the prefix the launcher passed on, then the native arguments.
+    fn launched_process(executable: &str, passed_on: &[&str], native: &[String]) -> Vec<String> {
+        std::iter::once(executable.to_string())
+            .chain(argv(passed_on))
+            .chain(native.iter().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn restore_through_a_launcher_does_not_repeat_what_its_prefix_passed_on() {
+        let session = AgentSessionRef::id("conversation").unwrap();
+        for (source, agent, executable, prefix, passed_on, admission) in [
+            (
+                "herdr:claude",
+                Agent::Claude,
+                "/home/placeholder/.local/bin/claude",
+                &[
+                    "run",
+                    "claude",
+                    "--account",
+                    "claude:a@example.com",
+                    "--",
+                    "--setting-sources",
+                    "project,local",
+                    "--add-dir",
+                    "/run/root",
+                    "--strict-mcp-config",
+                ][..],
+                &[
+                    "--setting-sources",
+                    "project,local",
+                    "--add-dir",
+                    "/run/root",
+                    "--strict-mcp-config",
+                ][..],
+                &[
+                    "--model",
+                    "claude-sonnet-5-5",
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--add-dir",
+                    "/run",
+                ][..],
+            ),
+            (
+                "herdr:codex",
+                Agent::Codex,
+                "/home/placeholder/.local/bin/codex",
+                &[
+                    "run",
+                    "codex",
+                    "--account",
+                    "codex:a@example.com",
+                    "--home-profile",
+                    "/run/profile",
+                    "--",
+                    "--disable",
+                    "worktrees",
+                ],
+                &["--disable", "worktrees"],
+                &[
+                    "-m",
+                    "gpt-6.1-sol",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--no-daemon",
+                ],
+            ),
+            (
+                "herdr:opencode",
+                Agent::OpenCode,
+                "/home/placeholder/@opencode/cli/bin/opencode.exe",
+                &["opencode", "--standalone"],
+                &["--standalone"],
+                &["--auto", "--session", "conversation"],
+            ),
+        ] {
+            let label = crate::detect::agent_label(agent);
+            let mut native = argv(admission);
+            let mut processes = Vec::new();
+            // Admission, then three restores, each replaying the options read
+            // from the process before it through the same launcher.
+            for _ in 0..4 {
+                let binding = bound_launcher(agent, prefix, &native);
+                let process = launched_process(executable, passed_on, &native);
+                let Some(AgentLaunchOptions::Known(options)) =
+                    launch_options_from_process_argv(agent, Some(&process), Some(&binding))
+                else {
+                    panic!("{label}: the launched command line should parse");
+                };
+                assert!(
+                    !options.starts_with(&argv(passed_on)),
+                    "{label}: {options:?}"
+                );
+                let (plan, outcome) =
+                    plan_with_launch_options(source, label, &session, Some(&options)).unwrap();
+                assert_eq!(outcome, Some(LaunchOptionsRestore::Kept), "{label}");
+                native = plan.argv[1..].to_vec();
+                processes.push(process);
+            }
+            assert_eq!(processes[1], processes[2], "{label}");
+            assert_eq!(processes[2], processes[3], "{label}");
+            let passed_on = argv(passed_on);
+            assert_eq!(
+                processes[3]
+                    .windows(passed_on.len())
+                    .filter(|window| *window == passed_on.as_slice())
+                    .count(),
+                1,
+                "{label}: {:?}",
+                processes[3]
+            );
+        }
+    }
+
+    #[test]
+    fn options_are_read_whole_unless_the_bound_launcher_started_the_process() {
+        let prefix = &[
+            "run",
+            "claude",
+            "--account",
+            "claude:a@example.com",
+            "--",
+            "--effort",
+            "low",
+        ];
+        let native = argv(&["--model", "claude-sonnet-5-5"]);
+        let binding = bound_launcher(Agent::Claude, prefix, &native);
+        fn read(
+            agent: Agent,
+            process: &[&str],
+            binding: Option<&crate::agent_launcher::BoundAgentLauncher>,
+        ) -> Option<AgentLaunchOptions> {
+            launch_options_from_process_argv(agent, Some(&argv(process)), binding)
+        }
+        // Started by the launcher: the prefix's part is its own.
+        assert_eq!(
+            read(
+                Agent::Claude,
+                &["claude", "--effort", "low", "--model", "claude-sonnet-5-5"],
+                Some(&binding)
+            ),
+            Some(known(&["--model", "claude-sonnet-5-5"]))
+        );
+        // An option given twice, once by the prefix and once to Herdr, is
+        // kept once, as Herdr was given it.
+        let twice = argv(&["--effort", "low", "--model", "claude-sonnet-5-5"]);
+        assert_eq!(
+            read(
+                Agent::Claude,
+                &[
+                    "claude",
+                    "--effort",
+                    "low",
+                    "--effort",
+                    "low",
+                    "--model",
+                    "claude-sonnet-5-5"
+                ],
+                Some(&bound_launcher(Agent::Claude, prefix, &twice))
+            ),
+            Some(known(&["--effort", "low", "--model", "claude-sonnet-5-5"]))
+        );
+        let whole = ["claude", "--effort", "low", "--model", "claude-haiku-5-5"];
+        // A process started another way, such as by hand in the same pane.
+        assert_eq!(
+            read(Agent::Claude, &whole, Some(&binding)),
+            Some(known(&whole[1..]))
+        );
+        // A launcher bound for another agent.
+        assert_eq!(
+            read(
+                Agent::Claude,
+                &["claude", "--effort", "low", "--model", "claude-sonnet-5-5"],
+                Some(&bound_launcher(Agent::Codex, prefix, &native))
+            ),
+            Some(known(&["--effort", "low", "--model", "claude-sonnet-5-5"]))
+        );
+        // A binding without the arguments it was started with.
+        let mut unknown_argv = binding.clone();
+        unknown_argv.argv.clear();
+        assert_eq!(
+            read(
+                Agent::Claude,
+                &["claude", "--effort", "low", "--model", "claude-sonnet-5-5"],
+                Some(&unknown_argv)
+            ),
+            Some(known(&["--effort", "low", "--model", "claude-sonnet-5-5"]))
+        );
+        // Arguments before the native ones that the prefix does not end with.
+        assert_eq!(
+            read(
+                Agent::Claude,
+                &["claude", "--verbose", "--model", "claude-sonnet-5-5"],
+                Some(&binding)
+            ),
+            Some(known(&["--verbose", "--model", "claude-sonnet-5-5"]))
+        );
+    }
+
+    #[test]
+    fn an_account_launcher_prefix_passes_no_options_so_none_are_lost() {
+        // `[session] account_launcher` restores run `agent-accounts run
+        // <agent> --account <account> -- <resume arguments>` and bind nothing;
+        // a pane bound to such a launcher reads every agent option as its own.
+        let session = AgentSessionRef::id("conversation").unwrap();
+        let prefix = ["run", "claude", "--account", "claude:a@example.com", "--"];
+        let mut native = argv(&["--model", "claude-haiku-5-5", "--effort", "low"]);
+        for binding in [true, false] {
+            for _ in 0..3 {
+                let process = launched_process("/home/placeholder/claude", &[], &native);
+                let launcher = bound_launcher(Agent::Claude, &prefix, &native);
+                let options = launch_options_from_process_argv(
+                    Agent::Claude,
+                    Some(&process),
+                    binding.then_some(&launcher),
+                );
+                assert_eq!(
+                    options,
+                    Some(known(&["--model", "claude-haiku-5-5", "--effort", "low"]))
+                );
+                let Some(AgentLaunchOptions::Known(options)) = options else {
+                    unreachable!()
+                };
+                let (plan, _) =
+                    plan_with_launch_options("herdr:claude", "claude", &session, Some(&options))
+                        .unwrap();
+                native = plan.argv[1..].to_vec();
+            }
+        }
+    }
+
+    fn opencode_options(args: &[&str]) -> AgentLaunchOptions {
+        launch_options_from_agent_args(Agent::OpenCode, &argv(args)).unwrap()
+    }
+
+    #[test]
+    fn opencode_auto_and_model_options_are_kept_on_restore() {
+        let options = [
+            "--auto",
+            "--standalone",
+            "-m",
+            "anthropic/claude-sonnet-5-5",
+            "--log-level",
+            "debug",
+            "--print-logs",
+            "--server",
+            "http://127.0.0.1:4096",
+        ];
+        assert_eq!(opencode_options(&options), known(&options));
+        assert_eq!(
+            opencode_options(&["--model=anthropic/claude-sonnet-5-5", "--log-level=info"]),
+            known(&["--model=anthropic/claude-sonnet-5-5", "--log-level=info"])
+        );
+        let (plan, outcome) = restore(
+            "herdr:opencode",
+            "opencode",
+            "ses_conversation",
+            Some(&["--auto"]),
+        );
+        assert_eq!(
+            plan.argv,
+            ["opencode", "--auto", "--session", "ses_conversation"]
+        );
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        // OpenCode's package runs its native binary with the same arguments.
+        let mut process = plan.argv.clone();
+        process[0] = "/home/placeholder/node_modules/@opencode/cli/bin/opencode.exe".into();
+        for process in [&plan.argv, &process] {
+            assert_eq!(
+                launch_options_from_process_argv(Agent::OpenCode, Some(process), None),
+                Some(known(&["--auto"]))
+            );
+            assert_eq!(
+                resumed_session_from_process_argv(Agent::OpenCode, process).as_deref(),
+                Some("ses_conversation")
+            );
+        }
+        let (plan, outcome) = restore("herdr:opencode", "opencode", "ses_conversation", None);
+        assert_eq!(plan.argv, ["opencode", "--session", "ses_conversation"]);
+        assert_eq!(
+            outcome,
+            Some(LaunchOptionsRestore::NotKept(
+                LaunchOptionsUnavailable::NotRecorded
+            ))
+        );
+    }
+
+    #[test]
+    fn opencode_conversation_prompt_and_one_time_parts_are_dropped() {
+        for one_time in [
+            &["-s", "ses_old"][..],
+            &["--session=ses_old"],
+            &["-c"],
+            &["--continue"],
+            &["--prompt", "fix the build"],
+            &["--wizard"],
+            &["--completions", "bash"],
+            &["-h"],
+            &["--version"],
+        ] {
+            let mut args = vec!["--auto"];
+            args.extend(one_time);
+            assert_eq!(opencode_options(&args), known(&["--auto"]), "{one_time:?}");
+        }
+        assert_eq!(
+            resumed_session_from_process_argv(
+                Agent::OpenCode,
+                &argv(&["opencode", "-s", "ses_named", "--auto"])
+            )
+            .as_deref(),
+            Some("ses_named")
+        );
+        assert_eq!(
+            resumed_session_from_process_argv(Agent::OpenCode, &argv(&["opencode", "--continue"])),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_operands_and_unknown_options_make_options_unavailable() {
+        for args in [
+            &["run", "say hi"][..],
+            &["--auto", "session", "list"],
+            &["--auto", "/home/placeholder/project"],
+            &["--auto", "--", "project"],
+        ] {
+            assert_eq!(
+                opencode_options(args),
+                unavailable(LaunchOptionsUnavailable::UnrecognizedCommand),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            opencode_options(&["--auto", "--not-an-opencode-option"]),
+            unavailable(LaunchOptionsUnavailable::UnsupportedOption)
+        );
     }
 }

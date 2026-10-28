@@ -476,6 +476,7 @@ fn launch_options_notice(
         Some(crate::detect::Agent::Claude) => "Claude",
         Some(crate::detect::Agent::Codex) => "Codex",
         Some(crate::detect::Agent::Grok) => "Grok",
+        Some(crate::detect::Agent::OpenCode) => "OpenCode",
         _ => agent,
     };
     Some(format!(
@@ -1652,6 +1653,7 @@ mod tests {
             crate::agent_resume::launch_options_from_process_argv(
                 crate::detect::Agent::Claude,
                 Some(&argv),
+                None,
             )
         else {
             panic!("an empty option value should parse");

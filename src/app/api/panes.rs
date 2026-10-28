@@ -1638,14 +1638,14 @@ impl App {
         )
     }
 
-    /// What the server can tell, as a Claude, Codex or Grok conversation report
+    /// What the server can tell, as a Claude, Codex, Grok or OpenCode conversation report
     /// arrives, about which process sent it: read here, once per report, so a
     /// launch record pairs the conversation only on that evidence. The agent
     /// process in `peer_ancestry`, the process on the other end of the API
     /// connection and its parents, is the reporter when the walk places it in
     /// the pane; otherwise the report stays undecided. Only when the server
     /// could not read that process does the pane's foreground job show which
-    /// Claude, Codex or Grok processes could have sent the report.
+    /// Claude, Codex, Grok or OpenCode processes could have sent the report.
     fn session_report_evidence(
         &self,
         ws_idx: usize,
