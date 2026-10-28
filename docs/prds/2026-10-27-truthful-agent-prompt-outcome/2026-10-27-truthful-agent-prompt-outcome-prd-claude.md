@@ -320,8 +320,7 @@ not_submitted only when Herdr has positive evidence the text stayed or was rejec
 without evidence; (4) advertise the behaviour as a capability in ping, and keep the existing wait mode working; (5)
 the required checks stay: the six conditions that already deliver, including prompting a working agent, must still
 report success. Supervisor's reason: the false success is the defect; an opt-in leaves every existing caller on it,
-and refuse-only misses unrecognised states. Refinement (1)'s "unsent draft" conflicts with (5) for M5 and is
-question 5; the supervisor corrected it in its decision on question 2: an unsent draft does not refuse.
+and refuse-only misses unrecognised states. Refinement (1)'s "unsent draft" is settled by the supervisor's decision on question 2 below: a real unsent draft now refuses as not ready, replacing the earlier marker answer.
 
 *Earlier record, superseded:* withdrawn by this interview, inferred (a), with an accepted-or-unverified success field.
 
