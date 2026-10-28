@@ -675,6 +675,11 @@ impl PaneTerminal {
         self.ghostty.agent_osc_title()
     }
 
+    #[cfg(unix)]
+    pub fn handoff_agent_osc_state(&self) -> crate::handoff_runtime::HandoffAgentOscState {
+        self.ghostty.handoff_agent_osc_state()
+    }
+
     pub fn agent_osc_progress(&self) -> String {
         self.ghostty.agent_osc_progress()
     }
@@ -1382,6 +1387,24 @@ impl GhosttyPaneTerminal {
     pub fn seed_terminal_title(&self, title: Option<String>) {
         if let Ok(mut core) = self.core.lock() {
             core.agent_osc_state.seed_terminal_title(title);
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn handoff_agent_osc_state(&self) -> crate::handoff_runtime::HandoffAgentOscState {
+        self.core
+            .lock()
+            .map(|core| core.agent_osc_state.handoff_agent_osc_state())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    pub fn seed_handoff_agent_osc_state(
+        &self,
+        state: crate::handoff_runtime::HandoffAgentOscState,
+    ) {
+        if let Ok(mut core) = self.core.lock() {
+            core.agent_osc_state.seed_handoff_agent_osc_state(state);
         }
     }
 

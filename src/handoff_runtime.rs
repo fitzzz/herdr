@@ -25,6 +25,10 @@ pub(crate) struct HandoffRuntimeState {
     pub input_state: Option<crate::pane::InputState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_title: Option<String>,
+    /// OSC evidence agent detection reads. Absent from runtimes written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_osc: Option<HandoffAgentOscState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +41,18 @@ pub(crate) struct HandoffRuntimeState {
     /// quiesced, so every admitted write is already on the PTY.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_streams: Option<Box<crate::terminal::input_streams::HandoffInputStreams>>,
+}
+
+/// The latest OSC 0/2 title and OSC 9 progress the pane's agent emitted, as
+/// retained for agent detection. Kept apart from `terminal_title` because a
+/// foreground agent change clears this evidence but keeps the displayed title.
+#[cfg(unix)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandoffAgentOscState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<String>,
 }
 
 #[cfg(unix)]
@@ -130,6 +146,7 @@ mod tests {
         let state: HandoffRuntimeState =
             serde_json::from_value(older).expect("an older runtime state should still load");
         assert_eq!(state.agent_launch, None);
+        assert_eq!(state.agent_osc, None);
 
         let confirmed = Some(HandoffAgentLaunch::Confirmed {
             process_id: 4242,
