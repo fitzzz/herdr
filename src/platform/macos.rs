@@ -1025,6 +1025,11 @@ fn procargs2_env(buf: &[u8]) -> Option<&[u8]> {
     rest.get(env_start..)
 }
 
+/// A process's environment is not read on macOS.
+pub(crate) fn process_environment_value(_pid: u32, _name: &str) -> Option<Option<String>> {
+    None
+}
+
 /// Get the current working directory of a process.
 ///
 /// Uses `proc_pidinfo(PROC_PIDVNODEPATHINFO)` to read `pvi_cdir.vip_path`.

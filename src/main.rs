@@ -397,6 +397,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 # Milliseconds between automatic agent restores; 0 starts them without spacing.
 # startup_per_agent_delay_ms = 100
+# Restore Claude and Codex agents through this agent-accounts executable, on the
+# account each conversation ran under. Unset types the resume command instead.
+# account_launcher = "~/bin/agent-accounts"
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

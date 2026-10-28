@@ -554,6 +554,15 @@ startup_per_agent_delay_ms = 100
 
 为减少启动时的资源争用，自动恢复默认每隔 100 毫秒启动一个智能体。第一个满足条件的智能体会立即启动。设置 `startup_per_agent_delay_ms = 0` 可禁用间隔。手动启动和显式连接终端不受影响。修改后需重启 Herdr 服务器。
 
+如果你通过 `agent-accounts` 启动器在多个登录上运行 Claude Code 和 Codex,把 `account_launcher` 设为它的可执行文件,恢复时就会把每个会话放回它原来使用的登录:
+
+```toml
+[session]
+account_launcher = "~/bin/agent-accounts"
+```
+
+Herdr 随后用 `<account_launcher> run <agent> --account <account> -- <resume command>` 恢复 Claude Code 或 Codex 窗格,并设置 `AGENT_ACCOUNTS_ID` 和 `AGENT_ACCOUNTS_REQUIRED=1`,因此无法使用的登录会停止启动,而不是改选其他登录。账号取自智能体进程的 `AGENT_ACCOUNTS_ID`,Herdr 在 Linux 上读取智能体命令行时一并读取。通过 `agent.start_with_launcher` 启动的窗格继续使用启动时的启动器。Grok 等其他智能体按原方式恢复。此设置默认关闭;修改后需重启 Herdr 服务器。账号未知时的行为见[会话状态与恢复](/docs/session-state/)。
+
 只有通过官方集成获得有效原生会话引用的窗格才能恢复；其他窗格会作为普通 shell 恢复。有关受支持的智能体和持久化行为，请参阅[会话状态与恢复](/docs/session-state/)。
 
 ## IME 光标跟踪

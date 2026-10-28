@@ -89,14 +89,17 @@ pub enum AppEvent {
         agent: Agent,
         observed_at: Instant,
     },
-    /// Process detection read the command line of a new Claude or Codex
-    /// process, read with when it started. `argv` is `None` where the
-    /// platform does not read it.
+    /// Process detection read the command line of a new Claude, Codex or
+    /// Grok process, read with when it started. `argv` is `None` where the
+    /// platform does not read it. `account` is the Claude or Codex account
+    /// its `AGENT_ACCOUNTS_ID` names, `Some(None)` when it names none, and
+    /// `None` when the environment was not read.
     AgentLaunchObserved {
         pane_id: PaneId,
         agent: Agent,
         process: crate::platform::ProcessInstance,
         argv: Option<Vec<String>>,
+        account: Option<Option<String>>,
     },
     /// The current Codex input screen is visible during managed startup.
     CodexPromptObserved { pane_id: PaneId, ready: bool },

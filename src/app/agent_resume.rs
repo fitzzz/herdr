@@ -236,6 +236,17 @@ impl App {
         // The pane runs the configured shell, so the command is quoted for it.
         let shell = crate::pane::pane_shell(&self.state.default_shell);
         let native_args = plan.argv.get(1..).unwrap_or_default();
+        let refuse = |app: &mut Self, error: String| {
+            if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+                terminal.pending_agent_resume_plan = None;
+                terminal.restore_error = Some(error);
+                terminal.restore_typed_nothing();
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
+        };
+        // What restore types: `None` starts the shell and types nothing, with
+        // `unresumed` saying why.
+        let mut unresumed = None;
         let resume_command = if let Some(binding) = &plan.launcher {
             let session = self
                 .state
@@ -251,31 +262,66 @@ impl App {
             let command = if identity_matches {
                 binding.launcher.restore_line(native_args, &shell)
             } else {
-                Err("Saved launcher does not match the native conversation identity".into())
+                let error = launcher_mismatch_error(binding, &plan.agent, session);
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    error = %error,
+                    "refused agent resume through a saved launcher of another conversation"
+                );
+                Err(error)
             };
             match command {
                 Ok(command) => Some(command),
                 Err(error) => {
-                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                        terminal.pending_agent_resume_plan = None;
-                        terminal.restore_error = Some(error);
-                        terminal.restore_typed_nothing();
-                        terminal.revision = terminal.revision.saturating_add(1);
-                    }
+                    refuse(self, error);
                     return true;
                 }
             }
+        } else if let Some(executable) = self.account_launcher.as_deref().filter(|_| {
+            crate::detect::parse_agent_label(&plan.agent)
+                .is_some_and(crate::agent_resume::uses_account_launcher)
+        }) {
+            let account = self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.launch_account_for_session(&plan.agent));
+            if let Some(account) = account {
+                match crate::agent_launcher::account_launcher(executable, &plan.agent, &account)
+                    .restore_line(native_args, &shell)
+                {
+                    Ok(command) => Some(command),
+                    Err(error) => {
+                        refuse(self, error);
+                        return true;
+                    }
+                }
+            } else {
+                let notice = unknown_account_notice(executable, &plan.argv);
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    "agent not resumed: the account its conversation ran under is unknown"
+                );
+                unresumed = Some(notice);
+                None
+            }
         } else {
-            crate::platform::interactive_shell_restore_command(&plan.argv, &shell)
-        };
-        let Some(resume_command) = resume_command else {
-            tracing::warn!(
-                pane = pane_id.raw(),
-                terminal = %terminal_id,
-                agent = %plan.agent,
-                "failed to start deferred agent resume with empty argv"
-            );
-            return false;
+            let Some(command) =
+                crate::platform::interactive_shell_restore_command(&plan.argv, &shell)
+            else {
+                tracing::warn!(
+                    pane = pane_id.raw(),
+                    terminal = %terminal_id,
+                    agent = %plan.agent,
+                    "failed to start deferred agent resume with empty argv"
+                );
+                return false;
+            };
+            Some(command)
         };
         let Some(launch_env) = self
             .find_pane(pane_id)
@@ -294,12 +340,15 @@ impl App {
             return true;
         }
 
-        let launch_options_notice = self
-            .state
-            .terminals
-            .get(&terminal_id)
-            .and_then(|terminal| terminal.agent_launch_restore)
-            .and_then(|outcome| launch_options_notice(&plan.agent, outcome));
+        let launch_options_notice = match &unresumed {
+            Some(notice) => Some(format!("\x1b[33mHerdr: {notice}\x1b[0m\r\n")),
+            None => self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.agent_launch_restore)
+                .and_then(|outcome| launch_options_notice(&plan.agent, outcome)),
+        };
         let runtime = match crate::terminal::TerminalRuntime::spawn_with_initial_history(
             pane_id,
             rows,
@@ -334,7 +383,16 @@ impl App {
             }
         };
 
-        let mut input = resume_command;
+        let Some(mut input) = resume_command else {
+            self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.pending_agent_resume_plan = None;
+                terminal.restore_error = unresumed;
+                terminal.restore_typed_nothing();
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
+            return true;
+        };
         input.push('\r');
         if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
             tracing::warn!(
@@ -363,6 +421,40 @@ impl App {
     }
 }
 
+/// Why a launcher bound to one conversation was not used to resume another.
+fn launcher_mismatch_error(
+    binding: &crate::agent_launcher::BoundAgentLauncher,
+    agent: &str,
+    session: Option<&crate::agent_resume::PersistedAgentSession>,
+) -> String {
+    let bound = binding
+        .session
+        .as_ref()
+        .map_or("no conversation", |session| session.value.as_str());
+    let saved = session.map_or("no conversation", |session| {
+        session.session_ref.value.as_str()
+    });
+    format!(
+        "Saved launcher does not match the native conversation identity: the {} launcher was \
+         started for {bound}, but this pane saved {agent} conversation {saved}. Herdr did not \
+         resume it, so it cannot run on the wrong account. Resume it yourself in a new pane.",
+        binding.agent
+    )
+}
+
+/// What a restored pane says when its Claude or Codex conversation was not
+/// resumed because nothing recorded the account it ran under.
+fn unknown_account_notice(executable: &std::path::Path, argv: &[String]) -> String {
+    let agent = argv.first().map_or("", String::as_str);
+    format!(
+        "this {agent} conversation was not resumed: Herdr does not know which account it ran \
+         under, and resuming it on another account could use the wrong login. Resume it on its \
+         account with: {} run {agent} --account <account> -- {}",
+        executable.display(),
+        argv.get(1..).unwrap_or_default().join(" ")
+    )
+}
+
 /// The line written into a restored pane whose agent resumed without the
 /// options it was launched with, so the user can relaunch it in the right mode.
 fn launch_options_notice(
@@ -383,6 +475,7 @@ fn launch_options_notice(
     let agent = match crate::detect::parse_agent_label(agent) {
         Some(crate::detect::Agent::Claude) => "Claude",
         Some(crate::detect::Agent::Codex) => "Codex",
+        Some(crate::detect::Agent::Grok) => "Grok",
         _ => agent,
     };
     Some(format!(
@@ -553,6 +646,169 @@ mod tests {
         }
     }
 
+    /// A restored Codex pane whose saved conversation ran under `account`,
+    /// with no saved launcher, in an app whose account launcher is
+    /// `launcher`.
+    #[cfg(unix)]
+    fn app_with_unbound_codex_pane(
+        launcher: &std::path::Path,
+        account: Option<&str>,
+    ) -> (App, crate::terminal::TerminalId) {
+        let mut app = test_app();
+        app.account_launcher = Some(launcher.to_path_buf());
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("account-launcher")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.default_shell = "bash".into();
+        let id = app.state.terminals.keys().next().unwrap().clone();
+        let session = crate::agent_resume::AgentSessionRef::id("same-uuid").unwrap();
+        let options = vec!["-c".to_string(), "model_reasoning_effort='low'".to_string()];
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: session.clone(),
+        });
+        terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
+            agent: crate::detect::Agent::Codex,
+            options: crate::agent_resume::AgentLaunchOptions::Known(options.clone()),
+            resumed_without_options: false,
+            account: account.map(String::from),
+            launch: crate::terminal::SeededLaunch::Started {
+                session: Some(session.clone()),
+            },
+        });
+        let (plan, _) = crate::agent_resume::plan_with_launch_options(
+            "herdr:codex",
+            "codex",
+            &session,
+            Some(&options),
+        )
+        .unwrap();
+        terminal.pending_agent_resume_plan = Some(plan);
+        (app, id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unbound_agent_resumes_through_the_account_launcher_on_its_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let receipt = temp.path().join("receipt");
+        let launcher = temp.path().join("agent-accounts");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$AGENT_ACCOUNTS_ID\" \"$AGENT_ACCOUNTS_REQUIRED\" \"$@\" > '{}'\n",
+                receipt.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (mut app, id) = app_with_unbound_codex_pane(&launcher, Some("codex:a@example.com"));
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert!(app.state.terminals[&id].restore_error.is_none());
+        assert!(
+            app.state.terminals[&id].agent_launcher.is_none(),
+            "the account comes from the agent process each time, not a saved binding"
+        );
+        for _ in 0..100 {
+            if std::fs::read_to_string(&receipt).is_ok_and(|text| text.ends_with('\n')) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            [
+                "codex:a@example.com",
+                "1",
+                "run",
+                "codex",
+                "--account",
+                "codex:a@example.com",
+                "--",
+                "resume",
+                "same-uuid",
+                "-c",
+                "model_reasoning_effort='low'",
+                ""
+            ]
+            .join("\n")
+        );
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unknown_account_starts_the_shell_without_resuming_and_says_why() {
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let launcher = temp.path().join("agent-accounts");
+        let (mut app, id) = app_with_unbound_codex_pane(&launcher, None);
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            1,
+            "the pane keeps a usable shell"
+        );
+        let terminal = &app.state.terminals[&id];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        let error = terminal.restore_error.as_deref().unwrap();
+        assert!(error.contains("does not know which account"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "{} run codex --account <account> -- resume same-uuid",
+                launcher.display()
+            )),
+            "{error}"
+        );
+        // The conversation stays saved, so the next restore tries again.
+        let saved = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        let session = saved.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .agent_session
+            .clone()
+            .unwrap();
+        assert_eq!(session.value, "same-uuid");
+        assert_eq!(
+            session.launch_options,
+            Some(vec![
+                "-c".to_string(),
+                "model_reasoning_effort='low'".to_string()
+            ])
+        );
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_account_launcher_refuses_before_native_spawn() {
+        let (mut app, id) = app_with_unbound_codex_pane(
+            std::path::Path::new("/__missing_account_launcher__"),
+            Some("codex:a@example.com"),
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app.state.terminals[&id]
+            .restore_error
+            .as_deref()
+            .unwrap()
+            .contains("launcher executable is missing"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_launcher_missing_on_restore_refuses_before_native_spawn() {
@@ -633,6 +889,7 @@ mod tests {
             agent: crate::detect::Agent::Claude,
             options: crate::agent_resume::AgentLaunchOptions::Known(options.clone()),
             resumed_without_options: true,
+            account: None,
             launch: crate::terminal::SeededLaunch::Started {
                 session: Some(session),
             },
@@ -704,7 +961,15 @@ mod tests {
         );
         assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
         assert_eq!(app.terminal_runtimes.len(), 0);
-        assert!(app.state.terminals[&id].restore_error.is_some());
+        let error = app.state.terminals[&id].restore_error.clone().unwrap();
+        assert!(
+            error.contains("different-bound-uuid") && error.contains("saved-native-uuid"),
+            "the refusal names both conversations: {error}"
+        );
+        let info = app
+            .pane_info(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        assert_eq!(info.restore_error.as_deref(), Some(error.as_str()));
         let saved_again = crate::persist::capture(
             &app.state.workspaces,
             &app.state.terminals,

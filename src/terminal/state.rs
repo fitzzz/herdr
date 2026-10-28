@@ -404,7 +404,7 @@ fn session_for_process(
     }
 }
 
-/// What the server knew, as a Claude or Codex conversation report arrived,
+/// What the server knew, as a Claude, Codex or Grok conversation report arrived,
 /// about which process sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionReportEvidence {
@@ -418,9 +418,9 @@ pub enum SessionReportEvidence {
     /// when a process exited first, so it cannot tell who reported.
     Unidentified,
     /// The server could not read the process that sent the report, such as
-    /// for a report that did not come over the local API socket: the Claude
-    /// and Codex processes in the pane's foreground job, when the job could be
-    /// read.
+    /// for a report that did not come over the local API socket: the Claude,
+    /// Codex and Grok processes in the pane's foreground job, when the job
+    /// could be read.
     ForegroundAgents(Option<Vec<ProcessInstance>>),
 }
 
@@ -434,7 +434,7 @@ impl SessionReportEvidence {
     /// The processes this evidence names as the one that reported, and how
     /// it shows them, or `None` when the server cannot tell. A reporter
     /// names itself and the launchers directly above it. A foreground job
-    /// running exactly one Claude or Codex process names that process, which
+    /// running exactly one Claude, Codex or Grok process names that process, which
     /// is the only evidence that names a launch not yet bound to a process,
     /// taken to be that process. An unreadable job, a job running
     /// none or more than one, and a sender the server read but could not
@@ -574,6 +574,8 @@ pub struct AgentLaunchSeed {
     pub options: crate::agent_resume::AgentLaunchOptions,
     /// The restore fell back to the bare resume command.
     pub resumed_without_options: bool,
+    /// The account launcher account the launch runs under, when known.
+    pub account: Option<String>,
     pub launch: SeededLaunch,
 }
 
@@ -609,8 +611,9 @@ pub enum SeededLaunch {
     Saved(crate::agent_resume::AgentSessionRef),
 }
 
-/// The launch options of the Claude or Codex process running in a pane, kept
-/// so restore can repeat them.
+/// The launch options of the Claude, Codex or Grok process running in a
+/// pane, and the account launcher account it runs under, kept so restore can
+/// repeat them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedAgentLaunch {
     pub agent: Agent,
@@ -618,6 +621,9 @@ pub struct ObservedAgentLaunch {
     /// The agent was resumed by a restore that fell back to the bare resume
     /// command; stays set while the record is bound to that process.
     pub resumed_without_options: bool,
+    /// The `agent-accounts` account the process runs under
+    /// (`AGENT_ACCOUNTS_ID`), or the one a seed launched it with.
+    pub account: Option<String>,
     state: LaunchState,
 }
 
@@ -787,7 +793,9 @@ impl TerminalState {
                     .as_ref()
                     .and_then(ObservedAgentLaunch::resumed_without_options_agent)
             || current.map(ObservedAgentLaunch::session)
-                != launch.as_ref().map(ObservedAgentLaunch::session);
+                != launch.as_ref().map(ObservedAgentLaunch::session)
+            || current.and_then(|launch| launch.account.as_ref())
+                != launch.as_ref().and_then(|launch| launch.account.as_ref());
         self.agent_launch = launch;
         if saved_changed {
             self.agent_launch_revision += 1;
@@ -832,6 +840,7 @@ impl TerminalState {
             agent: seed.agent,
             options: seed.options,
             resumed_without_options: seed.resumed_without_options,
+            account: seed.account,
             state,
         }));
     }
@@ -855,12 +864,13 @@ impl TerminalState {
                 agent: launch.agent,
                 options: launch.options.clone(),
                 resumed_without_options: false,
+                account: launch.account.clone(),
                 state: LaunchState::Saved(session),
             });
         self.set_agent_launch(launch);
     }
 
-    /// Detection read the command line of a Claude or Codex process;
+    /// Detection read the command line of a Claude, Codex or Grok process;
     /// `resumed_session` is the conversation id that command line resumes.
     pub fn observe_agent_launch(
         &mut self,
@@ -891,6 +901,15 @@ impl TerminalState {
             return;
         }
         let reading = ResumeReading::of(&options, resumed_session);
+        // The process a seed launched runs under the seed's account until
+        // its own environment is read ([`Self::observe_agent_account`]).
+        let account = current
+            .filter(|current| match current.state {
+                LaunchState::Started(_) => true,
+                LaunchState::Bound { process: bound, .. } => bound.is(&process),
+                LaunchState::Saved(_) => false,
+            })
+            .and_then(|current| current.account.clone());
         let (options, resumed_without_options, kept_seed) = match current {
             Some(current) if seed_keeps_record(current, &process, &options, resumed_session) => (
                 current.options.clone(),
@@ -929,12 +948,28 @@ impl TerminalState {
             agent,
             options,
             resumed_without_options,
+            account,
             state: LaunchState::Bound {
                 process,
                 pairing,
                 kept_seed,
             },
         }));
+    }
+
+    /// Detection read the account launcher account of `process` from its
+    /// environment: `None` names no account. It replaces the account of the
+    /// launch record bound to that process.
+    pub fn observe_agent_account(&mut self, process: ProcessInstance, account: Option<String>) {
+        let Some(launch) = self.agent_launch.as_ref() else {
+            return;
+        };
+        if launch.account == account || !launch.process().is_some_and(|bound| bound.is(&process)) {
+            return;
+        }
+        let mut launch = launch.clone();
+        launch.account = account;
+        self.set_agent_launch(Some(launch));
     }
 
     /// The conversation a session save records for this pane.
@@ -1044,6 +1079,15 @@ impl TerminalState {
             .launch_for_current_session()
             .and_then(ObservedAgentLaunch::resumed_without_options_agent);
         agent.is_some() && crate::detect::parse_agent_label(agent_label) == agent
+    }
+
+    /// The account launcher account to save beside a session of
+    /// `agent_label`, when it is known for that same agent.
+    pub fn launch_account_for_session(&self, agent_label: &str) -> Option<String> {
+        let launch = self.launch_for_current_session()?;
+        (crate::detect::parse_agent_label(agent_label) == Some(launch.agent))
+            .then(|| launch.account.clone())
+            .flatten()
     }
 
     /// The options to save beside a session of `agent_label`, when they are
@@ -3723,6 +3767,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -3756,6 +3801,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -3789,6 +3835,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded.clone(),
                 resumed_without_options: true,
+                account: None,
                 launch: SeededLaunch::Started {
                     session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
                 },
@@ -3847,6 +3894,7 @@ mod tests {
             agent,
             options: known_options(&["--placeholder-seeded"]),
             resumed_without_options,
+            account: None,
             state: match process_id {
                 Some(process_id) => LaunchState::Bound {
                     process: ProcessInstance::unknown_start(process_id),
@@ -3887,6 +3935,7 @@ mod tests {
         }
         // A saved launch that nothing runs, with the mark.
         let saved = ObservedAgentLaunch {
+            account: None,
             state: LaunchState::Saved(crate::agent_resume::AgentSessionRef::id("seeded").unwrap()),
             ..fallback.clone()
         };
@@ -3998,6 +4047,7 @@ mod tests {
         ))
         .unwrap();
         let path_seed = ObservedAgentLaunch {
+            account: None,
             state: LaunchState::Started(Pairing::Assumed {
                 session: path.clone(),
                 earlier: None,
@@ -4552,6 +4602,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         observe_launcher_then_agent(&mut terminal, None);
@@ -4571,6 +4622,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&options().iter().map(String::as_str).collect::<Vec<_>>()),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started {
                 session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
             },
@@ -4595,6 +4647,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder-seeded"]),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started {
                 session: crate::agent_resume::AgentSessionRef::id("placeholder-a"),
             },
@@ -4698,6 +4751,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         for _ in 0..2 {
@@ -4730,6 +4784,7 @@ mod tests {
                 crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
             ),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started {
                 session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
             },
@@ -4767,6 +4822,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded.clone(),
                 resumed_without_options: true,
+                account: None,
                 launch: SeededLaunch::Started {
                     session: crate::agent_resume::AgentSessionRef::id("placeholder-session"),
                 },
@@ -4852,6 +4908,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -4877,6 +4934,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         let seeded_revision = terminal.agent_launch_revision();
@@ -4912,6 +4970,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--seeded"]),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -4938,6 +4997,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded.clone(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -4957,6 +5017,7 @@ mod tests {
             agent: Agent::Codex,
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -4979,6 +5040,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded,
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -5003,6 +5065,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder-a", "--placeholder-b"]),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         terminal.observe_agent_launch(
@@ -5015,6 +5078,106 @@ mod tests {
             terminal.launch_options_for_session("claude"),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn launch_account_follows_the_process_that_runs_the_saved_conversation() {
+        let session = crate::agent_resume::AgentSessionRef::id("saved-session").unwrap();
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            session_ref: session.clone(),
+        });
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Claude,
+            options: known_options(&["--model", "opus"]),
+            resumed_without_options: false,
+            account: Some("claude:a@example.com".into()),
+            launch: SeededLaunch::Started {
+                session: Some(session.clone()),
+            },
+        });
+        assert_eq!(
+            terminal.launch_account_for_session("claude").as_deref(),
+            Some("claude:a@example.com")
+        );
+        assert_eq!(terminal.launch_account_for_session("codex"), None);
+
+        // The process the restore started keeps the seeded account until its
+        // own environment is read.
+        let restored = ProcessInstance::unknown_start(40);
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            restored,
+            known_options(&["--model", "opus"]),
+            Some("saved-session"),
+        );
+        assert_eq!(
+            terminal.launch_account_for_session("claude").as_deref(),
+            Some("claude:a@example.com")
+        );
+        let revision = terminal.agent_launch_revision();
+        terminal.observe_agent_account(restored, Some("claude:b@example.com".into()));
+        assert_ne!(
+            terminal.agent_launch_revision(),
+            revision,
+            "a save records it"
+        );
+        assert_eq!(
+            terminal.launch_account_for_session("claude").as_deref(),
+            Some("claude:b@example.com")
+        );
+        // Another process's environment does not change this record.
+        terminal.observe_agent_account(
+            ProcessInstance::unknown_start(41),
+            Some("claude:c@example.com".into()),
+        );
+        assert_eq!(
+            terminal.launch_account_for_session("claude").as_deref(),
+            Some("claude:b@example.com")
+        );
+        // An environment that names no account clears it.
+        terminal.observe_agent_account(restored, None);
+        assert_eq!(terminal.launch_account_for_session("claude"), None);
+
+        // A new process in the pane does not inherit an account.
+        terminal.observe_agent_account(restored, Some("claude:b@example.com".into()));
+        terminal.observe_agent_launch(
+            Agent::Claude,
+            ProcessInstance::unknown_start(42),
+            known_options(&[]),
+            Some("saved-session"),
+        );
+        assert_eq!(terminal.agent_launch().unwrap().account, None);
+    }
+
+    #[test]
+    fn restore_typed_nothing_keeps_the_seeded_account_for_the_next_save() {
+        let session = crate::agent_resume::AgentSessionRef::id("saved-session").unwrap();
+        let mut terminal = test_terminal();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: session.clone(),
+        });
+        terminal.seed_agent_launch(AgentLaunchSeed {
+            agent: Agent::Codex,
+            options: crate::agent_resume::AgentLaunchOptions::Unavailable(
+                crate::agent_resume::LaunchOptionsUnavailable::NotRecorded,
+            ),
+            resumed_without_options: false,
+            account: Some("codex:a@example.com".into()),
+            launch: SeededLaunch::Started {
+                session: Some(session),
+            },
+        });
+        terminal.restore_typed_nothing();
+        assert_eq!(
+            terminal.launch_account_for_session("codex").as_deref(),
+            Some("codex:a@example.com")
+        );
+        assert_eq!(terminal.launch_options_for_session("codex"), None);
     }
 
     #[test]
@@ -5031,6 +5194,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: not_recorded(),
                 resumed_without_options: true,
+                account: None,
                 launch: SeededLaunch::Started { session: None },
             });
             terminal
@@ -5044,6 +5208,7 @@ mod tests {
             agent: Agent::Claude,
             options: not_recorded(),
             resumed_without_options: true,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         assert_ne!(terminal.agent_launch_revision(), revision);
@@ -5108,6 +5273,7 @@ mod tests {
             agent: Agent::Claude,
             options: known_options(&["--placeholder"]),
             resumed_without_options: false,
+            account: None,
             launch: SeededLaunch::Started { session: None },
         });
         assert!(!terminal.resumed_without_launch_options());
@@ -9207,6 +9373,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: known_options(&["--placeholder-a"]),
                 resumed_without_options: false,
+                account: None,
                 launch: SeededLaunch::Started { session: None },
             });
             report_with(&mut terminal, "claude", "claude-b", (1, "startup"), &job);
@@ -9344,6 +9511,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: known_options(&["--placeholder-a"]),
                 resumed_without_options: false,
+                account: None,
                 launch: SeededLaunch::Paired {
                     process: handed_off,
                     session: crate::agent_resume::AgentSessionRef::id("claude-a").unwrap(),
@@ -9481,6 +9649,7 @@ mod tests {
                     agent: Agent::Claude,
                     options: known_options(&["--placeholder-a"]),
                     resumed_without_options: false,
+                    account: None,
                     launch: SeededLaunch::Started { session: None },
                 });
             }
@@ -9817,6 +9986,7 @@ mod tests {
                 agent: Agent::Claude,
                 options: known_options(&["--placeholder-a"]),
                 resumed_without_options: false,
+                account: None,
                 launch: SeededLaunch::Started { session: None },
             });
             report_with(
@@ -10232,6 +10402,7 @@ mod tests {
                         agent: Agent::Claude,
                         options: known_options(&[SEED_OPTIONS]),
                         resumed_without_options: false,
+                        account: None,
                         launch: SeededLaunch::Started {
                             session: Some(Conversation::S.session()),
                         },

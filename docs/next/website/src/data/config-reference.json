@@ -1435,6 +1435,12 @@
           "type": "integer",
           "default": "100",
           "description": "Milliseconds between automatic agent restores after a server restart. The first agent starts without this delay; 0 disables spacing. Does not delay manual launches or explicit terminal attaches. Restart the server to apply."
+        },
+        {
+          "key": "session.account_launcher",
+          "type": "string",
+          "default": "unset",
+          "description": "An agent-accounts executable that restore runs Claude Code and Codex agents through, on the account each conversation ran under. A pane whose account is unknown is not resumed. Restart the server to apply."
         }
       ]
     },

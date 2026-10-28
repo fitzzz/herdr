@@ -270,6 +270,10 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// An `agent-accounts` executable that restore runs Claude and Codex
+    /// agents through, on the account each conversation ran under. Unset:
+    /// restore types the resume command into the pane's shell.
+    pub account_launcher: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +281,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            account_launcher: None,
         }
     }
 }
@@ -1439,6 +1444,18 @@ startup_per_agent_delay_ms = 0
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+    }
+
+    #[test]
+    fn account_launcher_defaults_off_and_parses() {
+        assert_eq!(Config::default().session.account_launcher, None);
+        let config: Config =
+            toml::from_str("[session]\naccount_launcher = \"~/Bahamut/bin/agent-accounts\"\n")
+                .unwrap();
+        assert_eq!(
+            config.session.account_launcher.as_deref(),
+            Some("~/Bahamut/bin/agent-accounts")
+        );
     }
 
     #[test]

@@ -165,7 +165,7 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
-/// The options a Claude or Codex process was launched with, without the parts
+/// The options a Claude, Codex or Grok process was launched with, without the parts
 /// that pick or start a conversation, a one-time prompt, or print-and-exit mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentLaunchOptions {
@@ -188,11 +188,42 @@ pub enum LaunchOptionsUnavailable {
     ExceedsResumeLimits,
 }
 
-/// Whether a Claude or Codex restore repeated the agent's launch options.
+/// Whether a Claude, Codex or Grok restore repeated the agent's launch options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchOptionsRestore {
     Kept,
     NotKept(LaunchOptionsUnavailable),
+}
+
+/// The environment variable `agent-accounts` sets to the account an agent
+/// process runs under, such as `claude:fitz@example.com`.
+pub const LAUNCH_ACCOUNT_ENV: &str = "AGENT_ACCOUNTS_ID";
+
+const MAX_LAUNCH_ACCOUNT_LEN: usize = 256;
+
+/// Agents an account launcher can start: `agent-accounts run` takes only
+/// Claude and Codex.
+pub fn uses_account_launcher(agent: crate::detect::Agent) -> bool {
+    matches!(
+        agent,
+        crate::detect::Agent::Claude | crate::detect::Agent::Codex
+    )
+}
+
+/// The account in an agent process's `AGENT_ACCOUNTS_ID` value, when it is
+/// an account of that agent (`<agent>:<label>`) that restore can pass on as
+/// one argument.
+pub fn launch_account(agent: crate::detect::Agent, value: &str) -> Option<String> {
+    if !uses_account_launcher(agent) {
+        return None;
+    }
+    let label = value
+        .strip_prefix(crate::detect::agent_label(agent))?
+        .strip_prefix(':')?;
+    let valid = !label.is_empty()
+        && value.len() <= MAX_LAUNCH_ACCOUNT_LEN
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace());
+    valid.then(|| value.to_string())
 }
 
 /// Launch options from a running process's full command line (`argv[0]`
@@ -231,6 +262,7 @@ pub fn launch_options_from_agent_args(
     let parsed = match agent {
         crate::detect::Agent::Claude => parse_claude_args(args).map(|launch| launch.options),
         crate::detect::Agent::Codex => parse_codex_args(args).map(|launch| launch.options),
+        crate::detect::Agent::Grok => parse_grok_args(args).map(|launch| launch.options),
         _ => return None,
     };
     Some(match parsed {
@@ -262,10 +294,11 @@ fn option_name(arg: &str) -> &str {
     &arg[..end]
 }
 
-/// The conversation id a Claude or Codex process command line resumes
-/// (`claude --resume <id>`, `codex resume <id>`), when it names one. A fork
-/// (`claude --resume <id> --fork-session`) runs a new conversation and names
-/// none; Codex forks with `codex fork`, which is not read as a resume.
+/// The conversation id a Claude, Codex or Grok process command line resumes
+/// (`claude --resume <id>`, `codex resume <id>`, `grok --resume <id>`), when
+/// it names one. A fork (`claude --resume <id> --fork-session`, the same in
+/// Grok) runs a new conversation and names none; Codex forks with
+/// `codex fork`, which is not read as a resume.
 pub fn resumed_session_from_process_argv(
     agent: crate::detect::Agent,
     argv: &[String],
@@ -284,6 +317,12 @@ pub fn resumed_session_from_process_argv(
                 .filter(|launch| launch.resume && !launch.last)?
                 .session_id
         }
+        crate::detect::Agent::Grok => {
+            parse_grok_args(args)
+                .ok()
+                .filter(|launch| !launch.fork)?
+                .session_id
+        }
         _ => None,
     }
 }
@@ -297,8 +336,11 @@ pub fn plan_with_launch_options(
     launch_options: Option<&[String]>,
 ) -> Option<(AgentResumePlan, Option<LaunchOptionsRestore>)> {
     let bare = plan(source, agent, session_ref)?;
-    let claude = match (source, agent, session_ref.kind) {
-        ("herdr:claude", "claude", AgentSessionRefKind::Id) => true,
+    // Claude and Grok take options before `--resume <id>`; Codex after
+    // `resume <id>`.
+    let options_first = match (source, agent, session_ref.kind) {
+        ("herdr:claude", "claude", AgentSessionRefKind::Id)
+        | ("herdr:grok", "grok", AgentSessionRefKind::Id) => true,
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => false,
         _ => return Some((bare, None)),
     };
@@ -315,11 +357,11 @@ pub fn plan_with_launch_options(
     }
 
     // Codex takes the id directly after `resume` so no option value can
-    // swallow it; Claude's `--resume` starts with a dash, which ends any
-    // variadic option before it.
+    // swallow it; Claude's and Grok's `--resume` starts with a dash, which
+    // ends any variadic option before it.
     let id = session_ref.value.clone();
-    let argv: Vec<String> = if claude {
-        std::iter::once("claude".to_string())
+    let argv: Vec<String> = if options_first {
+        std::iter::once(agent.to_string())
             .chain(options.iter().cloned())
             .chain(["--resume".to_string(), id])
             .collect()
@@ -343,10 +385,12 @@ pub fn plan_with_launch_options(
     ))
 }
 
-fn carries_launch_options(agent: crate::detect::Agent) -> bool {
+/// Agents whose launch options restore reads from their command line and
+/// repeats.
+pub fn carries_launch_options(agent: crate::detect::Agent) -> bool {
     matches!(
         agent,
-        crate::detect::Agent::Claude | crate::detect::Agent::Codex
+        crate::detect::Agent::Claude | crate::detect::Agent::Codex | crate::detect::Agent::Grok
     )
 }
 
@@ -615,6 +659,89 @@ const CODEX_SUBCOMMANDS: &[&str] = &[
     "update",
 ];
 
+/// Options of `grok --help` 1.0.70. Grok parses with clap; every value
+/// option takes one value and is repeated for more.
+const GROK_OPTIONS: &[LaunchOptionSpec] = &[
+    kept(&["--add-dir"], Value),
+    kept(&["--agent"], Value),
+    kept(&["--agents"], Value),
+    kept(&["--allow", "--allowedTools", "--allowed-tools"], Value),
+    kept(&["--always-approve"], Flag),
+    kept(&["--cwd"], Value),
+    kept(&["--debug"], Flag),
+    kept(&["--debug-file"], Value),
+    kept(&["--deny", "--disallowedTools"], Value),
+    kept(&["--disable-web-search"], Flag),
+    kept(&["--disallowed-tools"], Value),
+    kept(&["--fullscreen"], Flag),
+    kept(&["--leader-socket"], Value),
+    kept(&["-m", "--model"], Value),
+    kept(&["--max-turns"], Value),
+    kept(&["--minimal"], Flag),
+    kept(&["--no-alt-screen"], Flag),
+    kept(&["--no-plan"], Flag),
+    kept(&["--no-subagents"], Flag),
+    kept(&["--permission-mode"], Value),
+    kept(&["--reasoning-effort", "--effort"], Value),
+    kept(&["--rules"], Value),
+    kept(&["--sandbox"], Value),
+    kept(&["--system-prompt-override", "--system-prompt"], Value),
+    kept(&["--tools"], Value),
+    kept(&["--verbatim"], Flag),
+    // They pick or start a conversation; the saved session id takes their place.
+    dropped(&["-r", "--resume"], OptionalValue),
+    dropped(&["-c", "--continue"], Flag),
+    dropped(&["-s", "--session-id"], Value),
+    dropped(&["--fork-session"], Flag),
+    // Restores the repository snapshot once, when resuming.
+    dropped(&["--restore-code"], Flag),
+    // Single-turn and headless mode and the options that only work with it.
+    dropped(&["-p", "--single"], Value),
+    dropped(&["--prompt-file"], Value),
+    dropped(&["--prompt-json"], Value),
+    dropped(&["--output-format"], Value),
+    dropped(&["--json-schema"], Value),
+    dropped(&["--include-partial-messages"], Flag),
+    // Picks the browser login once, when the welcome screen signs in.
+    dropped(&["--oauth"], Flag),
+    // Starts the session in a new Git worktree.
+    dropped(&["-w", "--worktree"], OptionalValue),
+    dropped(&["--worktree-ref", "--ref"], Value),
+    // Print help or the version and exit.
+    dropped(&["-h", "--help"], Flag),
+    dropped(&["-v", "--version"], Flag),
+];
+
+const GROK_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "clone",
+    "completions",
+    "dashboard",
+    "disk-usage",
+    "doctor",
+    "du",
+    "export",
+    "help",
+    "inspect",
+    "leader",
+    "login",
+    "logout",
+    "mcp",
+    "memory",
+    "models",
+    "plugin",
+    "sessions",
+    "setup",
+    "trace",
+    "update",
+    "usage",
+    "v",
+    "version",
+    "worker",
+    "worktree",
+    "wrap",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParserStyle {
     Commander,
@@ -874,6 +1001,54 @@ fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, ArgsRejected> {
                 options_ended = true;
                 index += 1;
             }
+        }
+    }
+    Ok(launch)
+}
+
+#[derive(Debug, Default)]
+struct GrokLaunch {
+    options: Vec<String>,
+    /// The conversation `--resume <id>`, in any form, names.
+    session_id: Option<String>,
+    /// `--fork-session`: the resumed conversation is copied into a new one.
+    fork: bool,
+}
+
+/// The launch options in a Grok command line: clap options anywhere before
+/// `--`, a one-time prompt as the first operand, which is dropped, or a
+/// subcommand.
+fn parse_grok_args(args: &[String]) -> Result<GrokLaunch, ArgsRejected> {
+    let mut launch = GrokLaunch::default();
+    let mut operands = 0;
+    let mut index = 0;
+    let rejected = |reason, at| ArgsRejected { reason, at };
+    while index < args.len() {
+        match next_launch_arg(GROK_OPTIONS, ParserStyle::Clap, &args[index..])
+            .map_err(|reason| rejected(reason, index))?
+        {
+            LaunchArg::Option { spec, len, value } => {
+                if spec.keep {
+                    launch.options.extend_from_slice(&args[index..index + len]);
+                }
+                match spec.names[0] {
+                    "-r" => launch.session_id = value.map(String::from),
+                    "--fork-session" => launch.fork = true,
+                    _ => {}
+                }
+                index += len;
+            }
+            LaunchArg::Operand => {
+                if operands == 0 && GROK_SUBCOMMANDS.contains(&args[index].as_str()) {
+                    return Err(rejected(
+                        LaunchOptionsUnavailable::UnrecognizedCommand,
+                        index,
+                    ));
+                }
+                operands += 1;
+                index += 1;
+            }
+            LaunchArg::EndOfOptions => break,
         }
     }
     Ok(launch)
@@ -2568,6 +2743,150 @@ mod tests {
                 .value,
             "codex-session"
         );
+    }
+
+    fn grok_options(args: &[&str]) -> AgentLaunchOptions {
+        launch_options_from_agent_args(Agent::Grok, &argv(args)).unwrap()
+    }
+
+    #[test]
+    fn grok_full_access_model_and_effort_options_are_kept_on_restore() {
+        let full_access = [
+            "--permission-mode",
+            "bypassPermissions",
+            "--sandbox",
+            "off",
+            "--always-approve",
+            "-m",
+            "grok-code-fast-1",
+            "--effort",
+            "high",
+        ];
+        assert_eq!(grok_options(&full_access), known(&full_access));
+        assert_eq!(
+            grok_options(&[
+                "--model=grok-4",
+                "--reasoning-effort=low",
+                "--sandbox=strict"
+            ]),
+            known(&[
+                "--model=grok-4",
+                "--reasoning-effort=low",
+                "--sandbox=strict"
+            ])
+        );
+        let (plan, outcome) = restore("herdr:grok", "grok", "grok-session", Some(&full_access));
+        let mut expected = vec!["grok"];
+        expected.extend(full_access);
+        expected.extend(["--resume", "grok-session"]);
+        assert_eq!(plan.argv, expected);
+        assert_eq!(outcome, Some(LaunchOptionsRestore::Kept));
+        assert_eq!(
+            launch_options_from_process_argv(Agent::Grok, Some(&plan.argv)),
+            Some(known(&full_access))
+        );
+        assert_eq!(
+            resumed_session_from_process_argv(Agent::Grok, &plan.argv).as_deref(),
+            Some("grok-session")
+        );
+    }
+
+    #[test]
+    fn grok_conversation_prompt_and_headless_parts_are_dropped() {
+        assert_eq!(
+            grok_options(&[
+                "--permission-mode",
+                "plan",
+                "--resume",
+                "old-session",
+                "--fork-session",
+                "--restore-code",
+                "fix the build"
+            ]),
+            known(&["--permission-mode", "plan"])
+        );
+        for one_time in [
+            &["-c"][..],
+            &["--continue"],
+            &["-s", "11111111-2222-3333-4444-555555555555"],
+            &["-p", "say hi"],
+            &["--single=say hi", "--output-format", "json"],
+            &["--prompt-file", "/tmp/prompt"],
+            &["--prompt-json", "[]"],
+            &["--json-schema", "{}"],
+            &["--include-partial-messages"],
+            &["--oauth"],
+            &["-w"],
+            &["--worktree", "feature", "--worktree-ref", "main"],
+            &["--", "a prompt", "--model", "x"],
+        ] {
+            let mut args = vec!["-m", "grok-4"];
+            args.extend(one_time);
+            assert_eq!(
+                grok_options(&args),
+                known(&["-m", "grok-4"]),
+                "{one_time:?}"
+            );
+        }
+        assert_eq!(
+            resumed_session_from_process_argv(
+                Agent::Grok,
+                &argv(&["grok", "--resume", "kept", "--fork-session"])
+            ),
+            None
+        );
+        assert_eq!(
+            resumed_session_from_process_argv(Agent::Grok, &argv(&["grok", "--resume=named"]))
+                .as_deref(),
+            Some("named")
+        );
+    }
+
+    #[test]
+    fn grok_subcommands_and_unknown_options_make_options_unavailable() {
+        for args in [
+            &["sessions", "list"][..],
+            &["-m", "x", "agent", "run"],
+            &["login"],
+        ] {
+            assert_eq!(
+                grok_options(args),
+                unavailable(LaunchOptionsUnavailable::UnrecognizedCommand),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            grok_options(&["--not-a-grok-option", "x"]),
+            unavailable(LaunchOptionsUnavailable::UnsupportedOption)
+        );
+        // A prompt that happens to name a subcommand is a prompt after another one.
+        assert_eq!(grok_options(&["fix it", "login"]), known(&[]));
+    }
+
+    #[test]
+    fn launch_account_accepts_only_an_account_of_the_same_agent() {
+        assert_eq!(
+            launch_account(Agent::Claude, "claude:lum@relfi.co").as_deref(),
+            Some("claude:lum@relfi.co")
+        );
+        assert_eq!(
+            launch_account(Agent::Codex, "codex:kb@relfi.co+relfi").as_deref(),
+            Some("codex:kb@relfi.co+relfi")
+        );
+        for (agent, value) in [
+            (Agent::Claude, "codex:kb@relfi.co"),
+            (Agent::Codex, "claude:a@b.c"),
+            (Agent::Claude, "claude:"),
+            (Agent::Claude, "claude"),
+            (Agent::Claude, "claudex:a@b.c"),
+            (Agent::Claude, "claude:a b"),
+            (Agent::Claude, "claude:a\nb"),
+            (Agent::Grok, "grok:a@b.c"),
+        ] {
+            assert_eq!(launch_account(agent, value), None, "{agent:?} {value:?}");
+        }
+        let long = format!("claude:{}", "a".repeat(MAX_LAUNCH_ACCOUNT_LEN));
+        assert_eq!(launch_account(Agent::Claude, &long), None);
     }
 
     #[test]

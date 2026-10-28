@@ -297,8 +297,8 @@ async fn publish_agent_process_detected_event(
 /// the program its command line ran (`argv[0]`) when it was read.
 type PublishedAgentLaunch = (Agent, crate::platform::ProcessInstance, Option<String>);
 
-/// Claude and Codex restore repeats the options read from the agent's command
-/// line, so each new agent process is reported once, also when a wrapper runs
+/// Claude, Codex and Grok restore repeats the options read from the agent's
+/// command line, so each new agent process is reported once, also when a wrapper runs
 /// one after another in the same process group, or a later process reuses the
 /// id (told apart by its start time). A process is reported once more when a
 /// later probe reads a command line it could not read before (the read is
@@ -311,7 +311,8 @@ fn agent_launch_observation(
     argv: Option<&[String]>,
     last_published: &mut Option<PublishedAgentLaunch>,
 ) -> Option<(Agent, crate::platform::ProcessInstance)> {
-    let Some(agent) = agent.filter(|agent| matches!(agent, Agent::Claude | Agent::Codex)) else {
+    let Some(agent) = agent.filter(|agent| crate::agent_resume::carries_launch_options(*agent))
+    else {
         *last_published = None;
         return None;
     };
@@ -329,9 +330,9 @@ fn agent_launch_observation(
     Some((agent, agent_process))
 }
 
-/// One probe's launch observation: publishes the probed Claude or Codex
-/// process with its command line when [`agent_launch_observation`] finds it
-/// new.
+/// One probe's launch observation: publishes the probed Claude, Codex or
+/// Grok process with its command line, and for Claude and Codex the account
+/// it runs under, when [`agent_launch_observation`] finds it new.
 async fn publish_agent_launch_observation(
     state_events: &mpsc::Sender<AppEvent>,
     pane_id: PaneId,
@@ -345,12 +346,29 @@ async fn publish_agent_launch_observation(
     else {
         return;
     };
+    // Read once per published process, and only where its command line was
+    // readable: the environment read has the same platform limits.
+    let account = if argv.is_some() && crate::agent_resume::uses_account_launcher(agent) {
+        tokio::task::spawn_blocking(move || {
+            crate::platform::process_environment_value(
+                process.pid,
+                crate::agent_resume::LAUNCH_ACCOUNT_ENV,
+            )
+            .map(|value| value.and_then(|value| crate::agent_resume::launch_account(agent, &value)))
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
     if let Err(e) = state_events
         .send(AppEvent::AgentLaunchObserved {
             pane_id,
             agent,
             process,
             argv,
+            account,
         })
         .await
     {
@@ -5873,7 +5891,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_launch_observation_publishes_each_claude_or_codex_process_once() {
+    fn agent_launch_observation_publishes_each_claude_codex_or_grok_process_once() {
         let claude_argv = ["claude".to_string()];
         let mut last = None;
         assert_eq!(
@@ -5957,6 +5975,18 @@ mod tests {
         assert_eq!(
             agent_launch_observation(Some(Agent::Codex), None, Some(&claude_argv), &mut last),
             None
+        );
+        assert_eq!(
+            agent_launch_observation(
+                Some(Agent::Grok),
+                Some(crate::platform::ProcessInstance::unknown_start(13)),
+                Some(&["grok".to_string()]),
+                &mut last
+            ),
+            Some((
+                Agent::Grok,
+                crate::platform::ProcessInstance::unknown_start(13)
+            ))
         );
     }
 

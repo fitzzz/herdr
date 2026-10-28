@@ -225,8 +225,21 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "maki" => Some(Agent::Maki),
         "muse" | "muse-code" | "muse-cli" => Some(Agent::Muse),
         _ if is_muse_versioned_binary(name) => Some(Agent::Muse),
+        _ if is_grok_versioned_binary(name) => Some(Agent::Grok),
         _ => None,
     }
+}
+
+/// Grok's installer runs the release it links as `grok`, named
+/// `grok-<version>` (e.g. `grok-1.0.70`), and its release archives name the
+/// binary `grok-<version>-<os>-<arch>`, which the kernel cuts to 15
+/// characters as the process name (`grok-1.0.50-lin`). Require a digit right
+/// after `grok-` so unrelated tools such as `grok-build-helper` stay
+/// unmatched.
+fn is_grok_versioned_binary(name: &str) -> bool {
+    path_basename(name)
+        .strip_prefix("grok-")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// Muse's install-dir launcher script resolves the active release and execs
@@ -1381,6 +1394,14 @@ mod tests {
         assert_eq!(identify_agent("ghcs"), Some(Agent::GithubCopilot));
         assert_eq!(identify_agent("grok"), Some(Agent::Grok));
         assert_eq!(identify_agent("grok-build"), Some(Agent::Grok));
+        assert_eq!(identify_agent("grok-1.0.70"), Some(Agent::Grok));
+        assert_eq!(identify_agent("grok-1.0.50-lin"), Some(Agent::Grok));
+        assert_eq!(
+            identify_agent("/opt/grok/grok-1.0.50-linux-x86_64"),
+            Some(Agent::Grok)
+        );
+        assert_eq!(identify_agent("grok-helper"), None);
+        assert_eq!(identify_agent("grok-"), None);
         assert_eq!(identify_agent("hermes"), Some(Agent::Hermes));
         assert_eq!(identify_agent("hermes-agent"), Some(Agent::Hermes));
         assert_eq!(identify_agent("kilo"), Some(Agent::Kilo));

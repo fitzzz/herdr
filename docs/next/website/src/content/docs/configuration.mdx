@@ -558,6 +558,15 @@ startup_per_agent_delay_ms = 100
 
 Automatic restores start one agent at a time, 100 milliseconds apart by default, to reduce startup contention. The first eligible agent starts immediately. Set `startup_per_agent_delay_ms = 0` to disable spacing. Manual launches and explicit terminal attaches are unaffected. Restart the Herdr server to apply changes.
 
+If you run Claude Code and Codex on several logins through an `agent-accounts` launcher, set `account_launcher` to its executable so restore puts each conversation back on the login it ran under:
+
+```toml
+[session]
+account_launcher = "~/bin/agent-accounts"
+```
+
+Herdr then resumes a Claude Code or Codex pane with `<account_launcher> run <agent> --account <account> -- <resume command>`, with `AGENT_ACCOUNTS_ID` and `AGENT_ACCOUNTS_REQUIRED=1` set, so a login that cannot be used stops the launch instead of choosing another one. The account is the one in the agent process's `AGENT_ACCOUNTS_ID`, which Herdr reads on Linux when it reads the agent's command line. A pane started through `agent.start_with_launcher` keeps the launcher it was started with. Other agents, such as Grok, restore as before. The setting is off by default; restart the Herdr server to apply changes. See [Session state and restore](/docs/session-state/#account-launcher) for what happens when the account is unknown.
+
 Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
 ## IME cursor tracking

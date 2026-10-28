@@ -1638,14 +1638,14 @@ impl App {
         )
     }
 
-    /// What the server can tell, as a Claude or Codex conversation report
+    /// What the server can tell, as a Claude, Codex or Grok conversation report
     /// arrives, about which process sent it: read here, once per report, so a
     /// launch record pairs the conversation only on that evidence. The agent
     /// process in `peer_ancestry`, the process on the other end of the API
     /// connection and its parents, is the reporter when the walk places it in
     /// the pane; otherwise the report stays undecided. Only when the server
     /// could not read that process does the pane's foreground job show which
-    /// Claude or Codex processes could have sent the report.
+    /// Claude, Codex or Grok processes could have sent the report.
     fn session_report_evidence(
         &self,
         ws_idx: usize,
@@ -1655,8 +1655,8 @@ impl App {
     ) -> crate::terminal::SessionReportEvidence {
         use crate::detect::ReportSender;
         use crate::terminal::SessionReportEvidence;
-        let Some(agent @ (crate::detect::Agent::Claude | crate::detect::Agent::Codex)) =
-            crate::detect::parse_agent_label(agent_label)
+        let Some(agent) = crate::detect::parse_agent_label(agent_label)
+            .filter(|agent| crate::agent_resume::carries_launch_options(*agent))
         else {
             return Default::default();
         };
@@ -1678,12 +1678,10 @@ impl App {
                 job.processes
                     .iter()
                     .filter(|process| {
-                        matches!(
-                            crate::detect::identify_agent_process(process),
-                            Some((
-                                crate::detect::Agent::Claude | crate::detect::Agent::Codex,
-                                _
-                            ))
+                        crate::detect::identify_agent_process(process).is_some_and(
+                            |(identified, _)| {
+                                crate::agent_resume::carries_launch_options(identified)
+                            },
                         )
                     })
                     .map(|process| crate::platform::ProcessInstance {
