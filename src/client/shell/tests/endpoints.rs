@@ -74,6 +74,114 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
 }
 
 #[test]
+fn multi_endpoint_local_terminal_renders_after_unavailable_frame() {
+    let (mut state, _) = state_with_remote();
+    state.invalidate_pane_surface();
+    let unavailable = state.compose(262, 122).unwrap();
+    assert!(frame_rows(&unavailable)
+        .iter()
+        .any(|row| row.contains("Local: online. Select a connected machine.")));
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .any(|hit| hit.endpoint_id.is_local()));
+
+    state.set_pane_surface(surface());
+    let composed = state.compose(262, 122).unwrap();
+    let buffer = composed.to_ratatui_buffer().unwrap();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(262, 122)).unwrap();
+    terminal.draw(|frame| *frame.buffer_mut() = buffer).unwrap();
+    let pane = state.layout(262, 122).pane_surface;
+    assert_eq!(terminal.backend().buffer()[(pane.x, pane.y)].symbol(), "L");
+    assert!(frame_rows(&composed).iter().any(|row| row.contains("LIVE")));
+    assert!(!frame_rows(&composed)
+        .iter()
+        .any(|row| row.contains("Select a connected machine")));
+}
+
+fn state_with_delayed_wide_surface() -> ClientShellState {
+    let (mut state, _) = state_with_remote();
+    let old_layout = state.layout(280, 130).pane_surface;
+    let mut delayed = surface();
+    delayed.frame = FrameData::from_ratatui_buffer_with_hyperlinks(
+        &Buffer::empty(Rect::new(0, 0, old_layout.width, old_layout.height)),
+        None,
+        &[],
+    );
+    delayed.panes[0].rect.width = old_layout.width;
+    delayed.panes[0].rect.height = old_layout.height;
+    delayed.panes[0].inner_rect = delayed.panes[0].rect;
+    delayed.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: u64::from(old_layout.height),
+    });
+    state.set_pane_surface(delayed.clone());
+    state.compose(280, 130).unwrap();
+    state.invalidate_pane_surface();
+    // An in-flight frame can still carry the previous terminal width after a shrink.
+    state.set_pane_surface(delayed);
+    state.compose(280, 130).unwrap();
+    state
+}
+
+#[test]
+fn multi_endpoint_copy_search_clips_delayed_surface_at_terminal_edge() {
+    let mut state = state_with_delayed_wide_surface();
+    let mut outcome = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+        &mut outcome,
+    );
+    let copy = state.copy_mode.as_mut().unwrap();
+    copy.search_query = "needle".into();
+    copy.search_matches = vec![
+        crate::api::schema::PaneTextRange {
+            start: crate::api::schema::PaneTextPoint { row: 7, col: 0 },
+            end: crate::api::schema::PaneTextPoint {
+                row: 7,
+                col: copy.geometry.0 - 1,
+            },
+        },
+        crate::api::schema::PaneTextRange {
+            start: crate::api::schema::PaneTextPoint { row: 7, col: 0 },
+            end: crate::api::schema::PaneTextPoint {
+                row: 128,
+                col: copy.geometry.0 - 1,
+            },
+        },
+    ];
+    copy.search_total = 2;
+    copy.search_current = Some(0);
+    copy.search_current_global = Some(0);
+    copy.cursor = crate::api::schema::PaneTextPoint { row: 7, col: 0 };
+    let composed = state.compose(262, 122).unwrap();
+    assert_eq!((composed.width, composed.height), (262, 122));
+    let buffer = composed.to_ratatui_buffer().unwrap();
+    assert_eq!(buffer[(261, 8)].bg, state.config.palette.accent);
+}
+
+#[test]
+fn multi_endpoint_mouse_selection_clips_delayed_surface_at_terminal_edge() {
+    let mut state = state_with_delayed_wide_surface();
+    let width = state.pane_surface.as_ref().unwrap().panes[0]
+        .inner_rect
+        .width;
+    state.selection = Some(crate::selection::Selection::absolute_range(
+        "pane_1".to_owned(),
+        (7, 0),
+        (128, width - 1),
+    ));
+    let composed = state.compose(262, 122).unwrap();
+    let buffer = composed.to_ratatui_buffer().unwrap();
+    assert_eq!(buffer[(261, 8)].bg, buffer[(260, 8)].bg);
+    assert_ne!(buffer[(261, 8)].bg, buffer[(261, 7)].bg);
+    assert_eq!(buffer[(261, 121)].bg, buffer[(261, 8)].bg);
+}
+
+#[test]
 fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
     let (mut state, id) = state_with_remote();
     state.set_endpoint_status(&id, ClientEndpointStatus::Attention);

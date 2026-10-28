@@ -791,10 +791,11 @@ pub(crate) fn render_selection_highlight<P: PartialEq>(
         return;
     };
     let style = automatic_selection_style(p, host_theme);
-    for y in 0..inner.height {
-        for x in 0..inner.width {
-            if selection.contains(y, x, scroll_metrics) {
-                buffer[(inner.x + x, inner.y + y)].set_style(style);
+    let visible = inner.intersection(buffer.area);
+    for y in visible.y..visible.bottom() {
+        for x in visible.x..visible.right() {
+            if selection.contains(y - inner.y, x - inner.x, scroll_metrics) {
+                buffer[(x, y)].set_style(style);
             }
         }
     }
