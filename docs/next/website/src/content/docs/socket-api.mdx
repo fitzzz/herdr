@@ -1048,7 +1048,9 @@ terminal, provider, native identity and the entire launcher before continuing.
 An unknown or mismatched result is not permission to retry or create a replacement.
 
 Same-identity recovery reapplies the launcher to Herdr's existing canonical
-native resume arguments. A confirmed replacement clears the binding; temporary
+native resume arguments. Herdr expects a launcher to pass its `prefix_args` on to
+the agent, so a leading copy of them in the agent's saved launch options is not
+repeated on recovery. A confirmed replacement clears the binding; temporary
 missing observations retain it. Missing or invalid launchers refuse recovery, as does
 a launcher command longer than the pane's shell takes in one line.
 Launcher-bearing disk snapshots use JSON version 4 and handoff manifests use
