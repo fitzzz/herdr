@@ -127,6 +127,8 @@ herdr integration install codex
 
 Codex 钩子通过与其他集成相同的本地 socket API 上报会话身份。Codex 的状态来自 Herdr 的屏幕清单检测。
 
+Codex 在会话的第一个提示发送时运行钩子。在此之前,用 `codex resume <id>` 启动的 Codex 会显示该会话,Herdr 从进程的命令行读取它;新的 Codex 会话则不显示会话。
+
 Herdr 默认使用 `~/.codex`,设置了 `CODEX_HOME` 时使用后者。Codex 配置目录必须已经存在。安装会写入 `herdr-agent-state.sh`、更新 `hooks.json`,并确保 `config.toml` 中有 `[features] hooks = true`。如果存在已弃用的顶层 `codex_hooks` 标志,它也会一并移除。卸载会从 `hooks.json` 中移除 Herdr 条目并删除钩子脚本,但不改动 `config.toml`。
 
 ## GitHub Copilot CLI

@@ -426,13 +426,21 @@ fn terminal_agent_session_info(
         }
     }
 
-    terminal
-        .persisted_agent_session
-        .as_ref()
-        .map(|session| crate::api::schema::AgentSessionInfo {
+    if let Some(session) = terminal.persisted_agent_session.as_ref() {
+        return Some(crate::api::schema::AgentSessionInfo {
             source: session.source.clone(),
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
+        });
+    }
+
+    terminal
+        .codex_command_line_session()
+        .map(|session_ref| crate::api::schema::AgentSessionInfo {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            kind: session_ref.kind,
+            value: session_ref.value.clone(),
         })
 }
