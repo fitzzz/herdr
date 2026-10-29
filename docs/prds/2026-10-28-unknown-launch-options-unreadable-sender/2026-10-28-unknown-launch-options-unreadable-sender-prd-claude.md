@@ -98,6 +98,14 @@ Paths starting with `w1/`, `w2/` or `checks-` are in
   project's Test jobs setting, passed 4,325 of 4,325 tests with 15 skipped; `just docs-contract-test`
   passed. The tested tree is the rebased head before this entry; the later commit changes only this
   PRD.
+- 2026-10-29 17:52:27 EDT - `origin/main` advanced to `9e8f045e` (PR #16: the Codex conversation its
+  command line resumes, Codex startup draft dots, and the TUI edge work of PR #15). GitHub then marked
+  pull request #12 conflicting. The branch was rebased onto it; the only conflict was in
+  `src/terminal/state.rs`, where main's new `codex_command_line_session` sits beside
+  `sync_agent_launch_session`. The resolution keeps that method and this task's version of the
+  `sync_agent_launch_session` doc and body. `just ci` with `NEXTEST_TEST_THREADS=32` passed 4,330 of
+  4,330 tests with 15 skipped, and `just docs-contract-test` passed. The tested tree is the rebased
+  head before this entry; the later commit changes only this PRD.
 
 ## Introduction/Overview
 
