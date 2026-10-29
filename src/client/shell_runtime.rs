@@ -255,6 +255,8 @@ pub(super) fn begin_endpoint_activation(
     let already_active = !replace_pending
         && !force
         && endpoints.active_id() == &endpoint_id
+        // A live transport lease does not restore a client frame lost during resize.
+        && state.shell.as_ref().is_some_and(|shell| shell.has_presented_surface())
         && endpoints
             .connection(&endpoint_id)
             .is_some_and(|connection| connection.surface_active);
@@ -799,6 +801,73 @@ pub(super) fn finish_client_shell_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_endpoint_local_selection_reacquires_missing_terminal_surface() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>);
+        impl endpoint::EndpointTransport for Capture {
+            fn send(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+        }
+
+        let mut state = ClientState::test_new();
+        state.reported_size = (262, 122);
+        let shell = state.shell.as_mut().unwrap();
+        let profile = endpoint::SavedSshEndpoint {
+            id: endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            label: "Remote".into(),
+            target: "dev@example.test".into(),
+            session: "main".into(),
+            enabled: true,
+        };
+        shell.set_endpoint_catalog(&[profile]);
+        let snapshot = serde_json::from_str(include_str!(
+            "../../tests/fixtures/endpoint-snapshot-v1.json"
+        ))
+        .unwrap();
+        shell.set_endpoint_snapshot_for_generation(&endpoint::ClientEndpointId::Local, 1, snapshot);
+        shell.invalidate_pane_surface();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut endpoints = endpoint::EndpointRegistry::new(
+            Capture(sent.clone()),
+            1,
+            endpoint::EndpointNegotiation::new(
+                vec!["client_shell.surface.set".into()],
+                vec![
+                    crate::protocol::endpoint::SURFACE_INTEREST_CAPABILITY.into(),
+                    crate::protocol::endpoint::PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
+                ],
+            ),
+        );
+        let mut commands = endpoint_commands::EndpointCommands::default();
+        let mut pending = None;
+        let mut serial = 1;
+        let mut scheduled = None;
+        begin_endpoint_activation(
+            &mut state,
+            &mut endpoints,
+            &mut commands,
+            &mut pending,
+            &mut serial,
+            endpoint::ClientEndpointId::Local,
+            Some(shell::ClientEndpointFocusTarget::Workspace("w1".into())),
+            false,
+            std::time::Instant::now(),
+            &mut scheduled,
+        )
+        .unwrap();
+        assert!(
+            pending.is_some(),
+            "a focus acknowledgement cannot restore a missing terminal frame"
+        );
+        assert!(sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| matches!(message, ClientMessage::ClientShellResize { .. })));
+    }
 
     #[test]
     fn host_color_reaches_server_before_first_snapshot() {

@@ -786,19 +786,15 @@ fn render_client_copy_search_highlights(
                 hit.inner_rect.width.saturating_sub(1)
             };
             let end_col = end_col.min(hit.inner_rect.width.saturating_sub(1));
-            occlusion.cover(Rect::new(
+            let highlight = Rect::new(
                 hit.inner_rect.x.saturating_add(start_col),
                 hit.inner_rect.y.saturating_add(viewport_row),
                 end_col.saturating_add(1).saturating_sub(start_col),
                 1,
-            ));
-            for col in start_col..=end_col {
-                buffer[(
-                    hit.inner_rect.x.saturating_add(col),
-                    hit.inner_rect.y.saturating_add(viewport_row),
-                )]
-                    .set_style(style);
-            }
+            )
+            .intersection(buffer.area);
+            occlusion.cover(highlight);
+            buffer.set_style(highlight, style);
         }
     }
 }
