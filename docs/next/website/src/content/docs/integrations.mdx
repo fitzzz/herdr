@@ -125,6 +125,8 @@ herdr integration install codex
 
 The Codex hook reports session identity through the same local socket API used by other integrations. Codex state comes from Herdr's screen manifest detection.
 
+Codex runs the hook when the first prompt of a session is sent. Until then, a Codex started with `codex resume <id>` shows that conversation, which Herdr reads from the process's command line; a new Codex session shows none.
+
 Herdr uses `~/.codex` by default, or `CODEX_HOME` when set. The Codex config directory must already exist. Install writes `herdr-agent-state.sh`, updates `hooks.json`, and ensures `[features] hooks = true` in `config.toml`. It also removes the deprecated top-level `codex_hooks` flag when present. Uninstall removes Herdr entries from `hooks.json` and deletes the hook script, but leaves `config.toml` unchanged.
 
 ## GitHub Copilot CLI

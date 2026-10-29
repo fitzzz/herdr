@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.10.28.1"
+version = "2026.10.29.1"
 min_engine_version = 4
-updated_at = "2026-10-28T19:00:00Z"
+updated_at = "2026-10-29T21:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -168,7 +168,9 @@ state = "draft"
 priority = 600
 region = "current_prompt_line"
 regex = ['(?m)^›[ \t]+[^/\r\n][^\r\n]*$']
-not = [{ regex = ['(?m)^›[ \t]+Ask Codex to do anything[ \t]*$'] }]
+# On a fresh Astra task Codex animates braille dots into blank composer cells,
+# including those after the placeholder, for up to 15 s; typing stops them.
+not = [{ regex = ['(?m)^›[ \t]+Ask Codex to do anything[ \t⠁⠂⠄⠈⠐⠠⡀⢀]*$'] }]
 
 [[composer]]
 id = "queued_message"

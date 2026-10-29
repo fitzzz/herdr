@@ -84,7 +84,7 @@ STAGED_PUBLISHED_MANIFESTS = {
     # Codex's engine-4 composer rules stay bundled until a released client
     # carries engine 4. Published clients keep the engine-3 catalog manifest.
     "codex": (
-        "2026.10.28.1",
+        "2026.10.29.1",
         "2026.10.11.1",
         "d25cfddb5434259303fb0ac27b5b0e6d0558408e6901ee112bcd53de02bcda13",
     ),

@@ -984,6 +984,23 @@ impl TerminalState {
             })
     }
 
+    /// The conversation the pane's bound Codex process resumes on its own
+    /// command line (`codex resume <id>`), while no later fact contradicts it.
+    /// Codex reports its conversation only when its first turn starts, so a
+    /// resume typed into the shell, or one whose managed start outlived its
+    /// deadline, is otherwise unnamed until the next prompt. The launch record
+    /// is dropped when the agent leaves the pane, and this with it.
+    pub fn codex_command_line_session(&self) -> Option<&crate::agent_resume::AgentSessionRef> {
+        let launch = self
+            .agent_launch
+            .as_ref()
+            .filter(|launch| launch.agent == Agent::Codex)?;
+        let process = launch.process()?;
+        let fact = self.process_sessions.of(&process)?;
+        let (_, runs) = self.process_sessions.session_of(&process)?;
+        (fact.shown_by == ShownBy::CommandLine && runs).then_some(&fact.session)
+    }
+
     /// Records which processes a report of the pane's current conversation
     /// named ([`SessionReportEvidence::named_processes`]) and decides the launch
     /// record's pairing again: a bound process runs the conversation it was
@@ -5290,6 +5307,51 @@ mod tests {
         );
         assert!(!terminal.resumed_without_launch_options());
         assert!(!terminal.resumed_without_launch_options_for_session("claude"));
+    }
+
+    #[test]
+    fn codex_command_line_session_names_a_bound_resume_until_contradicted() {
+        let id = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
+        let process = ProcessInstance::unknown_start(10);
+        let resumed = |agent: Agent, session: Option<&str>| {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(agent), AgentState::Idle);
+            terminal.observe_agent_launch(agent, process, known_options(&[]), session);
+            terminal
+        };
+
+        let mut terminal = resumed(Agent::Codex, Some("codex-a"));
+        assert_eq!(terminal.codex_command_line_session(), Some(&id("codex-a")));
+        // The process's own report of another conversation replaces it.
+        report_with(
+            &mut terminal,
+            "codex",
+            "codex-b",
+            (1, "clear"),
+            &SessionReportEvidence::Reporter(vec![process]),
+        );
+        assert_eq!(terminal.codex_command_line_session(), None);
+
+        // A Codex started without `resume <id>`, or another agent, names none.
+        assert_eq!(
+            resumed(Agent::Codex, None).codex_command_line_session(),
+            None
+        );
+        assert_eq!(
+            resumed(Agent::Claude, Some("claude-a")).codex_command_line_session(),
+            None
+        );
+
+        // It leaves the pane with the process.
+        let mut terminal = resumed(Agent::Codex, Some("codex-a"));
+        terminal.set_detected_state_with_visible_blocker(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(terminal.codex_command_line_session(), None);
     }
 
     #[test]
