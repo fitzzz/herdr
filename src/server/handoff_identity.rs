@@ -182,7 +182,7 @@ impl IdentityAttempt {
         manifest: &HandoffManifest,
         bytes: &[u8],
     ) -> io::Result<HashMap<u32, AdmittedPaneIdentity>> {
-        let identities = admit_manifest(&self.receipt, manifest)?;
+        let identities = admit_manifest(&self.receipt, manifest, codex_command_line_resume)?;
         self.verify_processes()?;
         let record = serde_json::to_vec(&serde_json::json!({
             "operation_id": self.receipt.operation_id,
@@ -236,11 +236,47 @@ fn layout_ids(layout: &crate::persist::LayoutSnapshot, ids: &mut Vec<u32>) {
     }
 }
 
-/// Pure complete admission. Run before `validated` and before restoration can
-/// allocate, resume, spawn, or publish a binding.
+/// The conversation the foreground Codex process of the pane whose shell is
+/// `child_pid` resumes on its own command line, read the way detection reads
+/// it.
+fn codex_command_line_resume(child_pid: u32) -> Option<String> {
+    let job = crate::detect::foreground_job(child_pid)?;
+    let (agent, _, index) = crate::detect::identify_agent_process_in_job(&job)?;
+    let argv = job.processes.get(index)?.argv.as_deref()?;
+    (agent == crate::detect::Agent::Codex)
+        .then(|| crate::agent_resume::resumed_session_from_process_argv(agent, argv))
+        .flatten()
+}
+
+/// The conversation a source API names for a pane from its Codex's own
+/// `resume <id>` command line (`TerminalState::codex_command_line_session`),
+/// which a session save leaves out, while the pane's Codex still resumes it.
+fn unsaved_codex_resume(
+    child: Option<&MigrationProcessStamp>,
+    codex_resume: impl Fn(u32) -> Option<String>,
+) -> io::Result<Option<Value>> {
+    let Some(value) = child.and_then(|child| codex_resume(child.pid)) else {
+        return Ok(None);
+    };
+    serde_json::to_value(crate::api::schema::AgentSessionInfo {
+        source: "herdr:codex".into(),
+        agent: "codex".into(),
+        kind: crate::agent_resume::AgentSessionRefKind::Id,
+        value,
+    })
+    .map(Some)
+    .map_err(io::Error::other)
+}
+
+/// Complete admission. Run before `validated` and before restoration can
+/// allocate, resume, spawn, or publish a binding. Its only outside read is
+/// `codex_resume`, the conversation a pane's Codex resumes on its command
+/// line, given the pane's shell process id; it is read only for a captured
+/// conversation the frozen snapshot does not save.
 pub(crate) fn admit_manifest(
     receipt: &IdentityReceipt,
     manifest: &HandoffManifest,
+    codex_resume: impl Fn(u32) -> Option<String>,
 ) -> io::Result<HashMap<u32, AdmittedPaneIdentity>> {
     super::handoff::validate_manifest_format(manifest)?;
     if receipt.version != 1
@@ -362,9 +398,16 @@ pub(crate) fn admit_manifest(
                     })
                     .transpose()
                     .map_err(io::Error::other)?;
+                // A Codex resumed by a command typed into the pane is named on
+                // the API before its first turn reports it, but not saved.
+                let occupant = if native.is_none() && capture.agent_session.is_some() {
+                    unsaved_codex_resume(capture.child.as_ref(), &codex_resume)?
+                } else {
+                    native
+                };
                 if capture.workspace_id != workspace_id
                     || capture.tab_id != tab_id
-                    || capture.agent_session != native
+                    || capture.agent_session != occupant
                     || capture.agent_name != saved.agent_name
                 {
                     return Err(mismatch("migration frozen occupant differs from capture"));
@@ -513,7 +556,7 @@ mod tests {
     #[test]
     fn sparse_canonical_mapping_preserves_exact_terminal_id() {
         let (receipt, manifest) = fixtures();
-        let admitted = admit_manifest(&receipt, &manifest).unwrap();
+        let admitted = admit_manifest(&receipt, &manifest, |_| None).unwrap();
         let AdmittedPaneIdentity::Runtime(id) = &admitted[&900] else {
             panic!("live pane was admitted as unavailable");
         };
@@ -523,29 +566,29 @@ mod tests {
     fn missing_runtime_duplicate_and_changed_occupant_are_not_admitted() {
         let (mut receipt, mut manifest) = fixtures();
         manifest.panes.clear();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         let (_, valid) = fixtures();
         manifest.panes = valid.panes;
         manifest.panes.push(manifest.panes[0].clone());
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         manifest.panes.pop();
         receipt.panes[0].child.as_mut().unwrap().pid += 1;
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         receipt.panes[0].child.as_mut().unwrap().pid -= 1;
         receipt.panes[0].terminal_id.clear();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
     }
     #[test]
     fn incomplete_public_numbers_and_layout_are_not_synthesized() {
         let (receipt, mut manifest) = fixtures();
         manifest.snapshot.workspaces[0].public_pane_numbers.clear();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         let (_, mut manifest) = fixtures();
         manifest.snapshot.workspaces[0].tabs[0].root_pane = Some(901);
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         let (_, mut manifest) = fixtures();
         manifest.snapshot.workspaces[0].tabs[0].panes.clear();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
     }
     #[test]
     fn duplicate_nested_keys_are_rejected_without_losing_u64_precision() {
@@ -579,7 +622,7 @@ mod tests {
     #[test]
     fn saved_launch_options_and_account_do_not_change_the_occupant_identity() {
         let (receipt, manifest) = fixtures_with_agent_session();
-        let admitted = admit_manifest(&receipt, &manifest).unwrap();
+        let admitted = admit_manifest(&receipt, &manifest, |_| None).unwrap();
         assert!(
             matches!(&admitted[&900], AdmittedPaneIdentity::Runtime(id) if id.as_str() == "opaque-exact-old-ID")
         );
@@ -605,7 +648,7 @@ mod tests {
         ] {
             let (mut receipt, manifest) = fixtures_with_agent_session();
             receipt.panes[0].agent_session.as_mut().unwrap()[field] = value.into();
-            let error = admit_manifest(&receipt, &manifest).err().unwrap();
+            let error = admit_manifest(&receipt, &manifest, |_| None).err().unwrap();
             assert_eq!(
                 error.to_string(),
                 "migration frozen occupant differs from capture",
@@ -614,17 +657,17 @@ mod tests {
         }
         let (mut receipt, manifest) = fixtures_with_agent_session();
         receipt.panes[0].agent_session = None;
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         let (mut receipt, manifest) = fixtures_with_agent_session();
         receipt.panes[0].agent_name = None;
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         let (receipt, mut manifest) = fixtures_with_agent_session();
         manifest.snapshot.workspaces[0].tabs[0]
             .panes
             .get_mut(&900)
             .unwrap()
             .agent_session = None;
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
     }
 
     #[test]
@@ -639,7 +682,7 @@ mod tests {
             label: Some("saved label".into()),
         });
         let exported_runtime = manifest.panes.pop().unwrap();
-        let admitted = admit_manifest(&receipt, &manifest).unwrap();
+        let admitted = admit_manifest(&receipt, &manifest, |_| None).unwrap();
         let AdmittedPaneIdentity::Unavailable(placeholder) = &admitted[&900] else {
             panic!("unavailable pane was admitted as live");
         };
@@ -650,12 +693,98 @@ mod tests {
             receipt.panes[0].unavailable.clone().unwrap()
         );
         manifest.panes.push(exported_runtime);
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         manifest.panes.clear();
         receipt.panes[0].unavailable.as_mut().unwrap().cwd = "/changed".into();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
         receipt.panes[0].unavailable.as_mut().unwrap().cwd = "/missing-is-valid-for-import".into();
         receipt.panes[0].unavailable.as_mut().unwrap().restore_error = "different failure".into();
-        assert!(admit_manifest(&receipt, &manifest).is_err());
+        assert!(admit_manifest(&receipt, &manifest, |_| None).is_err());
+    }
+
+    /// A Codex resumed by a command typed into the pane's shell: the source
+    /// API names its conversation from that command line, and the frozen
+    /// snapshot saves none.
+    fn fixtures_with_unsaved_codex_resume() -> (IdentityReceipt, HandoffManifest) {
+        let (mut receipt, manifest) = fixtures();
+        receipt.panes[0].agent_session = Some(serde_json::json!({
+            "agent":"codex","kind":"id","source":"herdr:codex","value":"conversation-1"
+        }));
+        (receipt, manifest)
+    }
+
+    #[test]
+    fn an_unsaved_codex_resume_is_admitted_while_the_pane_codex_resumes_it() {
+        let (receipt, manifest) = fixtures_with_unsaved_codex_resume();
+        let admitted = admit_manifest(&receipt, &manifest, |shell| {
+            (shell == 42).then(|| "conversation-1".to_string())
+        })
+        .unwrap();
+        assert!(
+            matches!(&admitted[&900], AdmittedPaneIdentity::Runtime(id) if id.as_str() == "opaque-exact-old-ID")
+        );
+    }
+
+    #[test]
+    fn an_unsaved_conversation_the_pane_codex_does_not_resume_is_not_admitted() {
+        for resumed in [None, Some("conversation-2")] {
+            let (receipt, manifest) = fixtures_with_unsaved_codex_resume();
+            let error = admit_manifest(&receipt, &manifest, |_| resumed.map(String::from))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "migration frozen occupant differs from capture",
+                "{resumed:?}"
+            );
+        }
+        let resumes_it = |_| Some("conversation-1".to_string());
+        // Only a Codex conversation id is read from a Codex command line.
+        for (field, value) in [
+            ("source", "herdr:claude"),
+            ("agent", "claude"),
+            ("kind", "path"),
+        ] {
+            let (mut receipt, manifest) = fixtures_with_unsaved_codex_resume();
+            receipt.panes[0].agent_session.as_mut().unwrap()[field] = value.into();
+            assert!(
+                admit_manifest(&receipt, &manifest, resumes_it).is_err(),
+                "{field}"
+            );
+        }
+        // Another agent name or child process still differs.
+        let (mut receipt, manifest) = fixtures_with_unsaved_codex_resume();
+        receipt.panes[0].agent_name = Some("worker".into());
+        assert!(admit_manifest(&receipt, &manifest, resumes_it).is_err());
+        let (mut receipt, manifest) = fixtures_with_unsaved_codex_resume();
+        receipt.panes[0].child.as_mut().unwrap().pid += 1;
+        assert!(admit_manifest(&receipt, &manifest, resumes_it).is_err());
+    }
+
+    #[test]
+    fn a_saved_conversation_is_never_replaced_by_the_command_line() {
+        let (mut receipt, manifest) = fixtures_with_agent_session();
+        receipt.panes[0].agent_session = Some(serde_json::json!({
+            "agent":"codex","kind":"id","source":"herdr:codex","value":"conversation-2"
+        }));
+        let read = std::cell::Cell::new(false);
+        let error = admit_manifest(&receipt, &manifest, |_| {
+            read.set(true);
+            Some("conversation-2".to_string())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "migration frozen occupant differs from capture"
+        );
+        assert!(!read.get());
+        let (receipt, manifest) = fixtures_with_agent_session();
+        admit_manifest(&receipt, &manifest, |_| {
+            read.set(true);
+            None
+        })
+        .unwrap();
+        assert!(!read.get());
     }
 }
