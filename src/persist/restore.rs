@@ -3314,7 +3314,8 @@ mod tests {
                 Some(1),
                 Some("startup".into()),
             );
-            terminal.sync_agent_launch_session(&Default::default());
+            terminal
+                .sync_agent_launch_session(&crate::terminal::SessionReportEvidence::Unidentified);
         });
         assert_eq!(saved.value, "fresh-session");
         assert_eq!(saved.launch_options, None);
@@ -3458,16 +3459,12 @@ mod tests {
         assert_eq!(agent_osc_title, "codex idle");
     }
 
-    /// The report evidence of a pane whose foreground job runs these Claude
-    /// processes.
+    /// The report evidence of Claude process `reporter`.
     #[cfg(unix)]
-    fn foreground_claude(process_ids: &[u32]) -> crate::terminal::SessionReportEvidence {
-        crate::terminal::SessionReportEvidence::ForegroundAgents(Some(
-            process_ids
-                .iter()
-                .map(|&pid| ProcessInstance::unknown_start(pid))
-                .collect(),
-        ))
+    fn reported_by(reporter: u32) -> crate::terminal::SessionReportEvidence {
+        crate::terminal::SessionReportEvidence::Reporter(vec![ProcessInstance::unknown_start(
+            reporter,
+        )])
     }
 
     #[cfg(unix)]
@@ -3559,7 +3556,7 @@ mod tests {
                     resumed,
                 );
                 set_claude_session(terminal);
-                terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+                terminal.sync_agent_launch_session(&reported_by(4242));
             })
             .await;
             assert!(terminal.pending_agent_resume_plan.is_none());
@@ -3644,7 +3641,7 @@ mod tests {
                 None,
             );
             set_claude_session(terminal);
-            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+            terminal.sync_agent_launch_session(&reported_by(4242));
         })
         .await;
         // That agent exited, and the user started another by hand.
@@ -3661,13 +3658,13 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn live_handoff_carries_no_pairing_reported_beside_another_process() {
+    async fn live_handoff_carries_no_pairing_reported_by_another_process() {
         let (snapshot, _) = snapshot_with_saved_pane_history();
         let observed = ProcessInstance {
             pid: 4242,
             started: Some(1),
         };
-        for (case, in_job) in [
+        for (case, reporter) in [
             ("another process", ProcessInstance::unknown_start(4343)),
             (
                 "the id reused later",
@@ -3677,8 +3674,8 @@ mod tests {
                 },
             ),
         ] {
-            // The old server read Claude's report beside one other Claude
-            // before detection read process 4242.
+            // The old server read Claude's report from another Claude before
+            // detection read process 4242.
             let terminal = handed_off(&snapshot, |terminal| {
                 terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
                 terminal.set_agent_session_ref_for_session_start(
@@ -3689,7 +3686,7 @@ mod tests {
                     Some("startup".into()),
                 );
                 terminal.sync_agent_launch_session(
-                    &crate::terminal::SessionReportEvidence::ForegroundAgents(Some(vec![in_job])),
+                    &crate::terminal::SessionReportEvidence::Reporter(vec![reporter]),
                 );
                 terminal.observe_agent_launch(
                     crate::detect::Agent::Claude,
@@ -3720,13 +3717,12 @@ mod tests {
                 Some(start.into()),
             );
         };
-        // A Claude started by hand reported its conversation as the lone agent
-        // in the job before detection read it, so the old server confirmed
-        // the pairing.
+        // A Claude started by hand reported its conversation before detection
+        // read it, so the old server confirmed the pairing.
         let mut terminal = handed_off(&snapshot, |terminal| {
             terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
             report(terminal, "claude-session", 1, "startup");
-            terminal.sync_agent_launch_session(&foreground_claude(&[4242]));
+            terminal.sync_agent_launch_session(&reported_by(4242));
             terminal.observe_agent_launch(
                 crate::detect::Agent::Claude,
                 ProcessInstance::unknown_start(4242),
@@ -3743,7 +3739,7 @@ mod tests {
         // conversation, and Herdr cannot tell which one reported it.
         terminal.set_detected_state(Some(crate::detect::Agent::Claude), AgentState::Idle);
         report(&mut terminal, "claude-child", 2, "resume");
-        terminal.sync_agent_launch_session(&foreground_claude(&[4242, 4343]));
+        terminal.sync_agent_launch_session(&crate::terminal::SessionReportEvidence::Unidentified);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 

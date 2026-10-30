@@ -326,15 +326,11 @@ impl Pairing {
 }
 
 /// The conversation the launch record of `process` owns, given the record
-/// it replaces, the pane's current conversation, whether a live agent
-/// reported it (rather than a restore leaving it) with no evidence of which
-/// process did, the conversations processes were shown to run, including
-/// what this process's command line resumes, and what that command line says.
+/// it replaces, the conversations processes were shown to run, including what
+/// this process's command line resumes, and what that command line says.
 fn session_for_process(
     previous: Option<&ObservedAgentLaunch>,
     agent: Agent,
-    current_session: Option<&crate::agent_resume::AgentSessionRef>,
-    reported_without_evidence: bool,
     shown: &ProcessSessions,
     process: &ProcessInstance,
     reading: ResumeReading,
@@ -365,13 +361,10 @@ fn session_for_process(
     // other process was shown to run.
     let unclaimed =
         |session: &&crate::agent_resume::AgentSessionRef| shown.runner(session).is_none();
-    if let Some(
-        LaunchState::Started(Pairing::Confirmed(session))
-        | LaunchState::Bound {
-            pairing: Pairing::Confirmed(session),
-            ..
-        },
-    ) = same_launch.map(|launch| &launch.state)
+    if let Some(LaunchState::Bound {
+        pairing: Pairing::Confirmed(session),
+        ..
+    }) = same_launch.map(|launch| &launch.state)
     {
         if unclaimed(&session) {
             return Pairing::Confirmed(session.clone());
@@ -382,20 +375,15 @@ fn session_for_process(
     let assumed = same_launch
         .and_then(ObservedAgentLaunch::session)
         .filter(unclaimed);
-    // A conversation a live agent reported that no earlier process owned,
-    // when no evidence of the report's sender was kept.
-    let reported = current_session
-        .filter(|session| reported_without_evidence && earlier != Some(*session))
-        .filter(unclaimed);
     let session = match reading {
         // A command line that resumes a valid conversation id showed this
         // process running it, above.
-        ResumeReading::Unknown | ResumeReading::Resumes(_) => assumed.or(reported),
+        ResumeReading::Unknown | ResumeReading::Resumes(_) => assumed,
         // A new conversation cannot be the one the seed named, unless no
         // command line can name that one.
-        ResumeReading::Nothing => assumed
-            .filter(|session| session.kind != crate::agent_resume::AgentSessionRefKind::Id)
-            .or(reported),
+        ResumeReading::Nothing => {
+            assumed.filter(|session| session.kind != crate::agent_resume::AgentSessionRefKind::Id)
+        }
     };
     let earlier = earlier.cloned();
     match session.cloned() {
@@ -404,53 +392,25 @@ fn session_for_process(
     }
 }
 
-/// What the server knew, as a Claude, Codex, Grok or OpenCode conversation report arrived,
-/// about which process sent it.
+/// What the server knew, as a Claude, Codex, Grok or OpenCode conversation
+/// report arrived, about which process sent it. Only a reporter names
+/// processes, matched by id and start time ([`ProcessInstance::is`]); a report
+/// records what it names in [`ProcessSessions`], which both reports and
+/// observations decide from, so the order they arrive in does not change the
+/// pairing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionReportEvidence {
     /// The reporter: the nearest process running the report's agent above
     /// the process that sent the report, inside the pane, with the launchers
     /// directly above it that started it.
     Reporter(Vec<ProcessInstance>),
-    /// The server read the process that sent the report but could not place
-    /// a process running the agent in the pane: none was found below the
-    /// pane's own process, or the walk ended before reaching the pane, such as
-    /// when a process exited first, so it cannot tell who reported.
+    /// The server cannot tell which process sent the report, so it names
+    /// none: the server could not read the process on the other end of the
+    /// connection, such as for a report that did not come over the local API
+    /// socket, or it read that process but could not place a process running
+    /// the agent in the pane, such as when none was found below the pane's
+    /// own process or a process exited before the walk reached the pane.
     Unidentified,
-    /// The server could not read the process that sent the report, such as
-    /// for a report that did not come over the local API socket: the Claude,
-    /// Codex, Grok and OpenCode processes in the pane's foreground job, when the job
-    /// could be read.
-    ForegroundAgents(Option<Vec<ProcessInstance>>),
-}
-
-impl Default for SessionReportEvidence {
-    fn default() -> Self {
-        Self::ForegroundAgents(None)
-    }
-}
-
-impl SessionReportEvidence {
-    /// The processes this evidence names as the one that reported, and how
-    /// it shows them, or `None` when the server cannot tell. A reporter
-    /// names itself and the launchers directly above it. A foreground job
-    /// running exactly one Claude, Codex, Grok or OpenCode process names that process, which
-    /// is the only evidence that names a launch not yet bound to a process,
-    /// taken to be that process. An unreadable job, a job running
-    /// none or more than one, and a sender the server read but could not
-    /// place in the pane name none. Processes match by id and start time
-    /// ([`ProcessInstance::is`]). A report records what it names in
-    /// [`ProcessSessions`], which both reports and observations decide from,
-    /// so the order they arrive in does not change the pairing.
-    fn named_processes(&self) -> Option<(&[ProcessInstance], ShownBy)> {
-        match self {
-            Self::Reporter(reporter) => Some((reporter, ShownBy::Reporter)),
-            Self::ForegroundAgents(Some(agents)) if agents.len() == 1 => {
-                Some((agents, ShownBy::ForegroundJob))
-            }
-            Self::Unidentified | Self::ForegroundAgents(_) => None,
-        }
-    }
 }
 
 /// The conversation agent processes were last shown to run, oldest first: a
@@ -474,8 +434,6 @@ enum ShownBy {
     CommandLine,
     /// A report's sender, or a live handoff that carried a confirmed pairing.
     Reporter,
-    /// The lone agent in the pane's foreground job as a report arrived.
-    ForegroundJob,
 }
 
 impl ProcessSessions {
@@ -680,9 +638,6 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
-    /// A live agent reported `persisted_agent_session`, rather than a restore
-    /// leaving it or `herdr agent start` arguments naming it.
-    persisted_agent_session_reported: bool,
     pub(crate) agent_launcher: Option<crate::agent_launcher::BoundAgentLauncher>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
@@ -714,10 +669,6 @@ pub struct TerminalState {
     pub restore_error: Option<String>,
     agent_launch: Option<ObservedAgentLaunch>,
     agent_launch_revision: u64,
-    /// The conversation last reported to the launch record with evidence of
-    /// its sender, which `process_sessions` holds, so the process detection
-    /// binds next is paired with it only on that evidence.
-    reported_session: Option<crate::agent_resume::AgentSessionRef>,
     /// The conversations agent processes in this pane were shown to run.
     process_sessions: ProcessSessions,
     /// Whether the restore that started this terminal repeated the agent's
@@ -738,7 +689,6 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
-            persisted_agent_session_reported: false,
             agent_launcher: None,
             reported_resume: None,
             reported_resume_revision: 0,
@@ -768,7 +718,6 @@ impl TerminalState {
             restore_error: None,
             agent_launch: None,
             agent_launch_revision: 0,
-            reported_session: None,
             process_sessions: ProcessSessions::default(),
             agent_launch_restore: None,
         }
@@ -925,21 +874,9 @@ impl TerminalState {
                 ResumeReading::Nothing | ResumeReading::Unknown => None,
             },
         );
-        let current_session = self.current_session_ref();
-        let reported_without_evidence = (self
-            .hook_authority
-            .as_ref()
-            .is_some_and(|authority| authority.session_ref.is_some())
-            || self.persisted_agent_session_reported)
-            && !self
-                .reported_session
-                .as_ref()
-                .is_some_and(|session| Some(session) == current_session);
         let pairing = session_for_process(
             self.agent_launch.as_ref(),
             agent,
-            current_session,
-            reported_without_evidence,
             &self.process_sessions,
             &process,
             reading,
@@ -1001,23 +938,26 @@ impl TerminalState {
         (fact.shown_by == ShownBy::CommandLine && runs).then_some(&fact.session)
     }
 
-    /// Records which processes a report of the pane's current conversation
-    /// named ([`SessionReportEvidence::named_processes`]) and decides the launch
-    /// record's pairing again: a bound process runs the conversation it was
-    /// last shown to run until another process is shown to run it
-    /// ([`ProcessSessions`]), and an unbound launch is paired when the
-    /// evidence names it, such as a conversation change inside it (Claude
-    /// `/clear`). When the evidence names no process, the report stays
-    /// undecided, so a repeated report decides again. A conversation reported
-    /// beside a saved launch that nothing runs belongs to another launch.
+    /// Records the reporter of the pane's current conversation, when the
+    /// server could tell it ([`SessionReportEvidence`]), and decides the
+    /// launch record's pairing again: a bound process runs the conversation it
+    /// was last shown to run until another process is shown to run it
+    /// ([`ProcessSessions`]). A reporter names processes, never an unbound
+    /// launch, which owns the conversation once detection binds it to one of
+    /// them. A report with no reporter names no process and stays undecided,
+    /// so a repeated report decides again. A conversation reported beside a
+    /// saved launch that nothing runs belongs to another launch.
     pub fn sync_agent_launch_session(&mut self, evidence: &SessionReportEvidence) {
         let Some(session) = self.current_session_ref().cloned() else {
             return;
         };
-        self.reported_session = Some(session.clone());
-        let named = evidence.named_processes();
-        if let Some((processes, shown_by)) = named {
-            self.process_sessions.show(processes, &session, shown_by);
+        let reported_by = match evidence {
+            SessionReportEvidence::Reporter(reporter) => Some(reporter),
+            SessionReportEvidence::Unidentified => None,
+        };
+        if let Some(reporter) = reported_by {
+            self.process_sessions
+                .show(reporter, &session, ShownBy::Reporter);
         }
         let Some(launch) = self.agent_launch.as_mut() else {
             return;
@@ -1025,30 +965,15 @@ impl TerminalState {
         let owns_it = launch.session() == Some(&session);
         let (pairing, paired) = match &mut launch.state {
             LaunchState::Saved(_) => return,
-            LaunchState::Started(pairing) => {
-                // A reporter names processes, never an unbound launch, which
-                // it owns once detection binds it to one of them.
-                let names_launch = named.map(|(_, shown_by)| shown_by == ShownBy::ForegroundJob);
-                let paired = match names_launch {
-                    Some(true) => Pairing::Confirmed(session.clone()),
-                    Some(false) if owns_it => Pairing::Unpaired {
-                        earlier: pairing.earlier().cloned(),
-                    },
-                    // Only a job's lone agent confirms an unbound launch,
-                    // which is taken to be that process, so it no longer runs
-                    // the conversation once another fact about it is newer.
-                    Some(false) | None
-                        if matches!(pairing, Pairing::Confirmed(confirmed)
-                        if self.process_sessions.runner(confirmed).is_none_or(|runner| {
-                            runner.shown_by != ShownBy::ForegroundJob
-                        })) =>
-                    {
-                        Pairing::Unpaired { earlier: None }
-                    }
-                    Some(false) | None => return,
+            // Another process reported the conversation the unbound launch
+            // named.
+            LaunchState::Started(pairing) if reported_by.is_some() && owns_it => {
+                let paired = Pairing::Unpaired {
+                    earlier: pairing.earlier().cloned(),
                 };
                 (pairing, paired)
             }
+            LaunchState::Started(_) => return,
             LaunchState::Bound {
                 process, pairing, ..
             } => {
@@ -1610,7 +1535,6 @@ impl TerminalState {
             );
             self.hook_authority = None;
             self.persisted_agent_session = durable_session;
-            self.persisted_agent_session_reported = true;
         }
         // Observing a process exit is not the same as the agent being gone: the
         // observation can be wrong while the agent keeps running, and the name
@@ -2210,7 +2134,6 @@ impl TerminalState {
         for (source, agent_label, session_ref, pending) in validated_replacement_sessions {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
             self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
-            self.persisted_agent_session_reported = true;
             self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
                 source: source.clone(),
                 agent: agent_label,
@@ -2421,7 +2344,6 @@ impl TerminalState {
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session);
-        self.persisted_agent_session_reported = false;
     }
 
     pub fn set_managed_agent_launch_session(
@@ -2429,7 +2351,6 @@ impl TerminalState {
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session.clone());
-        self.persisted_agent_session_reported = false;
         self.managed_agent_launch_session = Some(session);
     }
 
@@ -2442,7 +2363,6 @@ impl TerminalState {
     ) {
         self.set_reported_resume(None);
         self.persisted_agent_session = session.clone();
-        self.persisted_agent_session_reported = false;
         self.managed_agent_launch_session = session;
         self.agent_launcher = Some(binding);
     }
@@ -2704,7 +2624,6 @@ impl TerminalState {
             self.managed_agent_launch_session = None;
         }
         self.persisted_agent_session = Some(persisted_session);
-        self.persisted_agent_session_reported = true;
         let current_session = self.current_session_identity_for_persistence();
         if previous_session.is_some() && previous_session != current_session {
             // Rebinding can expose a cached Working screen; only a fresh report ends acquisition.
@@ -3372,10 +3291,8 @@ impl TerminalState {
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
         self.set_agent_launch(None);
-        self.reported_session = None;
         self.process_sessions = ProcessSessions::default();
         self.agent_launch_restore = None;
-        self.persisted_agent_session_reported = false;
         self.clear_agent_name();
     }
 
@@ -4058,7 +3975,6 @@ mod tests {
         let seed = launch_record(Agent::Claude, None, false, Some("current"), None);
         let seed_of_other = launch_record(Agent::Claude, None, false, Some("other"), None);
         let seed_of_nothing = launch_record(Agent::Claude, None, false, None, None);
-        let reported_seed = confirmed(seed.clone());
         let path = crate::agent_resume::AgentSessionRef::path(test_session_path(
             "placeholder-session.jsonl",
         ))
@@ -4098,11 +4014,10 @@ mod tests {
         ));
         let other = Resumes("other");
         let resumes_current = Resumes("current");
-        // As observation decides: the report's evidence of the current
-        // conversation and the process's own reading are what it was shown.
+        // As observation decides: the reporter of the current conversation,
+        // if any, and the process's own reading are what it was shown.
         let decide = |previous: Option<&ObservedAgentLaunch>,
-                      reported: bool,
-                      report: Option<&SessionReportEvidence>,
+                      reporter: &[u32],
                       process_id: u32,
                       reading: ResumeReading| {
             let process = ProcessInstance::unknown_start(process_id);
@@ -4117,70 +4032,34 @@ mod tests {
             {
                 shown.show(&[*process], session, ShownBy::Reporter);
             }
-            if let Some((named, shown_by)) = report.and_then(SessionReportEvidence::named_processes)
-            {
-                shown.show(named, &current, shown_by);
+            if !reporter.is_empty() {
+                let reporter: Vec<_> = reporter
+                    .iter()
+                    .map(|&pid| ProcessInstance::unknown_start(pid))
+                    .collect();
+                shown.show(&reporter, &current, ShownBy::Reporter);
             }
             if let Resumes(resumed) = reading {
                 shown.read(&process, Some(id(resumed)));
             }
-            session_for_process(
-                previous,
-                Agent::Claude,
-                Some(&current),
-                reported && report.is_none(),
-                &shown,
-                &process,
-                reading,
-            )
+            session_for_process(previous, Agent::Claude, &shown, &process, reading)
         };
-        // case, previous record, current conversation reported, process, reading,
-        // owned conversation, confirmed, carried earlier conversation
-        for (case, previous, reported, process_id, reading, expected, is_confirmed, carried) in [
+        // case, previous record, process, reading, owned conversation,
+        // confirmed, carried earlier conversation
+        for (case, previous, process_id, reading, expected, is_confirmed, carried) in [
+            ("first process", None, 10, Nothing, None, false, None),
             (
-                "first process, restored conversation",
+                "first unreadable process",
                 None,
-                false,
-                10,
-                Nothing,
-                None,
-                false,
-                None,
-            ),
-            (
-                "first process, reported conversation",
-                None,
-                true,
-                10,
-                Nothing,
-                Some("current"),
-                false,
-                None,
-            ),
-            (
-                "first unreadable process, restored conversation",
-                None,
-                false,
                 10,
                 Unknown,
                 None,
-                false,
-                None,
-            ),
-            (
-                "first unreadable process, reported conversation",
-                None,
-                true,
-                10,
-                Unknown,
-                Some("current"),
                 false,
                 None,
             ),
             (
                 "first process resuming the restored one",
                 None,
-                false,
                 10,
                 resumes_current,
                 Some("current"),
@@ -4190,7 +4069,6 @@ mod tests {
             (
                 "first process resuming another one",
                 None,
-                true,
                 10,
                 other,
                 Some("other"),
@@ -4200,7 +4078,6 @@ mod tests {
             (
                 "seed's process resuming the one it named",
                 Some(&seed),
-                false,
                 10,
                 resumes_current,
                 Some("current"),
@@ -4210,7 +4087,6 @@ mod tests {
             (
                 "seed's unreadable process",
                 Some(&seed),
-                false,
                 10,
                 Unknown,
                 Some("current"),
@@ -4220,7 +4096,6 @@ mod tests {
             (
                 "seed's process starting a new conversation",
                 Some(&seed),
-                false,
                 10,
                 Nothing,
                 None,
@@ -4230,7 +4105,6 @@ mod tests {
             (
                 "seed's process resuming another one",
                 Some(&seed),
-                false,
                 10,
                 other,
                 Some("other"),
@@ -4240,7 +4114,6 @@ mod tests {
             (
                 "seed's process resuming the one it named, not yet current",
                 Some(&seed_of_other),
-                false,
                 10,
                 other,
                 Some("other"),
@@ -4248,39 +4121,17 @@ mod tests {
                 None,
             ),
             (
-                "seed naming nothing, reported conversation",
+                "seed naming nothing",
                 Some(&seed_of_nothing),
-                true,
-                10,
-                Nothing,
-                Some("current"),
-                false,
-                None,
-            ),
-            (
-                "seed naming nothing, restored conversation",
-                Some(&seed_of_nothing),
-                false,
                 10,
                 Nothing,
                 None,
                 false,
-                None,
-            ),
-            (
-                "seed paired by a report",
-                Some(&reported_seed),
-                false,
-                10,
-                Nothing,
-                Some("current"),
-                true,
                 None,
             ),
             (
                 "same process keeps a confirmed pairing",
                 Some(&owner),
-                false,
                 10,
                 other,
                 Some("current"),
@@ -4290,7 +4141,6 @@ mod tests {
             (
                 "same process decides an assumed pairing again: resumes another",
                 Some(&assumed_owner),
-                false,
                 10,
                 other,
                 Some("other"),
@@ -4300,7 +4150,6 @@ mod tests {
             (
                 "same process decides an assumed pairing again: resumes it",
                 Some(&assumed_owner),
-                false,
                 10,
                 resumes_current,
                 Some("current"),
@@ -4310,7 +4159,6 @@ mod tests {
             (
                 "same process decides an assumed pairing again: new conversation",
                 Some(&assumed_owner),
-                false,
                 10,
                 Nothing,
                 None,
@@ -4320,7 +4168,6 @@ mod tests {
             (
                 "same process keeps an assumed pairing it cannot read",
                 Some(&assumed_owner),
-                false,
                 10,
                 Unknown,
                 Some("current"),
@@ -4330,7 +4177,6 @@ mod tests {
             (
                 "same unpaired process resuming the current one",
                 Some(&unpaired),
-                false,
                 10,
                 resumes_current,
                 Some("current"),
@@ -4340,7 +4186,6 @@ mod tests {
             (
                 "same unpaired process stays unpaired",
                 Some(&unpaired),
-                false,
                 10,
                 Nothing,
                 None,
@@ -4350,7 +4195,6 @@ mod tests {
             (
                 "same unpaired process carries the earlier one",
                 Some(&unpaired_after_owner),
-                true,
                 10,
                 Nothing,
                 None,
@@ -4360,7 +4204,6 @@ mod tests {
             (
                 "new process after the owner",
                 Some(&owner),
-                true,
                 11,
                 Nothing,
                 None,
@@ -4370,7 +4213,6 @@ mod tests {
             (
                 "new process after an unpaired one",
                 Some(&unpaired_after_owner),
-                true,
                 11,
                 Nothing,
                 None,
@@ -4378,29 +4220,17 @@ mod tests {
                 Some("current"),
             ),
             (
-                "new process after an unpaired first one, reported",
+                "new process after an unpaired first one",
                 Some(&unpaired),
-                true,
                 11,
                 Unknown,
-                Some("current"),
+                None,
                 false,
                 None,
             ),
             (
-                "new process after another owner, reported",
+                "new process after another owner",
                 Some(&owner_of_other),
-                true,
-                11,
-                Nothing,
-                Some("current"),
-                false,
-                Some("other"),
-            ),
-            (
-                "new process after another owner, restored",
-                Some(&owner_of_other),
-                false,
                 11,
                 Nothing,
                 None,
@@ -4410,7 +4240,6 @@ mod tests {
             (
                 "new process resuming the current one",
                 Some(&owner),
-                false,
                 11,
                 resumes_current,
                 Some("current"),
@@ -4420,7 +4249,6 @@ mod tests {
             (
                 "new process resuming another one",
                 Some(&owner),
-                true,
                 11,
                 other,
                 Some("other"),
@@ -4430,7 +4258,6 @@ mod tests {
             (
                 "other agent's record",
                 Some(&codex_owner),
-                true,
                 11,
                 Nothing,
                 None,
@@ -4439,7 +4266,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                decide(previous, reported, None, process_id, reading),
+                decide(previous, &[], process_id, reading),
                 match (expected.map(id), is_confirmed) {
                     (Some(session), true) => Pairing::Confirmed(session),
                     (Some(session), false) => Pairing::Assumed {
@@ -4457,8 +4284,6 @@ mod tests {
             session_for_process(
                 None,
                 Agent::Claude,
-                None,
-                false,
                 &ProcessSessions::default(),
                 &ProcessInstance::unknown_start(10),
                 Nothing
@@ -4467,100 +4292,42 @@ mod tests {
             "no conversation yet"
         );
         // A report whose sender the server read.
-        let reported_by = |reporter: &[u32]| {
-            SessionReportEvidence::Reporter(
-                reporter
-                    .iter()
-                    .map(|&pid| ProcessInstance::unknown_start(pid))
-                    .collect(),
-            )
-        };
-        let beside_another_agent = foreground_agents(&[10, 12]);
-        for (case, previous, report, reading, expected) in [
+        for (case, previous, reporter, reading, expected) in [
             (
                 "reported by this process, record of another",
                 Some(&owner_of_other),
-                reported_by(&[11, 7]),
+                &[11, 7][..],
                 Nothing,
                 Pairing::Confirmed(current.clone()),
             ),
             (
                 "reported by another process",
                 None,
-                reported_by(&[12]),
+                &[12],
                 Nothing,
                 Pairing::Unpaired { earlier: None },
             ),
             (
                 "seed naming what another process reported",
                 Some(&seed),
-                reported_by(&[12]),
+                &[12],
                 Unknown,
                 Pairing::Unpaired { earlier: None },
             ),
             (
                 "resumes what another process reported",
                 Some(&seed),
-                reported_by(&[12]),
+                &[12],
                 resumes_current,
                 Pairing::Confirmed(current.clone()),
             ),
-            (
-                "reported beside another agent",
-                None,
-                beside_another_agent.clone(),
-                Nothing,
-                Pairing::Unpaired { earlier: None },
-            ),
-            (
-                "seed naming what was reported beside another agent",
-                Some(&seed),
-                beside_another_agent,
-                Unknown,
-                Pairing::Assumed {
-                    session: current.clone(),
-                    earlier: None,
-                },
-            ),
-            (
-                "reported while the job was unreadable",
-                None,
-                SessionReportEvidence::ForegroundAgents(None),
-                Nothing,
-                Pairing::Unpaired { earlier: None },
-            ),
-            (
-                "reported while the job ran no agent",
-                None,
-                foreground_agents(&[]),
-                Nothing,
-                Pairing::Unpaired { earlier: None },
-            ),
-            (
-                "reported while the job ran one other agent",
-                None,
-                foreground_agents(&[12]),
-                Nothing,
-                Pairing::Unpaired { earlier: None },
-            ),
-            (
-                "reported while the job ran only this process",
-                None,
-                foreground_agents(&[11]),
-                Nothing,
-                Pairing::Confirmed(current.clone()),
-            ),
         ] {
-            assert_eq!(
-                decide(previous, true, Some(&report), 11, reading),
-                expected,
-                "{case}"
-            );
+            assert_eq!(decide(previous, reporter, 11, reading), expected, "{case}");
         }
         // No command line names a conversation kept as a path, so the seed's
         // pairing holds for its process.
         assert_eq!(
-            decide(Some(&path_seed), false, None, 10, Nothing).session(),
+            decide(Some(&path_seed), &[], 10, Nothing).session(),
             Some(&path),
             "seed naming a path"
         );
@@ -9115,7 +8882,6 @@ mod tests {
             Some(1),
             Some("startup".into()),
         );
-        assert!(terminal.persisted_agent_session_reported);
         terminal.observe_agent_launch(
             Agent::Codex,
             ProcessInstance::unknown_start(10),
@@ -9134,7 +8900,6 @@ mod tests {
         assert!(!terminal.finish_agent_process_acquisition());
         assert!(terminal.agent_launch().is_none());
         assert!(terminal.agent_launch_restore.is_none());
-        assert!(!terminal.persisted_agent_session_reported);
     }
 
     #[test]
@@ -9342,17 +9107,6 @@ mod tests {
         );
     }
 
-    /// The report evidence of a pane whose foreground job runs these Claude or
-    /// Codex processes.
-    fn foreground_agents(process_ids: &[u32]) -> SessionReportEvidence {
-        SessionReportEvidence::ForegroundAgents(Some(
-            process_ids
-                .iter()
-                .map(|&pid| ProcessInstance::unknown_start(pid))
-                .collect(),
-        ))
-    }
-
     /// The agent's own hook reports conversation `id` at session start.
     fn report_session(terminal: &mut TerminalState, agent: &str, id: &str, seq: u64, start: &str) {
         terminal.set_agent_session_ref_for_session_start(
@@ -9377,7 +9131,9 @@ mod tests {
             known_options(&["--placeholder-a"]),
             None,
         );
-        terminal.sync_agent_launch_session(&foreground_agents(&[10]));
+        terminal.sync_agent_launch_session(&SessionReportEvidence::Reporter(vec![
+            ProcessInstance::unknown_start(10),
+        ]));
         assert_eq!(
             terminal.launch_options_for_session(label),
             Some(vec!["--placeholder-a".into()])
@@ -9386,24 +9142,19 @@ mod tests {
     }
 
     /// Conversation `id` is reported, by agent process `reporter` when Herdr
-    /// knows it, while the pane's foreground job runs `job`.
+    /// knows it.
     fn report_from(
         terminal: &mut TerminalState,
         agent: &str,
         id: &str,
         (seq, start): (u64, &str),
         reporter: Option<u32>,
-        job: &[(u32, &str)],
     ) {
         let evidence = match reporter {
             Some(reporter) => {
                 SessionReportEvidence::Reporter(vec![ProcessInstance::unknown_start(reporter)])
             }
-            None => foreground_agents(
-                &job.iter()
-                    .map(|(process_id, _)| *process_id)
-                    .collect::<Vec<_>>(),
-            ),
+            None => SessionReportEvidence::Unidentified,
         };
         report_with(terminal, agent, id, (seq, start), &evidence);
     }
@@ -9418,74 +9169,6 @@ mod tests {
     ) {
         report_session(terminal, agent, id, seq, start);
         terminal.sync_agent_launch_session(evidence);
-    }
-
-    #[test]
-    fn a_started_seed_pairs_only_beside_one_agent_in_the_job() {
-        for (case, job, pairs) in [
-            (
-                "job unreadable",
-                SessionReportEvidence::ForegroundAgents(None),
-                false,
-            ),
-            ("two agents in the job", foreground_agents(&[10, 12]), false),
-            ("one agent in the job", foreground_agents(&[10]), true),
-        ] {
-            let mut terminal = test_terminal();
-            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-            // `herdr agent start` typed the launch; detection has not read
-            // its process yet when a conversation is reported over a
-            // connection the server cannot read.
-            terminal.seed_agent_launch(AgentLaunchSeed {
-                agent: Agent::Claude,
-                options: known_options(&["--placeholder-a"]),
-                resumed_without_options: false,
-                account: None,
-                launch: SeededLaunch::Started { session: None },
-            });
-            report_with(&mut terminal, "claude", "claude-b", (1, "startup"), &job);
-            assert_eq!(
-                terminal.launch_options_for_session("claude"),
-                pairs.then(|| vec!["--placeholder-a".to_string()]),
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_reused_process_id_in_the_job_does_not_confirm_the_bound_record() {
-        let bound = ProcessInstance {
-            pid: 10,
-            started: Some(100),
-        };
-        for (in_job, pairs) in [(Some(200), false), (Some(100), true)] {
-            let mut terminal = test_terminal();
-            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-            terminal.observe_agent_launch(
-                Agent::Claude,
-                bound,
-                known_options(&["--placeholder-a"]),
-                None,
-            );
-            // Over a connection the server cannot read, a conversation is
-            // reported while the job runs a process with the bound id; one
-            // with another start time is a later process that reused it.
-            report_with(
-                &mut terminal,
-                "claude",
-                "claude-b",
-                (1, "startup"),
-                &SessionReportEvidence::ForegroundAgents(Some(vec![ProcessInstance {
-                    pid: 10,
-                    started: in_job,
-                }])),
-            );
-            assert_eq!(
-                terminal.launch_options_for_session("claude"),
-                pairs.then(|| vec!["--placeholder-a".to_string()]),
-                "started {in_job:?}"
-            );
-        }
     }
 
     #[test]
@@ -9623,8 +9306,7 @@ mod tests {
             "claude",
             "claude-c",
             (3, "compact"),
-            None,
-            &[(10, "claude")],
+            Some(10),
         );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -9663,16 +9345,9 @@ mod tests {
             &SessionReportEvidence::Unidentified,
         );
         assert_eq!(terminal.launch_options_for_session("codex"), None);
-        // The report stayed undecided: repeated over a connection the server
-        // cannot read, the foreground job running its one Codex pairs it.
-        report_from(
-            &mut terminal,
-            "codex",
-            "codex-b",
-            (3, "compact"),
-            None,
-            &[(10, "codex")],
-        );
+        // The report stayed undecided: the Codex itself reporting it again
+        // pairs it.
+        report_from(&mut terminal, "codex", "codex-b", (3, "compact"), Some(10));
         assert_eq!(
             terminal.launch_options_for_session("codex"),
             Some(vec!["--placeholder-a".into()])
@@ -9684,20 +9359,12 @@ mod tests {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
         // The parent's Bash tool runs `claude --resume claude-c` in its own
         // process group, so the pane's foreground job shows only the parent.
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-c",
-            (2, "resume"),
-            Some(20),
-            &[(10, "claude")],
-        );
+        report_from(&mut terminal, "claude", "claude-c", (2, "resume"), Some(20));
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
     #[test]
     fn a_report_from_a_child_in_the_job_is_not_paired_with_the_parent_in_any_order() {
-        let parent_and_child = [(10, "claude"), (12, "claude")];
         for (reporter, seeded, report_first) in [
             (None, false, true),
             (Some(12), false, true),
@@ -9737,7 +9404,6 @@ mod tests {
                 "claude-c",
                 (1, "startup"),
                 reporter,
-                &parent_and_child,
             );
             if report_first {
                 observe_parent(&mut terminal);
@@ -9754,15 +9420,9 @@ mod tests {
     fn a_first_observation_does_not_take_a_conversation_reported_beside_another_agent() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
-        // Two Codex processes share the job when one of them reports.
-        report_from(
-            &mut terminal,
-            "codex",
-            "codex-b",
-            (1, "startup"),
-            None,
-            &[(10, "codex"), (11, "codex")],
-        );
+        // Two Codex processes share the job when one of them reports, and
+        // Herdr cannot tell which.
+        report_from(&mut terminal, "codex", "codex-b", (1, "startup"), None);
         terminal.observe_agent_launch(
             Agent::Codex,
             ProcessInstance::unknown_start(10),
@@ -9782,7 +9442,6 @@ mod tests {
             "claude-b",
             (1, "startup"),
             Some(20),
-            &[(20, "claude")],
         );
         // Process 20 exits before detection reads it; the next one starts a
         // new conversation of its own.
@@ -9800,14 +9459,7 @@ mod tests {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
         // A second Claude shares the job while the first clears to claude-b,
         // and Herdr cannot tell which one reported it.
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-b",
-            (2, "clear"),
-            None,
-            &[(10, "claude"), (12, "claude")],
-        );
+        report_from(&mut terminal, "claude", "claude-b", (2, "clear"), None);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         // The second one exits, and the first reports claude-b again.
         report_from(
@@ -9815,16 +9467,15 @@ mod tests {
             "claude",
             "claude-b",
             (3, "compact"),
-            None,
-            &[(10, "claude")],
+            Some(10),
         );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-a".into()])
         );
 
-        // Observed first, claude-b is reported beside another lone Claude,
-        // which exits, and then beside this process alone.
+        // Observed first, claude-b is reported by another Claude, and then by
+        // this process.
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
         terminal.observe_agent_launch(
@@ -9838,18 +9489,10 @@ mod tests {
             "claude",
             "claude-b",
             (1, "startup"),
-            None,
-            &[(12, "claude")],
+            Some(12),
         );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-b",
-            (2, "resume"),
-            None,
-            &[(10, "claude")],
-        );
+        report_from(&mut terminal, "claude", "claude-b", (2, "resume"), Some(10));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-a".into()])
@@ -9881,16 +9524,8 @@ mod tests {
             "claude-s",
             (1, "startup"),
             Some(10),
-            &[],
         );
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-s",
-            (2, "compact"),
-            None,
-            &[],
-        );
+        report_from(&mut terminal, "claude", "claude-s", (2, "compact"), None);
         observe(&mut terminal, 10, "--placeholder-a", None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -9907,18 +9542,10 @@ mod tests {
             "claude",
             "claude-s",
             (1, "startup"),
-            None,
-            &[(10, "claude")],
+            Some(10),
         );
         observe(&mut terminal, 10, "--placeholder-a", Some("claude-t"));
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-t",
-            (2, "resume"),
-            None,
-            &[],
-        );
+        report_from(&mut terminal, "claude", "claude-t", (2, "resume"), None);
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             None,
@@ -9933,8 +9560,7 @@ mod tests {
             "claude",
             "claude-s",
             (1, "startup"),
-            None,
-            &[(10, "claude")],
+            Some(10),
         );
         observe(&mut terminal, 12, "--placeholder-b", Some("claude-s"));
         assert_eq!(
@@ -9955,14 +9581,7 @@ mod tests {
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
         // Claude-b is reported beside two Claudes before detection reads
         // process 10, which leaves it undecided.
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-b",
-            (1, "startup"),
-            None,
-            &[(10, "claude"), (12, "claude")],
-        );
+        report_from(&mut terminal, "claude", "claude-b", (1, "startup"), None);
         terminal.observe_agent_launch(
             Agent::Claude,
             ProcessInstance::unknown_start(10),
@@ -9970,15 +9589,13 @@ mod tests {
             None,
         );
         assert_eq!(terminal.launch_options_for_session("claude"), None);
-        // The second one exits, and claude-b is reported again beside 10
-        // alone.
+        // Process 10 reports claude-b again.
         report_from(
             &mut terminal,
             "claude",
             "claude-b",
             (2, "compact"),
-            None,
-            &[(10, "claude")],
+            Some(10),
         );
         assert_eq!(
             terminal.launch_options_for_session("claude"),
@@ -9987,108 +9604,10 @@ mod tests {
     }
 
     #[test]
-    fn a_report_first_beside_one_agent_is_paired_only_with_that_process() {
-        let in_job = ProcessInstance {
-            pid: 10,
-            started: Some(100),
-        };
-        for (case, observed, pairs) in [
-            ("another process", ProcessInstance::unknown_start(12), false),
-            (
-                "the job's id reused later",
-                ProcessInstance {
-                    pid: 10,
-                    started: Some(200),
-                },
-                false,
-            ),
-            ("the job's process", in_job, true),
-        ] {
-            let mut terminal = test_terminal();
-            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-            report_with(
-                &mut terminal,
-                "claude",
-                "claude-b",
-                (1, "startup"),
-                &SessionReportEvidence::ForegroundAgents(Some(vec![in_job])),
-            );
-            terminal.observe_agent_launch(
-                Agent::Claude,
-                observed,
-                known_options(&["--placeholder-a"]),
-                None,
-            );
-            assert_eq!(
-                terminal.launch_options_for_session("claude"),
-                pairs.then(|| vec!["--placeholder-a".to_string()]),
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_seed_paired_beside_one_agent_binds_only_to_that_process() {
-        let in_job = ProcessInstance {
-            pid: 10,
-            started: Some(100),
-        };
-        for (case, observed, pairs) in [
-            ("another process", ProcessInstance::unknown_start(12), false),
-            (
-                "the job's id reused later",
-                ProcessInstance {
-                    pid: 10,
-                    started: Some(200),
-                },
-                false,
-            ),
-            ("the job's process", in_job, true),
-        ] {
-            let mut terminal = test_terminal();
-            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-            // `herdr agent start` typed the launch; its conversation is
-            // reported beside one Claude before detection reads a process.
-            terminal.seed_agent_launch(AgentLaunchSeed {
-                agent: Agent::Claude,
-                options: known_options(&["--placeholder-a"]),
-                resumed_without_options: false,
-                account: None,
-                launch: SeededLaunch::Started { session: None },
-            });
-            report_with(
-                &mut terminal,
-                "claude",
-                "claude-b",
-                (1, "startup"),
-                &SessionReportEvidence::ForegroundAgents(Some(vec![in_job])),
-            );
-            terminal.observe_agent_launch(
-                Agent::Claude,
-                observed,
-                known_options(&["--placeholder-x"]),
-                None,
-            );
-            assert_eq!(
-                terminal.launch_options_for_session("claude").is_some(),
-                pairs,
-                "{case}"
-            );
-        }
-    }
-
-    #[test]
     fn a_conversation_change_reported_by_the_bound_process_keeps_its_options() {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
         // `/clear` in the agent, with a nested Claude in the job.
-        report_from(
-            &mut terminal,
-            "claude",
-            "claude-b",
-            (2, "clear"),
-            Some(10),
-            &[(10, "claude"), (12, "claude")],
-        );
+        report_from(&mut terminal, "claude", "claude-b", (2, "clear"), Some(10));
         assert_eq!(
             terminal.launch_options_for_session("claude"),
             Some(vec!["--placeholder-a".into()])
@@ -10100,8 +9619,7 @@ mod tests {
         let mut terminal = agent_running_its_reported_conversation(Agent::Codex);
         // Ctrl-Z stops the first Codex, and a second one starts in the
         // foreground and reports its new conversation.
-        report_session(&mut terminal, "codex", "codex-b", 2, "startup");
-        terminal.sync_agent_launch_session(&foreground_agents(&[11]));
+        report_from(&mut terminal, "codex", "codex-b", (2, "startup"), Some(11));
         assert_eq!(terminal.launch_options_for_session("codex"), None);
         // Detection reads the second Codex, which takes its conversation.
         terminal.observe_agent_launch(
@@ -10121,8 +9639,7 @@ mod tests {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
         // `claude --resume claude-c` runs in the foreground while the first
         // Claude is stopped.
-        report_session(&mut terminal, "claude", "claude-c", 2, "resume");
-        terminal.sync_agent_launch_session(&foreground_agents(&[11]));
+        report_from(&mut terminal, "claude", "claude-c", (2, "resume"), Some(11));
         assert_eq!(terminal.launch_options_for_session("claude"), None);
         terminal.observe_agent_launch(
             Agent::Claude,
@@ -10140,23 +9657,209 @@ mod tests {
     fn a_report_from_a_child_agent_in_the_same_job_is_not_paired_with_its_parent() {
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
         // The first Claude runs another Claude in its own process group, and
-        // that one resumes another conversation.
-        report_session(&mut terminal, "claude", "claude-c", 2, "resume");
-        terminal.sync_agent_launch_session(&foreground_agents(&[10, 12]));
+        // that one resumes another conversation; Herdr cannot tell which of
+        // them reported it.
+        report_from(&mut terminal, "claude", "claude-c", (2, "resume"), None);
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
     #[test]
-    fn a_conversation_change_inside_the_only_agent_of_the_job_keeps_its_options() {
+    fn a_report_with_no_readable_sender_beside_one_agent_saves_no_options() {
+        // The pane's foreground job runs only Claude process 10 when a
+        // conversation is reported over a connection the server cannot read.
+        let no_readable_sender = SessionReportEvidence::Unidentified;
+        let seed = |terminal: &mut TerminalState| {
+            // `herdr agent start` typed the launch.
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: known_options(&["--placeholder-a"]),
+                resumed_without_options: false,
+                account: None,
+                launch: SeededLaunch::Started { session: None },
+            });
+        };
+        let observe = |terminal: &mut TerminalState| {
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance::unknown_start(10),
+                known_options(&["--placeholder-a"]),
+                None,
+            );
+        };
+        let report = |terminal: &mut TerminalState, seq, start| {
+            report_with(
+                terminal,
+                "claude",
+                "claude-b",
+                (seq, start),
+                &no_readable_sender,
+            );
+        };
+        let setup = || {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal
+        };
+        let mut cases = Vec::new();
+
+        let mut terminal = setup();
+        seed(&mut terminal);
+        report(&mut terminal, 1, "startup");
+        cases.push((
+            "a seed before detection reads its process",
+            terminal.clone(),
+        ));
+        observe(&mut terminal);
+        cases.push(("a seed, then its process", terminal));
+
+        let mut terminal = setup();
+        report(&mut terminal, 1, "startup");
+        observe(&mut terminal);
+        cases.push(("reported before detection reads the process", terminal));
+
+        let mut terminal = setup();
+        observe(&mut terminal);
+        report(&mut terminal, 1, "startup");
+        cases.push(("reported after detection reads the process", terminal));
+
+        // `/clear` in the agent its own report paired.
         let mut terminal = agent_running_its_reported_conversation(Agent::Claude);
-        // `/clear`, with a tool the agent runs in the same job, which is no
-        // Claude or Codex process.
-        report_session(&mut terminal, "claude", "claude-b", 2, "clear");
-        terminal.sync_agent_launch_session(&foreground_agents(&[10]));
-        assert_eq!(
-            terminal.launch_options_for_session("claude"),
-            Some(vec!["--placeholder-a".into()])
-        );
+        report(&mut terminal, 2, "clear");
+        cases.push(("a conversation change", terminal));
+
+        for (case, terminal) in cases {
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbound_seed_is_not_confirmed_by_a_report_with_no_readable_sender() {
+        // Review round 17 P1: the seeded launch exits before detection reads
+        // its process, and Claude process 11, alone in the pane's foreground
+        // job, reports its own conversation over a connection the server
+        // cannot read.
+        let no_readable_sender = SessionReportEvidence::Unidentified;
+        for (case, session) in [
+            ("a restore", Some("claude-a")),
+            ("`herdr agent start`", None),
+        ] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            terminal.seed_agent_launch(AgentLaunchSeed {
+                agent: Agent::Claude,
+                options: known_options(&["--placeholder-seed"]),
+                resumed_without_options: false,
+                account: None,
+                launch: SeededLaunch::Started {
+                    session: session.and_then(crate::agent_resume::AgentSessionRef::id),
+                },
+            });
+            report_with(
+                &mut terminal,
+                "claude",
+                "claude-b",
+                (1, "startup"),
+                &no_readable_sender,
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+            assert!(
+                !terminal.resumed_without_launch_options_for_session("claude"),
+                "{case}"
+            );
+            // Detection reads process 11, which started a conversation of
+            // its own.
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance::unknown_start(11),
+                known_options(&["--placeholder-b"]),
+                None,
+            );
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+            // Its report with a readable sender pairs it again.
+            report_from(&mut terminal, "claude", "claude-b", (2, "resume"), Some(11));
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(vec!["--placeholder-b".into()]),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_observed_process_does_not_take_a_conversation_a_state_report_set() {
+        // A `pane.report_agent` state report from the Claude hook source
+        // carries conversation claude-b; the server reads no sender for it.
+        let state_report = |terminal: &mut TerminalState, seq| {
+            assert!(terminal
+                .set_agent_session_ref(
+                    "herdr:claude".into(),
+                    "claude".into(),
+                    crate::agent_resume::AgentSessionRef::id("claude-b"),
+                    Some(seq),
+                )
+                .is_some());
+        };
+        let observe = |terminal: &mut TerminalState| {
+            terminal.observe_agent_launch(
+                Agent::Claude,
+                ProcessInstance::unknown_start(10),
+                known_options(&["--placeholder-a"]),
+                None,
+            );
+        };
+        for case in [
+            "reported before detection reads the process",
+            "reported after detection reads the process",
+            "a seed naming no conversation, then its process",
+        ] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+            match case {
+                "reported before detection reads the process" => {
+                    state_report(&mut terminal, 1);
+                    observe(&mut terminal);
+                }
+                "reported after detection reads the process" => {
+                    observe(&mut terminal);
+                    state_report(&mut terminal, 1);
+                }
+                _ => {
+                    terminal.seed_agent_launch(AgentLaunchSeed {
+                        agent: Agent::Claude,
+                        options: known_options(&["--placeholder-a"]),
+                        resumed_without_options: false,
+                        account: None,
+                        launch: SeededLaunch::Started { session: None },
+                    });
+                    state_report(&mut terminal, 1);
+                    observe(&mut terminal);
+                }
+            }
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                None,
+                "{case}"
+            );
+            // The agent's own report with a readable sender pairs it.
+            report_from(&mut terminal, "claude", "claude-b", (2, "resume"), Some(10));
+            assert_eq!(
+                terminal.launch_options_for_session("claude"),
+                Some(vec!["--placeholder-a".into()]),
+                "{case}"
+            );
+        }
     }
 
     /// Every short sequence of launch, report and exit events, checked after
@@ -10231,13 +9934,12 @@ mod tests {
             Unrecognized,
         }
 
-        /// What the server knows about a report's sender.
+        /// What the server knows about a report's sender: its reporter, or
+        /// nothing, when it could not read or place the sender.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum Sender {
             Reporter(Process),
-            Unplaced,
-            Job(&'static [Process]),
-            JobUnreadable,
+            Unidentified,
         }
 
         impl Sender {
@@ -10246,30 +9948,14 @@ mod tests {
                     Self::Reporter(process) => {
                         SessionReportEvidence::Reporter(vec![process.instance()])
                     }
-                    Self::Unplaced => SessionReportEvidence::Unidentified,
-                    Self::Job(processes) => SessionReportEvidence::ForegroundAgents(Some(
-                        processes.iter().map(|process| process.instance()).collect(),
-                    )),
-                    Self::JobUnreadable => SessionReportEvidence::ForegroundAgents(None),
+                    Self::Unidentified => SessionReportEvidence::Unidentified,
                 }
             }
 
-            fn processes(self) -> &'static [Process] {
+            fn named(self) -> Option<Process> {
                 match self {
-                    Self::Reporter(Process::P) | Self::Job(&[Process::P]) => &[Process::P],
-                    Self::Reporter(Process::Q) | Self::Job(&[Process::Q]) => &[Process::Q],
-                    Self::Reporter(Process::P2) => &[Process::P2],
-                    Self::Job(processes) => processes,
-                    Self::Unplaced | Self::JobUnreadable => &[],
-                }
-            }
-
-            /// The one process this evidence names, by its kind.
-            fn named(self) -> Option<(Process, FactSource)> {
-                match self {
-                    Self::Reporter(process) => Some((process, FactSource::Reporter)),
-                    Self::Job(&[process]) => Some((process, FactSource::Job)),
-                    _ => None,
+                    Self::Reporter(process) => Some(process),
+                    Self::Unidentified => None,
                 }
             }
         }
@@ -10281,6 +9967,9 @@ mod tests {
             Observe(Process, Reading),
             /// A report of a conversation; `false` when its sequence is stale.
             Report(Conversation, Sender, bool),
+            /// A `pane.report_agent` state report carrying a conversation,
+            /// with a new sequence; the server keeps no evidence of its sender.
+            StateReport(Conversation),
             /// The process detection last read exits.
             Exit,
         }
@@ -10302,17 +9991,13 @@ mod tests {
                     Sender::Reporter(Process::P),
                     Sender::Reporter(Process::Q),
                     Sender::Reporter(Process::P2),
-                    Sender::Unplaced,
-                    Sender::Job(&[Process::P]),
-                    Sender::Job(&[Process::Q]),
-                    Sender::Job(&[Process::P, Process::Q]),
-                    Sender::Job(&[]),
-                    Sender::JobUnreadable,
+                    Sender::Unidentified,
                 ] {
                     for accepted in [true, false] {
                         events.push(Event::Report(conversation, sender, accepted));
                     }
                 }
+                events.push(Event::StateReport(conversation));
             }
             events
         }
@@ -10323,7 +10008,6 @@ mod tests {
         enum FactSource {
             CommandLine,
             Reporter,
-            Job,
         }
 
         /// What is true, from the events alone.
@@ -10342,7 +10026,10 @@ mod tests {
             bound: Option<Process>,
             seeded: bool,
             observed_since_seed: bool,
+            /// The sequence of the last report the pane took, and the
+            /// highest one sent.
             sequence: u64,
+            sent: u64,
             accepted_since_exit: bool,
         }
 
@@ -10353,9 +10040,10 @@ mod tests {
 
             /// Whether `event` can happen next.
             fn allows(&self, event: Event) -> bool {
-                let mentioned: &[Process] = match event {
+                let mentioned = match event {
                     Event::Seed => return self.time == 0,
                     Event::Exit => return self.bound.is_some(),
+                    Event::StateReport(_) => return true,
                     Event::Observe(process, reading) => {
                         // A process's command line does not change, except
                         // when a launcher detection could not place execs the
@@ -10365,23 +10053,19 @@ mod tests {
                         {
                             return false;
                         }
-                        match process {
-                            Process::P => &[Process::P],
-                            Process::Q => &[Process::Q],
-                            Process::P2 => &[Process::P2],
-                        }
+                        Some(process)
                     }
                     Event::Report(_, sender, accepted) => {
                         if !accepted && !self.accepted_since_exit {
                             return false;
                         }
-                        sender.processes()
+                        sender.named()
                     }
                 };
                 // P cannot come back once another process took its id.
-                mentioned.iter().all(|process| {
-                    self.alive(*process)
-                        && (*process != Process::P || !self.appeared[Process::P2.index()])
+                mentioned.is_none_or(|process| {
+                    self.alive(process)
+                        && (process != Process::P || !self.appeared[Process::P2.index()])
                 })
             }
 
@@ -10389,7 +10073,9 @@ mod tests {
                 self.appeared[process.index()] = true;
             }
 
-            fn apply(&mut self, event: Event) {
+            /// Applies `event`; `taken` is whether the pane took a state
+            /// report, which the model does not predict.
+            fn apply(&mut self, event: Event, taken: bool) {
                 self.time += 1;
                 match event {
                     Event::Seed => self.seeded = true,
@@ -10416,16 +10102,26 @@ mod tests {
                         }
                     }
                     Event::Report(conversation, sender, accepted) => {
-                        for process in sender.processes() {
-                            self.appear(*process);
+                        if let Some(process) = sender.named() {
+                            self.appear(process);
+                            if accepted {
+                                self.runs[process.index()] =
+                                    Some((conversation, self.time, FactSource::Reporter));
+                            }
                         }
                         if accepted {
-                            self.sequence += 1;
+                            self.sent += 1;
+                            self.sequence = self.sent;
                             self.accepted_since_exit = true;
-                            if let Some((process, source)) = sender.named() {
-                                self.runs[process.index()] =
-                                    Some((conversation, self.time, source));
-                            }
+                        }
+                    }
+                    // It names no process, so it shows none running the
+                    // conversation.
+                    Event::StateReport(_) => {
+                        self.sent += 1;
+                        if taken {
+                            self.sequence = self.sent;
+                            self.accepted_since_exit = true;
                         }
                     }
                     Event::Exit => {
@@ -10440,22 +10136,27 @@ mod tests {
 
             /// The live process that runs `conversation` now: the latest fact
             /// about it wins.
-            fn runner(&self, conversation: Conversation) -> Option<(Process, FactSource)> {
+            fn runner(&self, conversation: Conversation) -> Option<Process> {
                 PROCESSES
                     .into_iter()
                     .filter(|process| self.alive(*process))
                     .filter_map(|process| {
                         self.runs[process.index()]
                             .filter(|(runs, _, _)| *runs == conversation)
-                            .map(|(_, time, source)| (time, process, source))
+                            .map(|(_, time, _)| (time, process))
                     })
-                    .max_by_key(|(time, _, _)| *time)
-                    .map(|(_, process, source)| (process, source))
+                    .max_by_key(|(time, _)| *time)
+                    .map(|(_, process)| process)
             }
         }
 
-        /// Drives the terminal as the server does for each event.
-        fn drive(terminal: &mut TerminalState, model: &Model, event: Event) -> Result<(), String> {
+        /// Drives the terminal as the server does for each event: whether the
+        /// pane took a state report.
+        fn drive(
+            terminal: &mut TerminalState,
+            model: &Model,
+            event: Event,
+        ) -> Result<bool, String> {
             match event {
                 Event::Seed => {
                     terminal.set_persisted_agent_session(
@@ -10503,7 +10204,7 @@ mod tests {
                 Event::Report(conversation, sender, accepted) => {
                     terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
                     let sequence = if accepted {
-                        model.sequence + 1
+                        model.sent + 1
                     } else {
                         model.sequence
                     };
@@ -10517,6 +10218,19 @@ mod tests {
                         return Err(format!("the report was accepted: {took}"));
                     }
                 }
+                // As the server applies `pane.report_agent` from the Claude
+                // hook source: it reads no sender for a state report.
+                Event::StateReport(conversation) => {
+                    terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+                    return Ok(terminal
+                        .set_agent_session_ref(
+                            "herdr:claude".into(),
+                            "claude".into(),
+                            Some(conversation.session()),
+                            Some(model.sent + 1),
+                        )
+                        .is_some());
+                }
                 Event::Exit => {
                     terminal.set_detected_state_with_visible_blocker(
                         Some(Agent::Claude),
@@ -10527,7 +10241,7 @@ mod tests {
                     );
                 }
             }
-            Ok(())
+            Ok(true)
         }
 
         /// A Claude report as the server applies it: whether the pane took it.
@@ -10550,38 +10264,33 @@ mod tests {
         }
 
         /// Whether the options a session save writes now agree with the
-        /// model: `Err` names the disagreement, and `Ok(true)` a known limit.
-        fn check(terminal: &TerminalState, model: &Model) -> Result<bool, String> {
+        /// model: `Err` names the disagreement.
+        fn check(terminal: &TerminalState, model: &Model) -> Result<(), String> {
             let Some(current) = terminal.current_session_ref() else {
-                return Ok(false);
+                return Ok(());
             };
             let Some(conversation) = [Conversation::S, Conversation::T]
                 .into_iter()
                 .find(|conversation| conversation.session() == *current)
             else {
-                return Ok(false);
+                return Ok(());
             };
             let saved = terminal.launch_options_for_session("claude");
             let runner = model.runner(conversation);
             let runner_options =
-                runner.and_then(|(process, _)| model.observed[process.index()].clone().flatten());
+                runner.and_then(|process| model.observed[process.index()].clone().flatten());
             if let Some(saved) = &saved {
                 if runner_options.as_ref() == Some(saved) {
-                    return Ok(false);
+                    return Ok(());
                 }
-                let seed_options = saved.as_slice() == [SEED_OPTIONS.to_string()];
-                if seed_options && model.seeded && !model.observed_since_seed {
-                    // The typed launch runs S until detection reads a
-                    // process.
-                    if conversation == Conversation::S && runner.is_none() {
-                        return Ok(false);
-                    }
-                    // Known limit (PRD Assumptions, no readable sender): the
-                    // lone agent in the job is taken to be the seed's launch
-                    // before detection reads it.
-                    if runner.is_some_and(|(_, source)| source == FactSource::Job) {
-                        return Ok(true);
-                    }
+                // The typed launch runs S until detection reads a process.
+                if saved.as_slice() == [SEED_OPTIONS.to_string()]
+                    && model.seeded
+                    && !model.observed_since_seed
+                    && conversation == Conversation::S
+                    && runner.is_none()
+                {
+                    return Ok(());
                 }
                 return Err(format!(
                     "saved {saved:?} beside {conversation:?}, which {runner:?} runs"
@@ -10590,23 +10299,17 @@ mod tests {
             // A lone process that resumed the conversation itself, or that
             // its reporter named, keeps its options beside it.
             let lone = model.appeared.iter().filter(|appeared| **appeared).count() == 1;
-            if let (
-                true,
-                Some((_, FactSource::CommandLine | FactSource::Reporter)),
-                Some(options),
-            ) = (lone, runner, runner_options)
-            {
+            if let (true, Some(options)) = (lone, runner_options) {
                 return Err(format!(
                     "saved no options beside {conversation:?}, which {runner:?} runs with {options:?}"
                 ));
             }
-            Ok(false)
+            Ok(())
         }
 
         #[derive(Default)]
         struct Outcome {
             sequences: u64,
-            known_limit: u64,
             failures: Vec<(Vec<Event>, String)>,
         }
 
@@ -10628,16 +10331,13 @@ mod tests {
                 let mut model = model.clone();
                 sequence.push(event);
                 outcome.sequences += 1;
-                let result = drive(&mut terminal, &model, event).and_then(|()| {
-                    model.apply(event);
+                let result = drive(&mut terminal, &model, event).and_then(|taken| {
+                    model.apply(event, taken);
                     check(&terminal, &model)
                 });
                 match result {
                     Err(failure) => outcome.failures.push((sequence.clone(), failure)),
-                    Ok(known_limit) => {
-                        outcome.known_limit += u64::from(known_limit);
-                        explore(&terminal, &model, sequence, events, outcome);
-                    }
+                    Ok(()) => explore(&terminal, &model, sequence, events, outcome),
                 }
                 sequence.pop();
             }
@@ -10661,23 +10361,20 @@ mod tests {
                                 let mut sequence = vec![first];
                                 outcome.sequences += 1;
                                 let mut model = model;
-                                match drive(&mut terminal, &model, first).and_then(|()| {
-                                    model.apply(first);
+                                match drive(&mut terminal, &model, first).and_then(|taken| {
+                                    model.apply(first, taken);
                                     check(&terminal, &model)
                                 }) {
                                     Err(failure) => {
                                         outcome.failures.push((sequence.clone(), failure))
                                     }
-                                    Ok(known_limit) => {
-                                        outcome.known_limit += u64::from(known_limit);
-                                        explore(
-                                            &terminal,
-                                            &model,
-                                            &mut sequence,
-                                            events,
-                                            &mut outcome,
-                                        );
-                                    }
+                                    Ok(()) => explore(
+                                        &terminal,
+                                        &model,
+                                        &mut sequence,
+                                        events,
+                                        &mut outcome,
+                                    ),
                                 }
                             }
                             outcome
@@ -10689,7 +10386,6 @@ mod tests {
                     .collect::<Vec<_>>()
             });
             let sequences: u64 = outcomes.iter().map(|outcome| outcome.sequences).sum();
-            let known_limit: u64 = outcomes.iter().map(|outcome| outcome.known_limit).sum();
             let mut failures = outcomes
                 .into_iter()
                 .flat_map(|outcome| outcome.failures)
@@ -10697,7 +10393,7 @@ mod tests {
             failures.sort_by_key(|(sequence, _)| sequence.len());
             eprintln!(
                 "exhaustive pairing: {sequences} sequences up to length {MAX_LENGTH}, \
-                 {known_limit} steps at a known limit, {} failing, in {:?}",
+                 {} failing, in {:?}",
                 failures.len(),
                 started.elapsed()
             );

@@ -866,6 +866,16 @@ Evidence paths starting with `w3/`, `w4/`, `w5/`, `logs/` or `artifacts/` are in
   saved the flag. FR-10 and FR-29 Interaction Testing set to Yes. Every row is now Yes or a reasoned N/A. Flagged, not
   changed: the restore log line `agent resume without launch options ... reason=ExceedsResumeLimits` is written at
   planning, before the start finds that nothing can be typed, so it still appears for E.
+- 2026-10-28 07:44:29 EDT - Follow-up task T-4 (`Leave launch options unknown when the report sender is unreadable`,
+  PRD `docs/prds/2026-10-28-unknown-launch-options-unreadable-sender/2026-10-28-unknown-launch-options-unreadable-sender-prd-claude.md`)
+  removed the two guesses the known limit under Assumptions (review rounds 8 and 9) describes, as the project supervisor
+  adopted review finding r7-3 on 2026-10-27. A Claude or Codex conversation report whose sender Herdr cannot read now names
+  no process: it no longer takes the pane's lone foreground Claude or Codex process, and it no longer confirms an unbound
+  seed (review round 17 P1 `r17-seed-job-inference`). A first observation also no longer takes a conversation reported
+  without kept sender evidence, including a `pane.report_agent` state report carrying a conversation. Such reports leave
+  the launch options unknown, so the next restore resumes bare with `launch options not kept` and reason `NotRecorded`
+  (FR-10 and FR-29 here, unchanged). Hook reports and other reports with a readable sender pair exactly as before. The
+  earlier text above stays as history.
 
 ## Introduction/Overview
 
