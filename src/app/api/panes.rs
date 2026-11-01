@@ -1613,7 +1613,16 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
-        let evidence = self.session_report_evidence(ws_idx, pane_id, &agent_label, peer_ancestry);
+        let Some(evidence) =
+            self.session_report_evidence(ws_idx, pane_id, &agent_label, peer_ancestry)
+        else {
+            tracing::info!(
+                pane_id = %params.pane_id,
+                agent = %agent_label,
+                "ignored a conversation report from the agent's shared server"
+            );
+            return encode_success(id, ResponseResult::Ok {});
+        };
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1644,14 +1653,17 @@ impl App {
     /// process in `peer_ancestry`, the process on the other end of the API
     /// connection and its parents, is the reporter when the walk places it in
     /// the pane; otherwise, or when the server could not read that process,
-    /// the report names none.
+    /// the report names none. `None` when the agent's shared server sent the
+    /// report ([`crate::detect::ReportSender::SharedServer`]): it names the
+    /// pane that started the server, not the pane of the conversation, so the
+    /// report is not taken.
     fn session_report_evidence(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         agent_label: &str,
         peer_ancestry: Option<&[crate::platform::AncestorProcess]>,
-    ) -> crate::terminal::SessionReportEvidence {
+    ) -> Option<crate::terminal::SessionReportEvidence> {
         use crate::detect::ReportSender;
         use crate::terminal::SessionReportEvidence;
         let (Some(agent), Some(ancestry)) = (
@@ -1659,7 +1671,7 @@ impl App {
                 .filter(|agent| crate::agent_resume::carries_launch_options(*agent)),
             peer_ancestry,
         ) else {
-            return SessionReportEvidence::Unidentified;
+            return Some(SessionReportEvidence::Unidentified);
         };
         match self
             .state
@@ -1667,8 +1679,9 @@ impl App {
             .and_then(crate::terminal::TerminalRuntime::child_pid)
             .map(|pane_process| crate::detect::report_sender(ancestry, agent, pane_process))
         {
-            Some(ReportSender::Agent(reporter)) => SessionReportEvidence::Reporter(reporter),
-            Some(ReportSender::Unidentified) | None => SessionReportEvidence::Unidentified,
+            Some(ReportSender::Agent(reporter)) => Some(SessionReportEvidence::Reporter(reporter)),
+            Some(ReportSender::SharedServer) => None,
+            Some(ReportSender::Unidentified) | None => Some(SessionReportEvidence::Unidentified),
         }
     }
 
@@ -2367,6 +2380,213 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    /// The processes at and above a hook's python3, nearest first, from
+    /// `(pid, parent, process group, argv)`.
+    fn hook_ancestry(table: &[(u32, u32, u32, &[&str])]) -> Vec<crate::platform::AncestorProcess> {
+        table
+            .iter()
+            .map(
+                |(pid, parent, group, argv)| crate::platform::AncestorProcess {
+                    process: crate::platform::ForegroundProcess {
+                        pid: *pid,
+                        name: argv[0].rsplit('/').next().unwrap_or(argv[0]).to_string(),
+                        argv0: None,
+                        argv: Some(argv.iter().map(|arg| (*arg).to_string()).collect()),
+                        cmdline: Some(argv.join(" ")),
+                        started: None,
+                    },
+                    parent: *parent,
+                    process_group: Some(*group),
+                },
+            )
+            .collect()
+    }
+
+    fn report_codex_session(
+        app: &mut App,
+        public_pane_id: &str,
+        seq: u64,
+        session: &str,
+        session_start_source: &str,
+        sender: Vec<crate::platform::AncestorProcess>,
+    ) {
+        let response = app.handle_api_request_after_internal_events_drained(
+            crate::api::schema::Request {
+                id: "report".into(),
+                method: crate::api::schema::Method::PaneReportAgentSession(
+                    PaneReportAgentSessionParams {
+                        pane_id: public_pane_id.into(),
+                        source: "herdr:codex".into(),
+                        agent: "codex".into(),
+                        seq: Some(seq),
+                        agent_session_id: Some(session.into()),
+                        agent_session_path: None,
+                        session_start_source: Some(session_start_source.into()),
+                        resume_argv: None,
+                    },
+                ),
+            },
+            Some(sender),
+        );
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(response.result, ResponseResult::Ok {}));
+    }
+
+    /// The conversation the pane shows live, and the one a session save
+    /// would restart it with.
+    fn recorded_and_saved_session(app: &App) -> (Option<String>, Option<String>) {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = &app.state.workspaces[0].tabs[0].panes[&pane_id].attached_terminal_id;
+        let terminal = &app.state.terminals[terminal_id];
+        let recorded = terminal
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or(terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| &session.session_ref))
+            .map(|session| session.value.clone());
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+        );
+        let saved = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .find_map(|pane| pane.agent_session.as_ref())
+            .map(|session| session.value.clone());
+        (recorded, saved)
+    }
+
+    #[tokio::test]
+    async fn codex_reports_from_the_shared_server_do_not_change_the_pane_conversation() {
+        // Pane A's shell is 20 and runs A's Codex client, 30. Codex's shared
+        // daemon, 80, runs every attached client's conversations and its
+        // hooks carry the environment of A, which started it.
+        let (mut app, pane_a) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_set_child_pid(20);
+        app.state.insert_test_runtime(pane_id, runtime);
+        app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Codex,
+            observed_at: std::time::Instant::now(),
+        });
+        let client = [
+            (20, 1, 20, &["bash"][..]),
+            (
+                30,
+                20,
+                30,
+                &["/placeholder/bin/codex", "resume", "session-a"][..],
+            ),
+        ];
+        let hook = |parent: u32| {
+            [
+                (90, 85, 85, &["python3", "-"][..]),
+                (
+                    85,
+                    parent,
+                    85,
+                    &["bash", "herdr-agent-state.sh", "session"][..],
+                ),
+            ]
+        };
+        let daemon = |parent: u32| {
+            (
+                80,
+                parent,
+                80,
+                &[
+                    "/placeholder/bin/codex",
+                    "app-server",
+                    "--listen",
+                    "unix://",
+                ][..],
+            )
+        };
+        let in_process_hook = || hook_ancestry(&[&hook(30)[..], &client[..]].concat());
+
+        // A's own conversation, from A's client running Codex in process.
+        report_codex_session(
+            &mut app,
+            &pane_a,
+            1,
+            "session-a",
+            "resume",
+            in_process_hook(),
+        );
+        let a = (Some("session-a".to_string()), Some("session-a".to_string()));
+        assert_eq!(recorded_and_saved_session(&app), a);
+
+        // B starts, clears and compacts conversations on the shared daemon,
+        // while the daemon is A's child inside pane A, and after A's client
+        // exited and the daemon was reparented outside every pane.
+        for (seq, (session, source)) in [
+            ("session-b", "startup"),
+            ("session-b2", "clear"),
+            ("session-b2", "compact"),
+            ("session-b3", "resume"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let under_client = hook_ancestry(&[&hook(80)[..], &[daemon(30)], &client[..]].concat());
+            report_codex_session(
+                &mut app,
+                &pane_a,
+                10 + seq as u64,
+                session,
+                source,
+                under_client,
+            );
+            assert_eq!(recorded_and_saved_session(&app), a, "{source} under A");
+            let reparented = hook_ancestry(
+                &[&hook(80)[..], &[daemon(1), (1, 0, 1, &["/sbin/init"][..])]].concat(),
+            );
+            report_codex_session(
+                &mut app,
+                &pane_a,
+                20 + seq as u64,
+                session,
+                source,
+                reparented,
+            );
+            assert_eq!(recorded_and_saved_session(&app), a, "{source} reparented");
+        }
+
+        // A's genuine new, clear, compact and resume still update pane A.
+        for (seq, (session, source)) in [
+            ("session-a2", "startup"),
+            ("session-a3", "clear"),
+            ("session-a3", "compact"),
+            ("session-a4", "resume"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            report_codex_session(
+                &mut app,
+                &pane_a,
+                30 + seq as u64,
+                session,
+                source,
+                in_process_hook(),
+            );
+            let expected = Some(session.to_string());
+            assert_eq!(
+                recorded_and_saved_session(&app),
+                (expected.clone(), expected),
+                "{source} from A"
+            );
+        }
     }
 
     #[test]

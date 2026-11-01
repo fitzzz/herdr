@@ -1078,6 +1078,27 @@ fn parse_codex_args(args: &[String]) -> Result<CodexLaunch, ArgsRejected> {
     Ok(launch)
 }
 
+/// Whether a Codex process command line (`argv[0]` included) runs Codex's app
+/// server, such as the shared background server its TUIs attach to, instead
+/// of one client. The server runs the conversations of every client attached
+/// to it, and the hooks it runs carry the environment of the process that
+/// started it.
+pub fn codex_command_line_runs_app_server(argv: &[String]) -> bool {
+    let Some(start) = agent_args_start(argv) else {
+        return false;
+    };
+    let args = &argv[start..];
+    let mut index = 0;
+    while index < args.len() {
+        match next_launch_arg(CODEX_OPTIONS, ParserStyle::Clap, &args[index..]) {
+            Ok(LaunchArg::Option { len, .. }) => index += len,
+            Ok(LaunchArg::Operand) => return args[index] == "app-server",
+            Ok(LaunchArg::EndOfOptions) | Err(_) => return false,
+        }
+    }
+    false
+}
+
 #[derive(Debug, Default)]
 struct GrokLaunch {
     options: Vec<String>,
@@ -1430,6 +1451,44 @@ mod tests {
             "herdr:opencode",
             "opencode"
         ));
+    }
+
+    #[test]
+    fn codex_app_server_is_told_from_its_clients_by_command_line() {
+        for server in [
+            // The shared daemon a TUI starts, and the loop that keeps it.
+            argv(&[
+                "/placeholder/packages/app-server-daemon/releases/0.163.0/bin/codex",
+                "app-server",
+                "--listen",
+                "unix://",
+            ]),
+            argv(&["codex", "app-server", "daemon", "pid-update-loop"]),
+            // agent-accounts repeats its defaults before the subcommand.
+            argv(&[
+                "codex",
+                "-c",
+                "service_tier=\"default\"",
+                "app-server",
+                "-c",
+                "service_tier=\"default\"",
+            ]),
+            argv(&["node", "/placeholder/bin/codex.js", "app-server"]),
+        ] {
+            assert!(codex_command_line_runs_app_server(&server), "{server:?}");
+        }
+        for client in [
+            argv(&["codex"]),
+            argv(&["codex", "resume", "01a19776-179a-7310-b9a9-2343bb6691b2"]),
+            argv(&["codex", "-c", "model=\"app-server\"", "fix the app-server"]),
+            argv(&["codex", "-C", "app-server"]),
+            argv(&["codex", "--", "app-server"]),
+            argv(&["codex", "--unknown-option", "app-server"]),
+            argv(&["bash", "codex", "app-server"]),
+            argv(&[]),
+        ] {
+            assert!(!codex_command_line_runs_app_server(&client), "{client:?}");
+        }
     }
 
     #[test]
