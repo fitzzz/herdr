@@ -350,6 +350,13 @@ pub enum ReportSender {
     /// The nearest process running the agent, inside the pane, and the
     /// launchers directly above it that started it.
     Agent(Vec<crate::platform::ProcessInstance>),
+    /// The nearest process running the agent is the agent's shared server,
+    /// such as the Codex app server its TUIs attach to. It runs the
+    /// conversations of every attached client, and the hooks it runs carry
+    /// the environment of whichever client started it, so the pane a report
+    /// from it names is not the pane of the reported conversation. The server
+    /// may still run inside the pane that started it.
+    SharedServer,
     /// No process running the agent was placed in the pane: none was read
     /// below the pane's own process, or the walk ended before reaching the
     /// pane (a process exited, could not be read or reused an id, or the walk
@@ -364,25 +371,31 @@ pub enum ReportSender {
 /// process group, such as npm's `node .../codex.js` starting the native
 /// `codex` binary. An agent started by another agent's shell tool, which runs
 /// in its own process group, names only itself. Where the platform has no
-/// process groups, only npm's Codex launcher counts.
+/// process groups, only npm's Codex launcher counts. A report whose nearest
+/// agent process is the agent's shared server comes from that server, inside
+/// the pane or not ([`ReportSender::SharedServer`]).
 pub fn report_sender(
     ancestry: &[crate::platform::AncestorProcess],
     agent: Agent,
     pane_process: u32,
 ) -> ReportSender {
-    let Some(pane_index) = ancestry
+    let pane_index = ancestry
         .iter()
-        .position(|ancestor| ancestor.process.pid == pane_process)
-    else {
-        return ReportSender::Unidentified;
-    };
-    let in_pane = &ancestry[..=pane_index];
+        .position(|ancestor| ancestor.process.pid == pane_process);
     let runs_agent = |ancestor: &crate::platform::AncestorProcess| {
         identify_agent_process(&ancestor.process).is_some_and(|(identified, _)| identified == agent)
     };
-    let Some(nearest) = in_pane.iter().position(runs_agent) else {
+    // Up to the pane's own process when the walk reached it, so an agent
+    // above the pane, such as one running the Herdr server, is not the sender.
+    let below_pane = &ancestry[..pane_index.map_or(ancestry.len(), |index| index + 1)];
+    let nearest = below_pane.iter().position(runs_agent);
+    if nearest.is_some_and(|nearest| is_shared_agent_server(agent, &below_pane[nearest].process)) {
+        return ReportSender::SharedServer;
+    }
+    let (Some(pane_index), Some(nearest)) = (pane_index, nearest) else {
         return ReportSender::Unidentified;
     };
+    let in_pane = &ancestry[..=pane_index];
     let agent_process = &in_pane[nearest];
     let launches_agent = |ancestor: &&crate::platform::AncestorProcess| {
         let process = &ancestor.process;
@@ -403,6 +416,15 @@ pub fn report_sender(
             })
             .collect(),
     )
+}
+
+/// Whether `process` is `agent`'s shared server ([`ReportSender::SharedServer`]).
+fn is_shared_agent_server(agent: Agent, process: &crate::platform::ForegroundProcess) -> bool {
+    agent == Agent::Codex
+        && process
+            .argv
+            .as_deref()
+            .is_some_and(crate::agent_resume::codex_command_line_runs_app_server)
 }
 
 /// npm's `codex` command: node running the package's `bin/codex.js`, which
@@ -1217,9 +1239,9 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_run_by_an_agent_outside_the_pane_names_no_reporter() {
-        // A shared Codex daemon under pid 1 runs the hook; the pane's shell
-        // is 20.
+    fn a_hook_run_by_the_shared_codex_server_names_the_server() {
+        // The shared Codex daemon runs the hook, reparented under pid 1 after
+        // the client that started it exited; the pane's shell is 20.
         let daemon: &[(u32, u32, &str, &[&str])] = &[
             (90, 85, "python3", &["python3", "-"]),
             (
@@ -1232,12 +1254,109 @@ mod tests {
                 80,
                 1,
                 "codex",
-                &["/placeholder/bin/codex", "app-server", "--managed-daemon"],
+                &[
+                    "/placeholder/bin/codex",
+                    "app-server",
+                    "--listen",
+                    "unix://",
+                ],
             ),
             (1, 0, "systemd", &["/sbin/init"]),
         ];
         assert_eq!(
             report_sender(&ancestry_in(daemon, 90), Agent::Codex, 20),
+            ReportSender::SharedServer
+        );
+        // While the client that started it runs, the daemon is that client's
+        // child, inside the starting pane, in its own process group.
+        let under_client: &[(u32, u32, &str, &[&str])] = &[
+            (90, 85, "python3", &["python3", "-"]),
+            (
+                85,
+                80,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (
+                80,
+                30,
+                "codex",
+                &[
+                    "/placeholder/bin/codex",
+                    "app-server",
+                    "--listen",
+                    "unix://",
+                ],
+            ),
+            (30, 20, "codex", &["/placeholder/bin/codex"]),
+            (20, 1, "bash", &["bash"]),
+        ];
+        assert_eq!(
+            report_sender(
+                &in_groups(ancestry_in(under_client, 90), &[(80, 80), (30, 30)]),
+                Agent::Codex,
+                20
+            ),
+            ReportSender::SharedServer
+        );
+        // The client's own in-process server runs its hooks under the client.
+        let in_process: &[(u32, u32, &str, &[&str])] = &[
+            (90, 85, "python3", &["python3", "-"]),
+            (
+                85,
+                30,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (
+                30,
+                20,
+                "codex",
+                &["/placeholder/bin/codex", "-c", "service_tier=\"default\""],
+            ),
+            (20, 1, "bash", &["bash"]),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(in_process, 90), Agent::Codex, 20),
+            agent_processes(&[30])
+        );
+    }
+
+    #[test]
+    fn a_hook_run_by_an_agent_outside_the_pane_names_no_reporter() {
+        // A Codex client outside the pane, such as in a terminal Herdr does
+        // not run, runs the hook; the pane's shell is 20.
+        let outside: &[(u32, u32, &str, &[&str])] = &[
+            (90, 85, "python3", &["python3", "-"]),
+            (
+                85,
+                80,
+                "sh",
+                &["/bin/sh", "herdr-agent-state.sh", "session"],
+            ),
+            (80, 70, "codex", &["/placeholder/bin/codex"]),
+            (70, 1, "bash", &["bash"]),
+            (1, 0, "systemd", &["/sbin/init"]),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(outside, 90), Agent::Codex, 20),
+            ReportSender::Unidentified
+        );
+        // The Herdr server runs inside a conversation of the shared server;
+        // a report sent by hand from the pane's shell does not name it.
+        let server_in_daemon: &[(u32, u32, &str, &[&str])] = &[
+            (50, 20, "herdr", &["herdr", "pane", "report-agent-session"]),
+            (20, 10, "bash", &["bash"]),
+            (10, 5, "herdr", &["herdr", "server"]),
+            (
+                5,
+                1,
+                "codex",
+                &["codex", "app-server", "--listen", "unix://"],
+            ),
+        ];
+        assert_eq!(
+            report_sender(&ancestry_in(server_in_daemon, 50), Agent::Codex, 20),
             ReportSender::Unidentified
         );
     }

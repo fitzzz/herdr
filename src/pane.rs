@@ -4049,6 +4049,10 @@ impl PaneRuntime {
         (release_tx, writer)
     }
 
+    pub(crate) fn test_set_child_pid(&self, pid: u32) {
+        self.child_pid.store(pid, Ordering::Release);
+    }
+
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
