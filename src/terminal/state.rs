@@ -9335,8 +9335,9 @@ mod tests {
     #[test]
     fn a_conversation_reported_from_outside_the_pane_is_not_paired_with_the_job() {
         let mut terminal = agent_running_its_reported_conversation(Agent::Codex);
-        // A Codex process outside the pane, or one whose walk was cut before
-        // the pane, sent the report while the pane's job runs its one Codex.
+        // A Codex process whose walk was cut before the pane, so the server
+        // could not place it, sent the report while the pane's job runs its
+        // one Codex.
         report_with(
             &mut terminal,
             "codex",
