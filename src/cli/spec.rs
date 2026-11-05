@@ -334,6 +334,9 @@ fn agent_command() -> Command {
                 .about("Send key presses to an agent")
                 .arg(required("target", "TARGET"))
                 .arg(required("key", "KEY").num_args(1..))
+                .arg(option("expect-session", "SESSION").help(
+                    "Write nothing unless the agent still occupies this native session (agent get's agent_session.value)",
+                ))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
         )
         .subcommand(
@@ -1275,6 +1278,10 @@ mod tests {
         assert!(agent
             .get_subcommands()
             .all(|subcommand| subcommand.get_name() != "send"));
+        assert!(has_option(
+            command_path(&cmd, &["agent", "send-keys"]),
+            "expect-session"
+        ));
 
         let pane = command_path(&cmd, &["pane"]);
         assert!(pane

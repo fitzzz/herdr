@@ -467,6 +467,20 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
+        // Checked in the same step that enqueues the bytes: a replacement
+        // native session can only be recorded by another app-loop step, so it
+        // cannot land between this comparison and the write.
+        if let Some(expected) = params.expected_session.as_deref() {
+            let current = self
+                .state
+                .terminals
+                .get(terminal_id)
+                .and_then(super::super::creation::terminal_agent_session_info)
+                .map(|session| session.value);
+            if current.as_deref() != Some(expected) {
+                return agent_session_mismatch(id, &params.target, expected, current.as_deref());
+            }
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             return encode_error(id, "agent_send_keys_failed", err.to_string());
         }
@@ -481,6 +495,23 @@ fn agent_not_ready(id: String, target: &str) -> String {
         "agent_not_ready",
         format!("agent {target} is not an active named agent"),
     )
+}
+
+fn agent_session_mismatch(
+    id: String,
+    target: &str,
+    expected: &str,
+    current: Option<&str>,
+) -> String {
+    let message = match current {
+        Some(current) => format!(
+            "agent {target} occupies native session {current}, not the expected session {expected}; no keys were sent"
+        ),
+        None => format!(
+            "agent {target} has no known native session, not the expected session {expected}; no keys were sent"
+        ),
+    };
+    encode_error(id, "agent_session_mismatch", message)
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -979,6 +1010,7 @@ contains = ["TEST-DRAFT"]
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
+                expected_session: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -990,12 +1022,220 @@ contains = ["TEST-DRAFT"]
             AgentSendKeysParams {
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
+                expected_session: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[A\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A named, idle OpenCode agent hosted by a channel-backed runtime, so the
+    /// tests can observe exactly which bytes reach the terminal.
+    fn named_opencode_agent(
+        app: &mut App,
+    ) -> (
+        crate::terminal::TerminalId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Idle);
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        (terminal_id, rx)
+    }
+
+    fn record_native_session(
+        app: &mut App,
+        terminal_id: &crate::terminal::TerminalId,
+        value: &str,
+    ) {
+        app.state
+            .terminals
+            .get_mut(terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:opencode".into(),
+                agent: "opencode".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(value).unwrap(),
+            });
+    }
+
+    /// The value a caller reads before sending: `agent.get`'s `agent_session.value`.
+    fn reported_session(app: &mut App) -> Option<String> {
+        let response = app.handle_agent_get(
+            "req:get".into(),
+            AgentTarget {
+                target: "reviewer".into(),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        value["result"]["agent"]["agent_session"]["value"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn send_esc(app: &mut App, expected_session: Option<&str>) -> String {
+        app.handle_agent_send_keys(
+            "req:esc".into(),
+            AgentSendKeysParams {
+                target: "reviewer".into(),
+                keys: vec!["esc".into()],
+                expected_session: expected_session.map(str::to_string),
+            },
+        )
+    }
+
+    fn assert_session_mismatch(response: &str, current: Option<&str>) {
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(response).unwrap();
+        assert_eq!(error.error.code, "agent_session_mismatch", "{response}");
+        match current {
+            Some(current) => assert!(
+                error.error.message.contains(current),
+                "the refusal names the current session: {response}"
+            ),
+            None => assert!(
+                error.error.message.contains("no known native session"),
+                "{response}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_writes_when_the_expected_session_matches() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = named_opencode_agent(&mut app);
+        record_native_session(&mut app, &terminal_id, "ses_current");
+        let expected = reported_session(&mut app).expect("agent get reports the session");
+        assert_eq!(expected, "ses_current");
+
+        let response = send_esc(&mut app, Some(&expected));
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::Ok {}));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_refuses_a_different_session_without_writing() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = named_opencode_agent(&mut app);
+        record_native_session(&mut app, &terminal_id, "ses_current");
+
+        let response = send_esc(&mut app, Some("ses_other"));
+
+        assert_session_mismatch(&response, Some("ses_current"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_refuses_an_expected_session_when_none_is_known() {
+        let mut app = app_with_agent();
+        let (_terminal_id, mut rx) = named_opencode_agent(&mut app);
+        assert_eq!(reported_session(&mut app), None);
+
+        let response = send_esc(&mut app, Some("ses_current"));
+
+        assert_session_mismatch(&response, None);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_without_an_expected_session_ignores_the_session() {
+        let mut app = app_with_agent();
+        let (terminal_id, mut rx) = named_opencode_agent(&mut app);
+
+        let unknown = send_esc(&mut app, None);
+        record_native_session(&mut app, &terminal_id, "ses_current");
+        let known = send_esc(&mut app, None);
+
+        for response in [unknown, known] {
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert!(matches!(success.result, ResponseResult::Ok {}));
+            assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_send_keys_refuses_after_a_managed_agent_replaces_its_session() {
+        // The race Portal's cancel hits: it reads the session, then a managed
+        // agent of the same kind starts a new native session and keeps its
+        // name, then the Esc arrives. The handler runs as one app-loop step,
+        // so the replacement can only land before it; the guard must see it.
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let now = std::time::Instant::now();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::OpenCode,
+            now,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        );
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        assert!(terminal.reconcile_managed_agent_at(now, false));
+        let start_session = |app: &mut App, value: &str| {
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_agent_session_ref_for_session_start(
+                    "herdr:opencode".into(),
+                    "opencode".into(),
+                    crate::agent_resume::AgentSessionRef::id(value),
+                    None,
+                    Some("select".into()),
+                )
+                .expect("managed session should be accepted");
+        };
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        start_session(&mut app, "ses_old");
+        let observed = reported_session(&mut app).expect("agent get reports the session");
+        assert_eq!(observed, "ses_old");
+
+        start_session(&mut app, "ses_new");
+        assert_eq!(
+            app.state.terminals[&terminal_id].agent_name.as_deref(),
+            Some("reviewer"),
+            "the name must still resolve to the replacement for this race to exist"
+        );
+
+        let refused = send_esc(&mut app, Some(&observed));
+        assert_session_mismatch(&refused, Some("ses_new"));
+        assert!(rx.try_recv().is_err());
+
+        let unguarded = send_esc(&mut app, None);
+        let success: SuccessResponse = serde_json::from_str(&unguarded).unwrap();
+        assert!(
+            matches!(success.result, ResponseResult::Ok {}),
+            "without the guard the key reaches the replacement session"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b"));
+    }
+
+    #[test]
+    fn agent_send_keys_params_omit_an_absent_expected_session() {
+        let legacy: AgentSendKeysParams =
+            serde_json::from_value(serde_json::json!({"target": "reviewer", "keys": ["esc"]}))
+                .unwrap();
+        assert_eq!(legacy.expected_session, None);
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({"target": "reviewer", "keys": ["esc"]})
+        );
     }
 
     #[tokio::test]

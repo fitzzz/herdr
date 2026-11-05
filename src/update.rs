@@ -3060,6 +3060,7 @@ mod tests {
                 terminal_input_ack: false,
                 terminal_input_literal: false,
                 agent_prompt_outcome: false,
+                agent_send_keys_expected_session: false,
                 launch_option_replay: Vec::new(),
             }),
         };
@@ -3143,6 +3144,7 @@ mod tests {
                     terminal_input_ack: false,
                     terminal_input_literal: false,
                     agent_prompt_outcome: false,
+                    agent_send_keys_expected_session: false,
                     launch_option_replay: Vec::new(),
                 }),
             },
@@ -3408,6 +3410,7 @@ mod tests {
                     terminal_input_ack: false,
                     terminal_input_literal: false,
                     agent_prompt_outcome: false,
+                    agent_send_keys_expected_session: false,
                     launch_option_replay: Vec::new(),
                 }),
             },
