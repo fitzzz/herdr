@@ -881,14 +881,26 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    super::print_response(&super::send_request(&Request {
+    let guarded = expected_session.is_some();
+    let request = Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
             target: target.clone(),
             keys,
             expected_session,
         }),
-    })?)
+    };
+    // An older server ignores expected_session and writes the keys anyway.
+    let response = if guarded {
+        super::send_request_requiring_capability(
+            &request,
+            "agent_send_keys_expected_session",
+            |capabilities| capabilities.agent_send_keys_expected_session,
+        )?
+    } else {
+        super::send_request(&request)?
+    };
+    super::print_response(&response)
 }
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {

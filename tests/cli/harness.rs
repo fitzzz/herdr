@@ -567,6 +567,25 @@ pub(super) fn write_fake_pong(
     version: &str,
     protocol: u32,
 ) {
+    write_fake_pong_advertising(stream, request, version, protocol, &[]);
+}
+
+/// Answers a ping like `write_fake_pong`, also advertising each named boolean
+/// capability as true.
+pub(super) fn write_fake_pong_advertising(
+    stream: &mut UnixStream,
+    request: &serde_json::Value,
+    version: &str,
+    protocol: u32,
+    capabilities: &[&str],
+) {
+    let mut advertised = serde_json::json!({
+        "live_handoff": true,
+        "detached_server_daemon": true
+    });
+    for capability in capabilities {
+        advertised[*capability] = true.into();
+    }
     writeln!(
         stream,
         "{}",
@@ -576,10 +595,7 @@ pub(super) fn write_fake_pong(
                 "type": "pong",
                 "version": version,
                 "protocol": protocol,
-                "capabilities": {
-                    "live_handoff": true,
-                    "detached_server_daemon": true
-                }
+                "capabilities": advertised
             }
         })
     )
@@ -588,6 +604,15 @@ pub(super) fn write_fake_pong(
 }
 
 pub(super) fn accept_fake_cli_operation(listener: &UnixListener) -> (UnixStream, String) {
+    accept_fake_cli_operation_advertising(listener, &[])
+}
+
+/// Like `accept_fake_cli_operation`, with each named boolean capability
+/// advertised as true in the answered pings.
+pub(super) fn accept_fake_cli_operation_advertising(
+    listener: &UnixListener,
+    capabilities: &[&str],
+) -> (UnixStream, String) {
     loop {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -598,11 +623,12 @@ pub(super) fn accept_fake_cli_operation(listener: &UnixListener) -> (UnixStream,
             return (stream, line);
         }
 
-        write_fake_pong(
+        write_fake_pong_advertising(
             &mut stream,
             &request,
             "different-build-same-protocol",
             CURRENT_PROTOCOL,
+            capabilities,
         );
     }
 }

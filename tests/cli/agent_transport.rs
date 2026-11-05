@@ -283,51 +283,59 @@ fn prompt_wait_is_sent_as_one_agent_request() {
 }
 
 #[test]
-fn send_keys_expect_session_is_sent_with_the_keys_and_its_refusal_is_reported() {
+fn send_keys_expect_session_is_sent_to_a_supporting_server_and_its_refusal_is_reported() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("herdr.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {
-        let (mut stream, line) = accept_fake_cli_operation(&listener);
-        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "agent.send_keys");
-        assert_eq!(
-            request["params"],
+        for answer in [
+            serde_json::json!({"result": {"type": "ok"}}),
             serde_json::json!({
-                "target": "reviewer",
-                "keys": ["esc", "enter"],
-                "expected_session": "ses_old"
-            })
-        );
-        writeln!(
-            stream,
-            "{}",
-            serde_json::json!({
-                "id": request["id"],
                 "error": {
                     "code": "agent_session_mismatch",
                     "message": "agent reviewer occupies native session ses_new, not the expected session ses_old; no keys were sent"
                 }
-            })
-        )
-        .unwrap();
-        stream.flush().unwrap();
+            }),
+        ] {
+            let (mut stream, line) = accept_fake_cli_operation_advertising(
+                &listener,
+                &["agent_send_keys_expected_session"],
+            );
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.send_keys");
+            assert_eq!(
+                request["params"],
+                serde_json::json!({
+                    "target": "reviewer",
+                    "keys": ["esc", "enter"],
+                    "expected_session": "ses_old"
+                })
+            );
+            let mut response = answer;
+            response["id"] = request["id"].clone();
+            writeln!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+        }
     });
 
-    let sent = run_cli(
-        &socket_path,
-        &[
-            "agent",
-            "send-keys",
-            "reviewer",
-            "esc",
-            "--expect-session",
-            "ses_old",
-            "enter",
-        ],
+    let guarded_send = [
+        "agent",
+        "send-keys",
+        "reviewer",
+        "esc",
+        "--expect-session",
+        "ses_old",
+        "enter",
+    ];
+    let accepted = run_cli(&socket_path, &guarded_send);
+    assert!(
+        accepted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
     );
+    let sent = run_cli(&socket_path, &guarded_send);
     server.join().unwrap();
     assert_eq!(sent.status.code(), Some(1));
     let error: serde_json::Value = serde_json::from_slice(&sent.stderr).unwrap();
@@ -390,4 +398,96 @@ fn send_keys_without_expect_session_omits_the_field() {
         String::from_utf8_lossy(&sent.stderr)
     );
     cleanup_test_base(&base);
+}
+
+#[test]
+fn send_keys_expect_session_refuses_an_unsupported_server_before_sending_keys() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    for advertised in [None, Some(false)] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let worker_operations = Arc::clone(&operations);
+        let server = thread::spawn(move || {
+            while !worker_done.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(err) => panic!("accept: {err}"),
+                };
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = if request["method"] == "ping" {
+                    let mut capabilities = serde_json::json!({"live_handoff": false});
+                    if let Some(supported) = advertised {
+                        capabilities["agent_send_keys_expected_session"] = supported.into();
+                    }
+                    serde_json::json!({
+                        "type": "pong", "version": "older-server",
+                        "protocol": CURRENT_PROTOCOL, "capabilities": capabilities
+                    })
+                } else {
+                    // Old servers deserialize target/keys, ignore expected_session,
+                    // enqueue the keys and report success.
+                    worker_operations.lock().unwrap().push(request.clone());
+                    serde_json::json!({"type": "ok"})
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({
+                        "id": request["id"], "result": result
+                    })
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let output = run_cli(
+            &socket_path,
+            &[
+                "agent",
+                "send-keys",
+                "reviewer",
+                "esc",
+                "--expect-session",
+                "ses_old",
+            ],
+        );
+        done.store(true, Ordering::Release);
+        server.join().unwrap();
+        cleanup_test_base(&base);
+        assert!(
+            operations.lock().unwrap().is_empty(),
+            "a server advertising {advertised:?} must receive no mutating request"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "unsupported guard must be refused"
+        );
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["id"], "cli:agent:send-keys");
+        assert_eq!(error["error"]["code"], "unsupported_capability");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent_send_keys_expected_session"));
+    }
 }

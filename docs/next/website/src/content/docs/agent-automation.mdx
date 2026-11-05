@@ -123,7 +123,7 @@ herdr agent read reviewer --source recent-unwrapped --lines 80
 herdr agent send-keys reviewer esc
 ```
 
-Interrupt only the conversation you observed. A managed agent keeps its name when it starts a new conversation, so pin the key to the session `agent get` reported; Herdr returns `agent_session_mismatch` and writes nothing if the session changed:
+Interrupt only the conversation you observed. A managed agent keeps its name when it starts a new conversation, so pin the key to the session `agent get` reported; Herdr returns `agent_session_mismatch` and writes nothing if the session changed. Against a server too old to check the session, the CLI returns `unsupported_capability` and sends nothing:
 
 ```bash
 session=$(herdr agent get reviewer | jq -r '.result.agent.agent_session.value')
