@@ -57,6 +57,11 @@ pub struct ServerCapabilities {
     /// means acceptance was observed.
     #[serde(default)]
     pub agent_prompt_outcome: bool,
+    /// `agent.send_keys` honors `expected_session`: it refuses with
+    /// `agent_session_mismatch`, writing nothing, unless the occupant's current
+    /// native session equals it. Older servers ignore the field and write.
+    #[serde(default)]
+    pub agent_send_keys_expected_session: bool,
     /// Agent kinds whose restore repeats the options the agent was launched
     /// with, read from its command line without what the prefix of the
     /// launcher it was started through passed on. Absent on servers that do

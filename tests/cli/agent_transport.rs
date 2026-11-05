@@ -281,3 +281,113 @@ fn prompt_wait_is_sent_as_one_agent_request() {
     server.join().unwrap();
     cleanup_test_base(&base);
 }
+
+#[test]
+fn send_keys_expect_session_is_sent_with_the_keys_and_its_refusal_is_reported() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, line) = accept_fake_cli_operation(&listener);
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "agent.send_keys");
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "target": "reviewer",
+                "keys": ["esc", "enter"],
+                "expected_session": "ses_old"
+            })
+        );
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "error": {
+                    "code": "agent_session_mismatch",
+                    "message": "agent reviewer occupies native session ses_new, not the expected session ses_old; no keys were sent"
+                }
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let sent = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "send-keys",
+            "reviewer",
+            "esc",
+            "--expect-session",
+            "ses_old",
+            "enter",
+        ],
+    );
+    server.join().unwrap();
+    assert_eq!(sent.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&sent.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_session_mismatch");
+
+    for args in [
+        &["agent", "send-keys", "reviewer", "esc", "--expect-session"][..],
+        &[
+            "agent",
+            "send-keys",
+            "reviewer",
+            "--expect-session",
+            "ses_old",
+        ][..],
+        &[
+            "agent",
+            "send-keys",
+            "reviewer",
+            "esc",
+            "--expect-session",
+            "a",
+            "--expect-session",
+            "b",
+        ][..],
+    ] {
+        let rejected = run_cli(&socket_path, args);
+        assert_eq!(rejected.status.code(), Some(2), "{args:?}");
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn send_keys_without_expect_session_omits_the_field() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, line) = accept_fake_cli_operation(&listener);
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            request["params"],
+            serde_json::json!({"target": "reviewer", "keys": ["esc"]})
+        );
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id": request["id"], "result": {"type": "ok"}})
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let sent = run_cli(&socket_path, &["agent", "send-keys", "reviewer", "esc"]);
+    server.join().unwrap();
+    assert!(
+        sent.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    cleanup_test_base(&base);
+}

@@ -122,6 +122,8 @@ Without acceptance evidence, `agent.prompt` returns `agent_prompt_stalled`. Its 
 
 Servers advertise this with the boolean `agent_prompt_outcome` capability. Older servers omit the capability and keep the old success meaning: the bytes were written, not acceptance.
 
+`agent.send_keys` accepts an optional `expected_session` string: the `agent_session.value` that `agent.get` reported. When it is present, the server compares it with the resolved agent's current native session in the same step that writes the keys. If they differ, or no session is known, it returns `agent_session_mismatch` and writes nothing; the message names the current session when one is known. A managed agent keeps its name when it starts a new native session of the same kind, so this is how a caller avoids sending a key such as `esc` to a replacement conversation. The comparison uses the session the server has recorded; a change the agent has not yet reported is not visible to it. Omitting the field keeps the previous behavior. Servers advertise the field with the boolean `agent_send_keys_expected_session` capability; older servers ignore it and write the keys.
+
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep

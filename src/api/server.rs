@@ -84,6 +84,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         terminal_input_ack: true,
         terminal_input_literal: true,
         agent_prompt_outcome: true,
+        agent_send_keys_expected_session: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()
             .filter(|agent| crate::agent_resume::carries_launch_options(*agent))
@@ -1530,6 +1531,7 @@ mod tests {
                 terminal_input_ack: false,
                 terminal_input_literal: false,
                 agent_prompt_outcome: false,
+                agent_send_keys_expected_session: false,
                 launch_option_replay: Vec::new(),
             }),
             None,
@@ -1583,6 +1585,12 @@ mod tests {
     fn ping_advertises_truthful_agent_prompt_outcome() {
         let capabilities = default_capabilities().expect("capabilities");
         assert!(capabilities.agent_prompt_outcome);
+    }
+
+    #[test]
+    fn ping_advertises_agent_send_keys_expected_session() {
+        let capabilities = default_capabilities().expect("capabilities");
+        assert!(capabilities.agent_send_keys_expected_session);
     }
 
     #[test]

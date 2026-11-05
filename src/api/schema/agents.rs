@@ -20,6 +20,15 @@ pub struct AgentReadParams {
 pub struct AgentSendKeysParams {
     pub target: String,
     pub keys: Vec<String>,
+    /// The native agent session the caller expects the target to occupy: the
+    /// `agent_session.value` that `agent.get` reports. When present, the server
+    /// compares it with the occupant's current session in the same step that
+    /// writes the keys and refuses with `agent_session_mismatch`, writing
+    /// nothing, when they differ or no session is known. Advertised by
+    /// `ServerCapabilities::agent_send_keys_expected_session`; older servers
+    /// ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

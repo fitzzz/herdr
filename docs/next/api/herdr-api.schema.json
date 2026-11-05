@@ -1348,6 +1348,13 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "expected_session": {
+              "description": "The native agent session the caller expects the target to occupy: the\n`agent_session.value` that `agent.get` reports. When present, the server\ncompares it with the occupant's current session in the same step that\nwrites the keys and refuses with `agent_session_mismatch`, writing\nnothing, when they differ or no session is known. Advertised by\n`ServerCapabilities::agent_send_keys_expected_session`; older servers\nignore the field.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "keys": {
               "items": {
                 "type": "string"
@@ -10871,6 +10878,11 @@
             "agent_prompt_outcome": {
               "default": false,
               "description": "`agent.prompt` reports a truthful submission outcome: it refuses a busy\ncomposer with `agent_not_ready`, answers `agent_prompt_stalled` when\nacceptance evidence is missing, and answers `agent_prompt_not_submitted`\nwhen the text stayed in the composer or was rejected. A success answer\nmeans acceptance was observed.",
+              "type": "boolean"
+            },
+            "agent_send_keys_expected_session": {
+              "default": false,
+              "description": "`agent.send_keys` honors `expected_session`: it refuses with\n`agent_session_mismatch`, writing nothing, unless the occupant's current\nnative session equals it. Older servers ignore the field and write.",
               "type": "boolean"
             },
             "detached_server_daemon": {

@@ -851,16 +851,42 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
+    const USAGE: &str =
+        "usage: herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]";
+    let Some(target) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let mut keys = Vec::new();
+    let mut expected_session = None;
+    let mut index = 1;
+    while index < args.len() {
+        if args[index] == "--expect-session" {
+            let Some(value) = args.get(index + 1) else {
+                eprintln!("missing value for --expect-session");
+                return Ok(2);
+            };
+            if expected_session.replace(value.clone()).is_some() {
+                eprintln!("--expect-session given more than once");
+                return Ok(2);
+            }
+            index += 2;
+        } else {
+            keys.push(args[index].clone());
+            index += 1;
+        }
+    }
+    if keys.is_empty() {
+        eprintln!("{USAGE}");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
-            target: args[0].clone(),
-            keys: args[1..].to_vec(),
+            target: target.clone(),
+            keys,
+            expected_session,
         }),
     })?)
 }
@@ -934,7 +960,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...]");
+    eprintln!("  herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
