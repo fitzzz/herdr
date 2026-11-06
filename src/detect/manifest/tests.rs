@@ -45,7 +45,7 @@ fn composer_manifest(composer: &str) -> String {
         r#"
 id = "codex"
 version = "9999.01.01.1"
-min_engine_version = 4
+min_engine_version = 5
 updated_at = "2026-06-10T12:00:00Z"
 
 [[rules]]
@@ -970,7 +970,7 @@ fn composer_validation_accepts_requires_submitted_text_on_submitted_state() {
     let manifest = r#"
 id = "codex"
 version = "1"
-min_engine_version = 4
+min_engine_version = 5
 
 [[rules]]
 id = "base"
@@ -984,6 +984,59 @@ requires_submitted_text = true
 contains = ["›"]
 "#;
     assert!(parse_manifest(manifest).is_ok());
+}
+
+#[test]
+fn submitted_evidence_requires_engine_five_while_other_composer_states_keep_four() {
+    let with_state = |state: &str, engine: u32| {
+        format!(
+            r#"
+id = "codex"
+version = "1"
+min_engine_version = {engine}
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "evidence"
+state = "{state}"
+requires_submitted_text = true
+contains = ["›"]
+"#
+        )
+    };
+    let error = parse_manifest(&with_state("submitted_evidence", 4))
+        .expect_err("engine 4 cannot deserialize submitted_evidence");
+    assert!(
+        error.contains("submitted_evidence composer rules require min_engine_version 5"),
+        "{error}"
+    );
+    assert!(parse_manifest(&with_state("submitted_evidence", 5)).is_ok());
+    assert!(parse_manifest(&with_state("queued_evidence", 4)).is_ok());
+}
+
+#[test]
+fn remote_manifest_for_a_newer_engine_than_five_is_refused() {
+    let manifest = r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 6
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+"#;
+    let Err(error) = parse_remote_manifest_for_agent(Agent::Codex, manifest) else {
+        panic!("a manifest for a newer engine must not load");
+    };
+    assert!(
+        error.contains("requires engine 6, current engine is 5"),
+        "{error}"
+    );
 }
 
 #[test]

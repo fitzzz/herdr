@@ -81,8 +81,9 @@ STAGED_PUBLISHED_MANIFESTS = {
         "2026.09.18.1",
         "0f31b111144900b02f303577d27587f72d58d8c505185a682bd7887f822316ee",
     ),
-    # Codex's engine-4 composer rules stay bundled until a released client
-    # carries engine 4. Published clients keep the engine-3 catalog manifest.
+    # Codex's composer rules need engine 4, and its submitted_evidence rule
+    # engine 5. They stay bundled until a released client carries engine 5;
+    # published clients keep the engine-3 catalog manifest.
     "codex": (
         "2026.11.06.1",
         "2026.10.11.1",
@@ -197,6 +198,11 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
         raise CheckError(f"{path}: manifest exceeds max composer rule count {MAX_RULES_PER_MANIFEST}")
     if composer and min_engine < 4:
         raise CheckError(f"{path}: composer rules require min_engine_version 4")
+    # Engine 4 deserializes only the original composer states.
+    if min_engine < 5 and any(
+        isinstance(rule, dict) and rule.get("state") == "submitted_evidence" for rule in composer
+    ):
+        raise CheckError(f"{path}: submitted_evidence composer rules require min_engine_version 5")
     for index, rule in enumerate(composer):
         validate_composer(path, index, rule, complexity)
 

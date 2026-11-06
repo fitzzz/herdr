@@ -1,6 +1,6 @@
 id = "codex"
 version = "2026.11.06.1"
-min_engine_version = 4
+min_engine_version = 5
 updated_at = "2026-11-06T12:00:00Z"
 
 [[rules]]

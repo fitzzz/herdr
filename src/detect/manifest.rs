@@ -1147,6 +1147,17 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     if !manifest.composer.is_empty() && manifest.min_engine_version.unwrap_or(0) < 4 {
         return Err("composer rules require min_engine_version 4".to_string());
     }
+    // Engine 4 deserializes only the original composer states.
+    if manifest
+        .composer
+        .iter()
+        .any(|rule| rule.state == ManifestComposerState::SubmittedEvidence)
+        && manifest.min_engine_version.unwrap_or(0) < SUBMITTED_EVIDENCE_ENGINE_VERSION
+    {
+        return Err(format!(
+            "submitted_evidence composer rules require min_engine_version {SUBMITTED_EVIDENCE_ENGINE_VERSION}"
+        ));
+    }
 
     let mut complexity = ManifestComplexity::default();
     for rule in &manifest.rules {
@@ -1601,6 +1612,7 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
 }
 
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
+const SUBMITTED_EVIDENCE_ENGINE_VERSION: u32 = 5;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
 fn top_region_count(spec: &str) -> Option<usize> {

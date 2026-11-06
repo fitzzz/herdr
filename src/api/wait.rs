@@ -226,6 +226,13 @@ pub(super) fn prompt_agent(
     let submitted_baseline = before_screen.as_deref().map(|screen| {
         crate::detect::composer_submitted_evidence(expected_agent, screen, &prompt_needle)
     });
+    tracing::debug!(
+        request_id = %request_id,
+        baseline_read = before_screen.is_some(),
+        text_baseline = baseline,
+        submitted_baseline = ?submitted_baseline,
+        "agent prompt evidence baseline"
+    );
 
     if let Some(prompt_wait) = params.wait.as_mut() {
         prompt_wait.submission_deadline = total_timeout_ms
@@ -456,8 +463,9 @@ fn agent_prompt_stalled(
 }
 
 fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bool {
-    let new_text =
-        crate::detect::manifest::composer_text_occurrences(screen, &probe.needle) > probe.baseline;
+    let text_occurrences =
+        crate::detect::manifest::composer_text_occurrences(screen, &probe.needle);
+    let new_text = text_occurrences > probe.baseline;
     match probe.mode {
         PromptAcceptanceMode::Working { submitted_baseline } => {
             let queued = new_text
@@ -468,16 +476,35 @@ fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bo
                     "",
                     &probe.needle,
                 );
-            // A steered prompt is a new submitted entry above an input box that
-            // no longer holds a draft, a command or a selection list.
-            let steered = submitted_baseline.is_some_and(|baseline| {
+            // A steered prompt is a new submitted entry, carrying new prompt text,
+            // above an input box that no longer holds a draft, a command or a
+            // selection list. A detection window that grows can reveal the `›`
+            // marker of an older entry whose text was already counted, so every
+            // newly counted entry must be matched by newly visible prompt text;
+            // anything else is ambiguous and not evidence.
+            let new_entries = submitted_baseline.map(|baseline| {
                 crate::detect::composer_submitted_evidence(
                     probe.expected_agent,
                     screen,
                     &probe.needle,
-                ) > baseline
-                    && !composer_holds_input(probe.expected_agent, screen)
+                )
+                .saturating_sub(baseline)
             });
+            let holds_input = composer_holds_input(probe.expected_agent, screen);
+            let steered = new_entries.is_some_and(|new_entries| {
+                new_entries > 0
+                    && text_occurrences.saturating_sub(probe.baseline) >= new_entries
+                    && !holds_input
+            });
+            tracing::debug!(
+                text_occurrences,
+                text_baseline = probe.baseline,
+                new_entries = ?new_entries,
+                holds_input,
+                queued,
+                steered,
+                "agent prompt working evidence sample"
+            );
             queued || steered
         }
         PromptAcceptanceMode::ComposerCleared => {
@@ -755,7 +782,15 @@ fn wait_for_resolved_agent(
         }
 
         if wait.rejection_probe.is_some() || wait.acceptance_probe.is_some() {
-            if let Ok(screen) = read_agent_screen(&request_id, &wait.target, api_tx) {
+            let screen = read_agent_screen(&request_id, &wait.target, api_tx);
+            if let Err(error) = &screen {
+                tracing::debug!(
+                    request_id = %request_id,
+                    code = %error.error.code,
+                    "agent prompt evidence screen read failed"
+                );
+            }
+            if let Ok(screen) = screen {
                 if let Some(probe) = &wait.rejection_probe {
                     if std::time::Instant::now() >= probe.earliest {
                         if let Some(evidence) = prompt_not_submitted_evidence(
@@ -1297,26 +1332,138 @@ mod tests {
         assert!(!prompt_acceptance_evidence("\u{203a} hello\n", &cleared));
     }
 
-    // Shape captured from codex-cli 0.166.0 while a turn was running (see the
-    // steer reproduction): a steered prompt becomes a `›` history entry above
-    // the working status, and the input line shows its placeholder again.
-    const STEER_NEEDLE: &str = "Steer probe: after the sleep finishes, also say STEERED.";
-    const STEER_TRANSCRIPT_HEAD: &str = "  >_ OpenAI Codex (v0.166.0)\n\
-        \u{203a} Use your shell tool to run: sleep 25 ; echo finished. Then reply with SLEPT.\n\
-        \u{2022} I\u{2019}ll run the command now.\n";
-    const STEER_ENTRY: &str = "\u{203a} Steer probe: after the sleep finishes, also say STEERED.\n";
-    const STEER_TRANSCRIPT_TAIL: &str = "\u{2022} Ran codex-job start --label sleep-probe\n\
-        \u{2022} Working (20s \u{2022} esc to interrupt)\n\n";
-    const EMPTY_CODEX_INPUT: &str = "\u{203a} Ask Codex to do anything\n\
-        \x20 GPT-6.1-Sol low \u{b7} ~/cwd\n\
-        \x20 ? for shortcuts\n";
+    /// A private-config manifest override, so these tests exercise the evidence
+    /// contract with synthetic rules rather than the bundled agent grammar.
+    struct SyntheticManifests {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
 
-    fn working_codex_screen(entries: &[&str], input: &str) -> String {
-        let mut screen = STEER_TRANSCRIPT_HEAD.to_string();
+    impl SyntheticManifests {
+        fn install(manifests: &[(&str, &str)]) -> Self {
+            let lock = crate::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-wait-manifest-{}-{stamp}",
+                std::process::id()
+            ));
+            let overrides = dir
+                .join(crate::config::app_dir_name())
+                .join("agent-detection");
+            std::fs::create_dir_all(&overrides).unwrap();
+            for (agent, manifest) in manifests {
+                std::fs::write(overrides.join(format!("{agent}.toml")), manifest).unwrap();
+            }
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            crate::detect::manifest::reload_manifests();
+            Self {
+                _lock: lock,
+                previous,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for SyntheticManifests {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            crate::detect::manifest::reload_manifests();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // Codex is only the registry key; every gate below is synthetic.
+    const SYNTHETIC_CODEX: &str = r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 5
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["TEST-IDLE"]
+
+[[composer]]
+id = "selection"
+state = "selection_list"
+priority = 1000
+region = "whole_recent"
+contains = ["TEST-SELECTION"]
+
+[[composer]]
+id = "partial"
+state = "partial_command"
+priority = 900
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+/']
+
+[[composer]]
+id = "draft"
+state = "draft"
+priority = 600
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n]']
+not = [{ contains = ["TEST-EMPTY"] }]
+
+[[composer]]
+id = "queued"
+state = "queued_evidence"
+priority = 100
+region = "whole_recent"
+requires_submitted_text = true
+contains = ["TEST-QUEUED"]
+
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
+"#;
+
+    // Another agent kind with input-box rules but no submitted-evidence rule.
+    const SYNTHETIC_CLAUDE: &str = r#"
+id = "claude"
+version = "9999.01.01.1"
+min_engine_version = 5
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["TEST-IDLE"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n]']
+not = [{ contains = ["TEST-EMPTY"] }]
+"#;
+
+    const STEER_NEEDLE: &str = "review the diff";
+    const SCREEN_HEAD: &str = "TEST-HEADER\n\u{203a} first request\n\u{2022} reply\n";
+    const STEER_ENTRY: &str = "\u{203a} review the diff\n";
+    const SCREEN_TAIL: &str = "\u{2022} TEST-WORKING\n\n";
+    const EMPTY_INPUT: &str = "\u{203a} TEST-EMPTY\n  TEST-FOOTER\n";
+    const DRAFT_INPUT: &str = "\u{203a} review the diff\n  TEST-FOOTER\n";
+
+    fn working_screen(head: &str, entries: &[&str], input: &str) -> String {
+        let mut screen = head.to_string();
         for entry in entries {
             screen.push_str(entry);
         }
-        screen.push_str(STEER_TRANSCRIPT_TAIL);
+        screen.push_str(SCREEN_TAIL);
         screen.push_str(input);
         screen
     }
@@ -1343,22 +1490,20 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_steered_into_a_working_codex_turn_is_accepted() {
+    fn a_prompt_steered_into_a_working_turn_is_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
         let codex = Some(crate::detect::Agent::Codex);
         assert!(crate::detect::submitted_evidence_supported(codex));
-        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
-        let steered = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let steered = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
         assert!(prompt_acceptance_evidence(
             &steered,
             &working_probe(Some(&before), codex)
         ));
 
-        // A steer whose first line wrapped onto Codex's indented continuation
-        // line is still the same entry.
-        let wrapped = working_codex_screen(
-            &["\u{203a} Steer probe: after the sleep\n  finishes, also say STEERED.\n"],
-            EMPTY_CODEX_INPUT,
-        );
+        // A steer whose first line wrapped onto an indented continuation line
+        // is still the same entry.
+        let wrapped = working_screen(SCREEN_HEAD, &["\u{203a} review the\n  diff\n"], EMPTY_INPUT);
         assert!(prompt_acceptance_evidence(
             &wrapped,
             &working_probe(Some(&before), codex)
@@ -1367,27 +1512,38 @@ mod tests {
 
     #[test]
     fn a_steer_still_in_the_input_line_is_not_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
         let codex = Some(crate::detect::Agent::Codex);
-        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
-        let draft_input = format!("{STEER_ENTRY}  ? for shortcuts\n");
-        let still_typed = working_codex_screen(&[], &draft_input);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let still_typed = working_screen(SCREEN_HEAD, &[], DRAFT_INPUT);
         assert!(!prompt_acceptance_evidence(
             &still_typed,
             &working_probe(Some(&before), codex)
         ));
 
-        // A matching history entry does not count while the input box holds a draft.
-        let steered_with_draft = working_codex_screen(&[STEER_ENTRY], &draft_input);
-        assert!(!prompt_acceptance_evidence(
-            &steered_with_draft,
-            &working_probe(Some(&before), codex)
-        ));
+        // A matching history entry does not count while the input box holds a
+        // draft, a slash command or a selection list.
+        for input in [
+            DRAFT_INPUT,
+            "\u{203a} /model\n  TEST-FOOTER\n",
+            "\u{203a} TEST-EMPTY\nTEST-SELECTION\n",
+        ] {
+            let steered_with_input = working_screen(SCREEN_HEAD, &[STEER_ENTRY], input);
+            assert!(
+                !prompt_acceptance_evidence(
+                    &steered_with_input,
+                    &working_probe(Some(&before), codex)
+                ),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
     fn a_steered_entry_already_in_the_baseline_is_not_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
         let codex = Some(crate::detect::Agent::Codex);
-        let before = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        let before = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
         assert!(!prompt_acceptance_evidence(
             &before,
             &working_probe(Some(&before), codex)
@@ -1401,9 +1557,60 @@ mod tests {
     }
 
     #[test]
+    fn revealing_the_marker_of_an_older_entry_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // The detection window starts inside an older multiline message, so its
+        // continuation with the prompt text is visible but its marker is not.
+        let old_tail = "  review the diff\n\u{2022} reply\n";
+        let before = working_screen(old_tail, &[], EMPTY_INPUT);
+        // The window grows by one row and reveals that message's marker. No
+        // text was submitted: the prompt text count stays 1 while the entry
+        // count rises from 0 to 1.
+        let revealed_head = format!("\u{203a} Old multiline request\n{old_tail}");
+        let revealed = working_screen(&revealed_head, &[], EMPTY_INPUT);
+        assert_eq!(
+            crate::detect::composer_submitted_evidence(codex, &revealed, STEER_NEEDLE),
+            1
+        );
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A reveal together with a real steer is ambiguous: two new entries but
+        // one new occurrence of the text. Stay conservative.
+        let revealed_and_steered = working_screen(&revealed_head, &[STEER_ENTRY], EMPTY_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &revealed_and_steered,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn queued_evidence_still_accepts_a_working_prompt() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let queued = working_screen(
+            SCREEN_HEAD,
+            &["TEST-QUEUED\n  review the diff\n"],
+            EMPTY_INPUT,
+        );
+        assert!(prompt_acceptance_evidence(
+            &queued,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
     fn a_steered_entry_is_not_evidence_for_other_agent_kinds() {
-        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
-        let steered = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        let _manifests = SyntheticManifests::install(&[
+            ("codex", SYNTHETIC_CODEX),
+            ("claude", SYNTHETIC_CLAUDE),
+        ]);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let steered = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
         for agent in [Some(crate::detect::Agent::Claude), None] {
             assert!(!crate::detect::submitted_evidence_supported(agent));
             assert!(!prompt_acceptance_evidence(

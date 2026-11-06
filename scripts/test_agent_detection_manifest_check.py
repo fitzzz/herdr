@@ -320,6 +320,60 @@ contains = ["draft"]""",
             with self.assertRaisesRegex(check.CheckError, "composer rules require min_engine_version 4"):
                 check.load_manifest_dir(bundled, engine_version=4)
 
+    def submitted_evidence_manifest(self, min_engine_version: int) -> str:
+        return composer_manifest(
+            "codex",
+            "2026.06.10.1",
+            min_engine_version,
+            """[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+contains = ["submitted"]""",
+        )
+
+    def test_submitted_evidence_requires_engine_five(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            (bundled / "codex.toml").write_text(self.submitted_evidence_manifest(4))
+
+            with self.assertRaisesRegex(
+                check.CheckError, "submitted_evidence composer rules require min_engine_version 5"
+            ):
+                check.load_manifest_dir(bundled, engine_version=5)
+
+    def test_submitted_evidence_loads_at_engine_five_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            (bundled / "codex.toml").write_text(self.submitted_evidence_manifest(5))
+
+            self.assertIn("codex", check.load_manifest_dir(bundled, engine_version=5))
+            with self.assertRaisesRegex(check.CheckError, "exceeds engine 4"):
+                check.load_manifest_dir(bundled, engine_version=4)
+
+    def test_other_composer_states_stay_loadable_at_engine_four(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled = Path(tmp) / "bundled"
+            bundled.mkdir()
+            (bundled / "codex.toml").write_text(
+                composer_manifest(
+                    "codex",
+                    "2026.06.10.1",
+                    4,
+                    """[[composer]]
+id = "queued"
+state = "queued_evidence"
+region = "queued_input_block"
+requires_submitted_text = true
+contains = ["Queued follow-up inputs"]""",
+                )
+            )
+
+            self.assertIn("codex", check.load_manifest_dir(bundled, engine_version=5))
+
 
 if __name__ == "__main__":
     unittest.main()

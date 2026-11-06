@@ -492,9 +492,66 @@ fn send_keys_expect_session_refuses_an_unsupported_server_before_sending_keys() 
     }
 }
 
-/// A Codex 0.163+ stand-in: once working, a submitted prompt is steered into the
-/// running turn and drawn as a `›` history entry above the empty input line,
-/// with no queued-input block.
+/// A synthetic Codex manifest in the server's private config, so these tests
+/// exercise Herdr's prompt evidence contract rather than the bundled Codex
+/// screen grammar. Status comes from the title; the input box and its
+/// evidence follow the `›` prompt-marker regions with synthetic tokens.
+fn write_synthetic_codex_manifest(config_home: &Path) {
+    let dir = config_home.join(app_dir_name()).join("agent-detection");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("codex.toml"),
+        r#"id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 5
+
+[[rules]]
+id = "working"
+state = "working"
+priority = 200
+region = "osc_title"
+visible_working = true
+contains = ["TEST-WORKING"]
+
+[[rules]]
+id = "idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+visible_idle = true
+contains = ["TEST-IDLE"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+priority = 600
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n]']
+not = [{ contains = ["TEST-EMPTY"] }]
+
+[[composer]]
+id = "queued"
+state = "queued_evidence"
+priority = 100
+region = "whole_recent"
+requires_submitted_text = true
+contains = ["TEST-QUEUED"]
+
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
+"#,
+    )
+    .unwrap();
+}
+
+/// A stand-in for an agent that steers a prompt sent during a running turn
+/// into that turn: once working, a submitted prompt is drawn as a `›` history
+/// entry above the empty input line, with no queued-input block.
 fn write_fake_steering_codex(bin: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -504,21 +561,21 @@ fn write_fake_steering_codex(bin: &Path) {
         &fake_codex,
         r#"#!/bin/sh
 stty -echo
-title='fake-codex'
+title='TEST-IDLE'
 status=''
 transcript=''
 draw() {
   printf '\033]0;%s\007\033[H\033[2J\033[3J' "$title"
-  printf '  >_ OpenAI Codex (fake)\n\n%b' "$transcript"
+  printf 'TEST-HEADER\n\n%b' "$transcript"
   [ -n "$status" ] && printf '%s\n\n' "$status"
-  printf '\342\200\272 Ask Codex to do anything\n\n  ? for shortcuts'
+  printf '\342\200\272 TEST-EMPTY\n\n  TEST-FOOTER'
 }
 draw
 while IFS= read -r prompt; do
   case "$prompt" in
     "begin turn")
-      title='⠋ fake-codex'
-      status='• Working (5s • esc to interrupt)'
+      title='TEST-WORKING'
+      status='• TEST-STATUS'
       transcript="$transcript› $prompt\n\n"
       ;;
     "ignore while working") ;;
@@ -540,6 +597,7 @@ fn prompt_steered_into_a_working_codex_turn_is_prompted() {
     let socket_path = runtime_dir.join("herdr.sock");
     let bin = base.join("bin");
     write_fake_steering_codex(&bin);
+    write_synthetic_codex_manifest(&config_home);
     let path = PathBuf::from(format!("{}:/usr/bin:/bin", bin.display()));
     let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&path));
     wait_for_socket(&socket_path, Duration::from_secs(5));
