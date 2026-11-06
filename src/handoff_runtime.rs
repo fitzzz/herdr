@@ -37,6 +37,11 @@ pub(crate) struct HandoffRuntimeState {
     /// process was bound to the pane's launch yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_launch: Option<crate::terminal::state::HandoffAgentLaunch>,
+    /// The admitted `herdr agent start` launch bound to the pane's process,
+    /// by its id and start time. Absent from runtimes written before this
+    /// field existed and when no launch was bound to a process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_incarnation: Option<crate::terminal::launch_incarnation::HandoffLaunchIncarnation>,
     /// Acknowledged input stream state. Exported only after the PTY writer
     /// quiesced, so every admitted write is already on the PTY.
     #[serde(default, skip_serializing_if = "Option::is_none")]

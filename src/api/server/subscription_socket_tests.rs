@@ -220,6 +220,9 @@ fn reply(request: ApiRequestMessage, result: ResponseResult) {
             })
             .unwrap()
         }
+        Some(crate::api::ApiRequestProjection::AgentInputWakeup { .. }) => {
+            panic!("subscriptions never request the agent input wake-up")
+        }
         None => serde_json::to_string(&SuccessResponse {
             id: request.request.id,
             result,

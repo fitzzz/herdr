@@ -2909,7 +2909,14 @@ mod tests {
             .collect();
         assert_eq!(response["result"]["argv"], serde_json::json!(expected));
         let submitted = String::from_utf8(receiver.try_recv().unwrap().to_vec()).unwrap();
-        assert!(submitted.contains("/usr/bin/env -- FIXTURE_ACCOUNT=selected /usr/bin/printf"));
+        // The environment applies to the attesting helper, which execs the
+        // launcher in its own process.
+        assert!(
+            submitted.contains("/usr/bin/env -- FIXTURE_ACCOUNT=selected "),
+            "{submitted}"
+        );
+        assert!(submitted.contains(" __attest-launch nonce_"), "{submitted}");
+        assert!(submitted.contains(" -- /usr/bin/printf"), "{submitted}");
         assert_eq!(
             app.state.terminals[&terminal_id]
                 .agent_launcher
@@ -2945,10 +2952,51 @@ mod tests {
             Some(1),
             Some("startup".into()),
         );
+        // A session nothing ties to the launch's own process does not confirm.
+        let unattributed: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
+        assert_eq!(unattributed["result"]["confirmed"], false, "{unattributed}");
+        // The helper's claim, detection of the claimed process, and the
+        // official report that process sends.
+        let nonce = submitted
+            .split_once(" __attest-launch ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let provider = crate::platform::ProcessInstance {
+            pid: 4242,
+            started: Some(7),
+        };
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        assert!(terminal.launch_awaits_claim(&nonce));
+        terminal
+            .claim_launch_incarnation(provider, 10, Some(10))
+            .unwrap();
+        terminal.observe_agent_process(crate::detect::Agent::Codex, provider);
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_set_foreground_leader(Some(provider));
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.apply_agent_session_report(
+            "herdr:codex".into(),
+            "codex".into(),
+            crate::agent_resume::AgentSessionRef::id("same-uuid"),
+            Some(2),
+            Some("startup".into()),
+            &crate::terminal::SessionReportEvidence::Reporter(vec![provider]),
+        );
         let revision = app.state.terminals[&terminal_id].revision;
         let confirmed: serde_json::Value =
             serde_json::from_str(&app.handle_api_request(lookup())).unwrap();
         assert_eq!(confirmed["result"]["confirmed"], true, "{confirmed}");
+        assert_eq!(
+            confirmed["result"]["binding"]["session_launch_incarnation"],
+            response["result"]["launch_incarnation"]
+        );
         assert_eq!(
             confirmed["result"]["binding"]["session"]["value"],
             "same-uuid"

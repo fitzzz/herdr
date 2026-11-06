@@ -662,6 +662,7 @@ mod tests {
             .next()
             .unwrap();
         pane.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: Vec::new(),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,

@@ -1696,14 +1696,32 @@ fn live_handoff_preserves_agent_launcher_and_requires_fresh_native_observation()
     let receipt = base.join("launcher.json");
     let received = base.join("received");
     let ready = base.join("shell-ready");
-    let fake_provider = base.join("fake-provider.py");
-    fs::create_dir_all(&base).unwrap();
+    // Named `codex` so detection and report attribution identify it, as they
+    // do a real provider. It reports its own session over the API socket, so
+    // the report comes from the launch's own process.
+    let fake_provider = base.join("bin").join("codex");
+    let reported = base.join("reported");
+    fs::create_dir_all(base.join("bin")).unwrap();
     fs::write(
         &fake_provider,
-        r#"import json, os, sys
+        r#"import json, os, socket, sys
 with open(sys.argv[1], 'w') as out:
     json.dump([os.getpid(), sys.argv[4:], os.environ['FIXTURE_ACCOUNT'], os.environ['FIXTURE_REQUIRED'], sys.argv[3]], out)
 for line in sys.stdin:
+    if line.startswith('report '):
+        seq = int(line.split()[1])
+        request = {"id": "session", "method": "pane.report_agent_session", "params": {
+            "pane_id": os.environ['FIXTURE_PANE'], "source": "herdr:codex", "agent": "codex",
+            "seq": seq, "agent_session_id": os.environ['FIXTURE_SESSION'],
+            "session_start_source": "resume"}}
+        api = socket.socket(socket.AF_UNIX)
+        api.connect(os.environ['HERDR_SOCKET_PATH'])
+        api.sendall((json.dumps(request) + '\n').encode())
+        answer = api.makefile().readline()
+        api.close()
+        with open(os.environ['FIXTURE_REPORTED'], 'a') as out:
+            out.write('%d %s' % (seq, answer))
+        continue
     with open(sys.argv[2], 'a') as out:
         out.write(line)
     print('got:' + line.strip(), flush=True)
@@ -1733,7 +1751,8 @@ for line in sys.stdin:
     let launcher = serde_json::json!({
         "executable":"/usr/bin/python3",
         "prefix_args":["-u",fake_provider,receipt,received,"fixture prefix"],
-        "env":{"HERDR_AGENT":"codex","FIXTURE_ACCOUNT":"selected-account","FIXTURE_REQUIRED":"1"}
+        "env":{"HERDR_AGENT":"codex","FIXTURE_ACCOUNT":"selected-account","FIXTURE_REQUIRED":"1",
+            "FIXTURE_PANE":pane,"FIXTURE_SESSION":uuid,"FIXTURE_REPORTED":reported}
     });
     let started = request(
         &api_socket,
@@ -1760,7 +1779,27 @@ for line in sys.stdin:
         "id":"lookup", "method":"agent.launcher_info", "params":{"target":pane}}),
         )
     };
-    let report = |seq| {
+    let token = started["result"]["launch_incarnation"]
+        .as_str()
+        .expect("the start reply carries the launch incarnation")
+        .to_string();
+    // The provider sends the report itself, from the launch's own process.
+    let report = |seq: u64| {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({"id":"report", "method":"pane.send_input", "params":{
+            "pane_id":pane,"text":format!("report {seq}"),"keys":["Enter"]}}),
+        ));
+        wait_for_file_contains(&reported, &format!("{seq} {{"), Duration::from_secs(5));
+        let answer = fs::read_to_string(&reported).unwrap();
+        assert!(
+            !answer.contains("\"error\""),
+            "the provider's report was refused: {answer}"
+        );
+    };
+    // A report the server cannot attribute to the launch's process fills the
+    // session but confirms nothing.
+    let report_from_elsewhere = |seq: u64| {
         assert_ok(request(
             &api_socket,
             serde_json::json!({"id":"session", "method":"pane.report_agent_session", "params":{
@@ -1781,9 +1820,20 @@ for line in sys.stdin:
         );
         thread::sleep(Duration::from_millis(25));
     }
-    report(1);
+    report_from_elsewhere(1);
+    let unattributed = lookup();
+    assert_eq!(unattributed["result"]["confirmed"], false, "{unattributed}");
+    assert_eq!(
+        unattributed["result"]["agent"]["launch_incarnation"],
+        token.as_str()
+    );
+    report(2);
     let before = lookup();
     assert_eq!(before["result"]["confirmed"], true, "{before}");
+    assert_eq!(
+        before["result"]["binding"]["session_launch_incarnation"],
+        token.as_str()
+    );
     assert_eq!(before["result"]["binding"]["launcher"], launcher);
     assert_eq!(
         before["result"]["binding"]["argv"],
@@ -1814,7 +1864,21 @@ for line in sys.stdin:
         0,
         "the provider PID must survive handoff"
     );
-    report(2);
+    // The next server attests the carried launch once its detection sees the
+    // same process, by id and start time.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = lookup();
+        if observed["result"]["agent"]["launch_incarnation"] == token.as_str() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the continuing provider was not attested again: {observed}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    report(3);
     let confirmed = lookup();
     assert_eq!(confirmed["result"]["confirmed"], true, "{confirmed}");
     assert_eq!(confirmed["result"]["binding"], before["result"]["binding"]);

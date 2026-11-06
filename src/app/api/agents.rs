@@ -85,6 +85,10 @@ impl App {
                                 &current.agent,
                             )
                     })
+                // The session was reported by the process of the launch that
+                // still holds the terminal.
+                && agent.launch_incarnation.is_some()
+                && binding.session_launch_incarnation == agent.launch_incarnation
                 && crate::detect::parse_agent_label(&binding.agent).is_some_and(|kind| {
                     self.state
                         .terminals
@@ -103,6 +107,79 @@ impl App {
                 confirmed,
             },
         )
+    }
+
+    /// The launch helper an admitted start typed claims that admission from
+    /// its own process, read from the connection as `peer_ancestry` (the
+    /// sender first). The nonce is spent by this first use whatever the
+    /// outcome; only the pane shell's direct child with a readable start time
+    /// binds the launch. A helper the typed line runs because the shell
+    /// resolved the command itself ends the admission instead.
+    pub(super) fn handle_agent_attest_launch(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAttestLaunchParams,
+        peer_ancestry: Option<&[crate::platform::AncestorProcess]>,
+    ) -> String {
+        let Some(terminal_id) = self
+            .state
+            .terminals
+            .iter()
+            .find(|(_, terminal)| terminal.launch_awaits_claim(&params.nonce))
+            .map(|(terminal_id, _)| terminal_id.clone())
+        else {
+            return encode_error(
+                id,
+                "launch_attestation_refused",
+                "no admitted agent start waits for this attestation",
+            );
+        };
+        let shell = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(crate::terminal::TerminalRuntime::child_pid);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return encode_error(
+                id,
+                "launch_attestation_refused",
+                "the admitted agent start's terminal is gone",
+            );
+        };
+        if params.resolved_by_shell {
+            // The shell runs the command itself, so no process of this
+            // admission can be bound: the launch stays unattested.
+            terminal.admit_launch_incarnation(None);
+            return encode_success(id, ResponseResult::Ok {});
+        }
+        let claimed = match peer_ancestry.and_then(<[_]>::first) {
+            Some(sender) => terminal.claim_launch_incarnation(
+                crate::platform::ProcessInstance {
+                    pid: sender.process.pid,
+                    started: sender.process.started,
+                },
+                sender.parent,
+                shell,
+            ),
+            None => {
+                terminal.admit_launch_incarnation(None);
+                Err(crate::terminal::launch_incarnation::ClaimRefusal::UnknownBirth)
+            }
+        };
+        match claimed {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(refusal) => encode_error(
+                id,
+                "launch_attestation_refused",
+                match refusal {
+                    crate::terminal::launch_incarnation::ClaimRefusal::UnknownBirth => {
+                        "the server could not read the launching process and its start time"
+                    }
+                    crate::terminal::launch_incarnation::ClaimRefusal::NotTheShellsChild => {
+                        "the launching process is not the pane shell's own child"
+                    }
+                },
+            ),
+        }
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
@@ -124,12 +201,19 @@ impl App {
     }
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
-        let (agent, argv) = match self.start_agent(params) {
+        let started = match self.start_agent(params) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
 
-        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+        encode_success(
+            id,
+            ResponseResult::AgentStarted {
+                agent: started.agent,
+                argv: started.argv,
+                launch_incarnation: started.launch_incarnation,
+            },
+        )
     }
 
     pub(super) fn handle_agent_start_with_launcher(
@@ -146,12 +230,13 @@ impl App {
             timeout_ms: params.timeout_ms,
         };
         match self.start_agent_using_launcher(native, Some(launcher.clone())) {
-            Ok((agent, argv)) => encode_success(
+            Ok(started) => encode_success(
                 id,
                 ResponseResult::AgentStartedWithLauncher {
-                    agent,
-                    argv,
+                    agent: started.agent,
+                    argv: started.argv,
                     launcher,
+                    launch_incarnation: started.launch_incarnation,
                 },
             ),
             Err(err) => encode_error_body(id, self.agent_start_error_body(err)),
@@ -170,7 +255,13 @@ impl App {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Ok(())) => encode_success(
+                            id,
+                            ResponseResult::AgentPrompted {
+                                agent,
+                                evidence: None,
+                            },
+                        ),
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }
@@ -434,9 +525,51 @@ impl App {
         id: String,
         params: AgentSendKeysParams,
     ) -> String {
+        if params.expected_launch_incarnation.is_some() {
+            return encode_error(
+                id,
+                "invalid_request",
+                "agent.send_keys with expected_launch_incarnation is handled asynchronously by the app runtime",
+            );
+        }
+        match self.queue_agent_send_keys(id, params) {
+            QueuedKeys::Answered(response) => response,
+            QueuedKeys::Guarded { response, outcome } => response.answer(outcome.recv().ok()),
+        }
+    }
+
+    /// Sends keys guarded by an expected launch. The writer checks the
+    /// launch's process again just before writing, and the reply waits for
+    /// that answer off the app loop.
+    pub(crate) fn handle_deferred_agent_send_keys(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let crate::api::schema::Method::AgentSendKeys(params) = request.method else {
+            return;
+        };
+        match self.queue_agent_send_keys(request.id, params) {
+            QueuedKeys::Answered(response) => {
+                let _ = respond_to.send(response);
+            }
+            QueuedKeys::Guarded { response, outcome } => {
+                std::thread::spawn(move || {
+                    let _ = respond_to.send(response.answer(outcome.recv().ok()));
+                });
+            }
+        }
+    }
+
+    fn queue_agent_send_keys(&mut self, id: String, params: AgentSendKeysParams) -> QueuedKeys {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            Err(err) => {
+                return QueuedKeys::Answered(encode_error_body(
+                    id,
+                    self.agent_target_error_body(err),
+                ))
+            }
         };
         let Some(terminal_id) = self
             .state
@@ -444,7 +577,7 @@ impl App {
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
         else {
-            return agent_not_found(id, &params.target);
+            return QueuedKeys::Answered(agent_not_found(id, &params.target));
         };
         let Some(expected_agent) = self
             .state
@@ -452,40 +585,126 @@ impl App {
             .get(terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
-            return agent_not_ready(id, &params.target);
+            return QueuedKeys::Answered(agent_not_ready(id, &params.target));
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
+            return QueuedKeys::Answered(agent_not_found(id, &params.target));
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return agent_not_ready(id, &params.target);
+            return QueuedKeys::Answered(agent_not_ready(id, &params.target));
         }
         let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
             Ok(encoded) => encoded,
             Err(key) => {
-                return encode_error(id, "invalid_key", format!("unsupported key {key}"));
+                return QueuedKeys::Answered(encode_error(
+                    id,
+                    "invalid_key",
+                    format!("unsupported key {key}"),
+                ));
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        // Checked in the same step that enqueues the bytes: a replacement
-        // native session can only be recorded by another app-loop step, so it
-        // cannot land between this comparison and the write.
+        // Both guards are checked in the same app-loop step that enqueues the
+        // bytes, so no recorded session or launch can change in between. The
+        // launch guard also proves, from the process table read now, that the
+        // launch's own process leads the terminal's foreground, and the
+        // writer proves it again just before writing: a replacement the
+        // shell started may not have been observed yet.
+        let terminal = self.state.terminals.get(terminal_id);
         if let Some(expected) = params.expected_session.as_deref() {
-            let current = self
-                .state
-                .terminals
-                .get(terminal_id)
+            let current = terminal
                 .and_then(super::super::creation::terminal_agent_session_info)
                 .map(|session| session.value);
             if current.as_deref() != Some(expected) {
-                return agent_session_mismatch(id, &params.target, expected, current.as_deref());
+                return QueuedKeys::Answered(agent_session_mismatch(
+                    id,
+                    &params.target,
+                    expected,
+                    current.as_deref(),
+                ));
             }
         }
+        if let Some(expected) = params.expected_launch_incarnation {
+            let current = self.current_launch(terminal_id.as_str());
+            let Some((_, process)) = current.filter(|(token, _)| *token == expected) else {
+                let current = current.map(|(token, _)| token);
+                return QueuedKeys::Answered(agent_launch_mismatch(
+                    id,
+                    &params.target,
+                    &expected,
+                    current,
+                ));
+            };
+            return match runtime.queue_guarded_user_input(Bytes::from(bytes), process) {
+                Ok(outcome) => QueuedKeys::Guarded {
+                    response: GuardedKeysResponse {
+                        id,
+                        target: params.target,
+                        expected,
+                    },
+                    outcome,
+                },
+                Err(err) => QueuedKeys::Answered(encode_error(
+                    id,
+                    "agent_send_keys_failed",
+                    err.to_string(),
+                )),
+            };
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            return encode_error(id, "agent_send_keys_failed", err.to_string());
+            return QueuedKeys::Answered(encode_error(
+                id,
+                "agent_send_keys_failed",
+                err.to_string(),
+            ));
         }
 
-        encode_success(id, ResponseResult::Ok {})
+        QueuedKeys::Answered(encode_success(id, ResponseResult::Ok {}))
+    }
+}
+
+/// What queueing keys produced: an answer now, or a guarded write whose
+/// answer comes from the writer.
+enum QueuedKeys {
+    Answered(String),
+    Guarded {
+        response: GuardedKeysResponse,
+        outcome: std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>,
+    },
+}
+
+/// The reply owed for a guarded write once the writer answers.
+struct GuardedKeysResponse {
+    id: String,
+    target: String,
+    expected: String,
+}
+
+impl GuardedKeysResponse {
+    /// `None` means the writer closed without answering, so whether any of
+    /// the keys reached the terminal is unknown.
+    fn answer(self, outcome: Option<crate::pty::actor::GuardedWrite>) -> String {
+        match outcome {
+            Some(crate::pty::actor::GuardedWrite::Written) => {
+                encode_success(self.id, ResponseResult::Ok {})
+            }
+            Some(crate::pty::actor::GuardedWrite::Refused) => {
+                agent_launch_mismatch(self.id, &self.target, &self.expected, None)
+            }
+            Some(crate::pty::actor::GuardedWrite::Stopped { written, total }) => encode_error(
+                self.id,
+                "agent_send_keys_interrupted",
+                format!(
+                    "agent {} stopped running the expected launch {} while its keys were written; {written} of {total} bytes were written and the rest were not sent",
+                    self.target, self.expected
+                ),
+            ),
+            None => encode_error(
+                self.id,
+                "agent_send_keys_failed",
+                "the terminal writer stopped before confirming the write; some keys may have been sent",
+            ),
+        }
     }
 }
 
@@ -512,6 +731,23 @@ fn agent_session_mismatch(
         ),
     };
     encode_error(id, "agent_session_mismatch", message)
+}
+
+fn agent_launch_mismatch(
+    id: String,
+    target: &str,
+    expected: &str,
+    current: Option<&str>,
+) -> String {
+    let message = match current {
+        Some(current) => format!(
+            "agent {target} runs launch {current}, not the expected launch {expected}; no keys were sent"
+        ),
+        None => format!(
+            "agent {target} runs no attested launch, not the expected launch {expected}; no keys were sent"
+        ),
+    };
+    encode_error(id, "agent_launch_mismatch", message)
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -1011,6 +1247,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
                 expected_session: None,
+                expected_launch_incarnation: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -1023,6 +1260,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
                 expected_session: None,
+                expected_launch_incarnation: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
@@ -1088,6 +1326,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["esc".into()],
                 expected_session: expected_session.map(str::to_string),
+                expected_launch_incarnation: None,
             },
         )
     }
@@ -1336,3 +1575,7 @@ contains = ["TEST-DRAFT"]
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_launch_incarnation_tests.rs"]
+mod launch_incarnation_tests;

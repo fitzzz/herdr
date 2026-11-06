@@ -3124,6 +3124,7 @@ mod tests {
             env: Default::default(),
         };
         crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: launcher.argv(native),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,

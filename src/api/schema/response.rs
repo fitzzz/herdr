@@ -39,6 +39,18 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// How `agent.prompt` observed acceptance when the submission alone did not show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptEvidence {
+    /// The prompt sat unread in the agent's terminal input queue until Herdr
+    /// wrote one focus-in report; the agent then read it and started its turn.
+    ReleasedAfterWakeup,
+    /// Evidence named by a newer server. The prompt was still accepted.
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
@@ -100,11 +112,20 @@ pub enum ResponseResult {
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+        /// The token of this admission. Record it now: `agent.launch_incarnation`
+        /// reports it only once Herdr has seen the launch's own process, and
+        /// never again after that process is gone. Absent where Herdr cannot
+        /// attest a launch (Windows).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_incarnation: Option<String>,
     },
     AgentStartedWithLauncher {
         agent: AgentInfo,
         argv: Vec<String>,
         launcher: super::agents::AgentLauncher,
+        /// As for `AgentStarted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_incarnation: Option<String>,
     },
     AgentLauncherInfo {
         agent: AgentInfo,
@@ -113,6 +134,9 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+        /// Present only when acceptance needed more than the submission itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<AgentPromptEvidence>,
     },
     AgentList {
         agents: Vec<AgentInfo>,

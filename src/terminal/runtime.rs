@@ -331,6 +331,16 @@ impl TerminalRuntime {
         self.0.mouse_reporting_enabled()
     }
 
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.0.focus_reporting_enabled()
+    }
+
+    /// Bytes written to the PTY that its program has not read yet, or `None`
+    /// when the platform cannot measure them. Waits for the PTY actor.
+    pub fn unread_input_bytes(&self) -> Option<usize> {
+        self.0.unread_input_bytes()
+    }
+
     pub fn sgr_pixel_mouse_enabled(&self) -> bool {
         self.0.sgr_pixel_mouse_enabled()
     }
@@ -607,6 +617,21 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// The process leading the terminal's foreground process group now.
+    pub(crate) fn foreground_leader(&self) -> Option<crate::platform::ProcessInstance> {
+        self.0.foreground_leader()
+    }
+
+    /// Queues `bytes` to be written only while `process` leads the
+    /// terminal's foreground process group when the writer reaches them.
+    pub(crate) fn queue_guarded_user_input(
+        &self,
+        bytes: bytes::Bytes,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>> {
+        self.0.queue_guarded_user_input(bytes, process)
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -661,6 +686,13 @@ impl TerminalRuntime {
 
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.0.test_set_child_pid(pid);
+    }
+
+    pub(crate) fn test_set_foreground_leader(
+        &self,
+        process: Option<crate::platform::ProcessInstance>,
+    ) {
+        self.0.test_set_foreground_leader(process);
     }
 
     pub(crate) fn test_with_scrollback_bytes(

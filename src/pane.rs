@@ -297,22 +297,24 @@ async fn publish_agent_process_detected_event(
 /// the program its command line ran (`argv[0]`) when it was read.
 type PublishedAgentLaunch = (Agent, crate::platform::ProcessInstance, Option<String>);
 
-/// Claude, Codex, Grok and OpenCode restore repeats the options read from the agent's
-/// command line, so each new agent process is reported once, also when a wrapper runs
-/// one after another in the same process group, or a later process reuses the
-/// id (told apart by its start time). A process is reported once more when a
-/// later probe reads a command line it could not read before (the read is
-/// skipped while the process sleeps uninterruptibly), and when its program
-/// changed, as when a launcher script execs the agent in its own process.
-/// Returns the observation to publish, if any.
+/// Each new agent process is reported once, of any agent kind: a launch
+/// incarnation is attested only while detection shows its own process (see
+/// [`crate::terminal::launch_incarnation`]), and Claude, Codex, Grok and
+/// OpenCode restore repeats the options read from the agent's command line.
+/// A process is new also when a wrapper runs one after another in the same
+/// process group, or a later process reuses the id (told apart by its start
+/// time). A process is reported once more when a later probe reads a command
+/// line it could not read before (the read is skipped while the process
+/// sleeps uninterruptibly), and when its program changed, as when a launcher
+/// script execs the agent in its own process. Returns the observation to
+/// publish, if any.
 fn agent_launch_observation(
     agent: Option<Agent>,
     agent_process: Option<crate::platform::ProcessInstance>,
     argv: Option<&[String]>,
     last_published: &mut Option<PublishedAgentLaunch>,
 ) -> Option<(Agent, crate::platform::ProcessInstance)> {
-    let Some(agent) = agent.filter(|agent| crate::agent_resume::carries_launch_options(*agent))
-    else {
+    let Some(agent) = agent else {
         *last_published = None;
         return None;
     };
@@ -1531,6 +1533,8 @@ enum PaneRuntimeIo {
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        /// The process a test makes lead the foreground; none by default.
+        foreground: Mutex<Option<crate::platform::ProcessInstance>>,
     },
 }
 
@@ -1584,6 +1588,15 @@ impl PaneRuntimeIo {
         };
         crate::render_prof::duration_since("metadata.foreground_actor_request", started);
         result
+    }
+
+    #[cfg(unix)]
+    fn unread_input_bytes(&self) -> Option<usize> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.unread_input_bytes(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => None,
+        }
     }
 
     #[cfg(unix)]
@@ -1677,6 +1690,42 @@ impl PaneRuntimeIo {
                 if let Some(bytes) = response() {
                     let _ = sender.try_send(bytes);
                 }
+            }
+        }
+    }
+
+    fn queue_guarded_user_input(
+        &self,
+        bytes: Bytes,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>> {
+        match self {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => actor.queue_guarded_user_input(bytes, process),
+            #[cfg(windows)]
+            PaneRuntimeIo::Actor(_) => {
+                let _ = (bytes, process);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "guarded writes need a terminal with process groups",
+                ))
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel {
+                sender, foreground, ..
+            } => {
+                // Checked when the write happens, as the PTY actor does.
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                let leader = *foreground
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if crate::terminal::launch_incarnation::leads_foreground(process, leader) {
+                    sender.try_send(bytes).map_err(std::io::Error::other)?;
+                    let _ = reply_tx.send(crate::pty::actor::GuardedWrite::Written);
+                } else {
+                    let _ = reply_tx.send(crate::pty::actor::GuardedWrite::Refused);
+                }
+                Ok(reply_rx)
             }
         }
     }
@@ -2356,6 +2405,7 @@ impl PaneRuntime {
             initial_history_ansi: None,
             agent_state: None,
             agent_launch: None,
+            launch_incarnation: None,
             input_streams: Some(Box::new(self.input_streams.lock().export_for_handoff())),
         }
     }
@@ -2572,6 +2622,7 @@ impl PaneRuntime {
             initial_history_ansi,
             agent_state: _,
             agent_launch: _,
+            launch_incarnation: _,
             input_streams,
         } = state;
         let input_streams = crate::terminal::input_streams::TerminalInputStreams::from_table(
@@ -3780,6 +3831,40 @@ impl PaneRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
+    /// Queues `bytes` to be written only while `process` leads the pane's
+    /// foreground process group, checked by the writer just before writing.
+    pub(crate) fn queue_guarded_user_input(
+        &self,
+        bytes: Bytes,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>> {
+        self.io.queue_guarded_user_input(bytes, process)
+    }
+
+    /// The process leading the pane's foreground process group now, with
+    /// its start time; `None` when it cannot be read.
+    pub(crate) fn foreground_leader(&self) -> Option<crate::platform::ProcessInstance> {
+        #[cfg(test)]
+        if let PaneRuntimeIo::TestChannel { foreground, .. } = &self.io {
+            return *foreground
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        #[cfg(unix)]
+        {
+            self.io
+                .foreground_process_group_id(
+                    self.child_pid.load(Ordering::Acquire),
+                    self.cwd_process_exited.load(Ordering::Acquire),
+                )
+                .and_then(crate::terminal::launch_incarnation::group_leader)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.try_send_bytes(self.paste_payload(text))
     }
@@ -3793,6 +3878,19 @@ impl PaneRuntime {
             text
         };
         Bytes::from(payload)
+    }
+
+    /// Bytes written to this pane's PTY that its program has not read yet, or
+    /// `None` when the platform cannot measure them.
+    pub fn unread_input_bytes(&self) -> Option<usize> {
+        #[cfg(unix)]
+        {
+            self.io.unread_input_bytes()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
@@ -4053,6 +4151,18 @@ impl PaneRuntime {
         self.child_pid.store(pid, Ordering::Release);
     }
 
+    /// Makes `process` the one a test channel reports leading the foreground.
+    pub(crate) fn test_set_foreground_leader(
+        &self,
+        process: Option<crate::platform::ProcessInstance>,
+    ) {
+        if let PaneRuntimeIo::TestChannel { foreground, .. } = &self.io {
+            *foreground
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = process;
+        }
+    }
+
     pub(crate) fn test_process_pty_bytes(&self, bytes: &[u8]) {
         let _content_write_guard = match self.content_write_lock.lock() {
             Ok(guard) => guard,
@@ -4099,6 +4209,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    foreground: Mutex::new(None),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -5475,6 +5586,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                foreground: Mutex::new(None),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5516,6 +5628,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                foreground: Mutex::new(None),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5953,7 +6066,8 @@ mod tests {
                 crate::platform::ProcessInstance::unknown_start(11)
             ))
         );
-        // Other agents carry no launch options and reset the tracking.
+        // Agents without launch options are reported too, for their launch
+        // incarnation.
         assert_eq!(
             agent_launch_observation(
                 Some(Agent::Pi),
@@ -5961,9 +6075,11 @@ mod tests {
                 Some(&claude_argv),
                 &mut last
             ),
-            None
+            Some((
+                Agent::Pi,
+                crate::platform::ProcessInstance::unknown_start(12)
+            ))
         );
-        assert_eq!(last, None);
         assert_eq!(
             agent_launch_observation(
                 None,

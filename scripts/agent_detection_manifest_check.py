@@ -48,7 +48,7 @@ COMPOSER_KEYS = {
 }
 GATE_KEYS = {"all", "any", "not", "contains", "regex", "line_regex"}
 STATES = {"idle", "working", "blocked", "unknown"}
-COMPOSER_STATES = {"selection_list", "partial_command", "draft", "queued_evidence"}
+COMPOSER_STATES = {"selection_list", "partial_command", "draft", "queued_evidence", "submitted_evidence"}
 REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
     r"before_current_prompt_marker|current_prompt_block_marker|after_current_prompt_block_marker|"
@@ -81,10 +81,11 @@ STAGED_PUBLISHED_MANIFESTS = {
         "2026.09.18.1",
         "0f31b111144900b02f303577d27587f72d58d8c505185a682bd7887f822316ee",
     ),
-    # Codex's engine-4 composer rules stay bundled until a released client
-    # carries engine 4. Published clients keep the engine-3 catalog manifest.
+    # Codex's composer rules need engine 4, and its submitted_evidence rule
+    # engine 5. They stay bundled until a released client carries engine 5;
+    # published clients keep the engine-3 catalog manifest.
     "codex": (
-        "2026.10.29.1",
+        "2026.11.06.1",
         "2026.10.11.1",
         "d25cfddb5434259303fb0ac27b5b0e6d0558408e6901ee112bcd53de02bcda13",
     ),
@@ -197,6 +198,11 @@ def validate_manifest(path: Path, engine_version: int) -> dict:
         raise CheckError(f"{path}: manifest exceeds max composer rule count {MAX_RULES_PER_MANIFEST}")
     if composer and min_engine < 4:
         raise CheckError(f"{path}: composer rules require min_engine_version 4")
+    # Engine 4 deserializes only the original composer states.
+    if min_engine < 5 and any(
+        isinstance(rule, dict) and rule.get("state") == "submitted_evidence" for rule in composer
+    ):
+        raise CheckError(f"{path}: submitted_evidence composer rules require min_engine_version 5")
     for index, rule in enumerate(composer):
         validate_composer(path, index, rule, complexity)
 
@@ -228,9 +234,10 @@ def validate_composer(path: Path, index: int, rule: object, complexity: dict[str
     requires_submitted_text = rule.get("requires_submitted_text", False)
     if not isinstance(requires_submitted_text, bool):
         raise CheckError(f"{path}: composer rule {rule_id} requires_submitted_text must be a boolean")
-    if requires_submitted_text and state != "queued_evidence":
+    if requires_submitted_text and state not in {"queued_evidence", "submitted_evidence"}:
         raise CheckError(
-            f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state queued_evidence"
+            f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state "
+            "queued_evidence or submitted_evidence"
         )
     validate_gate(
         path,

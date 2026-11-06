@@ -88,6 +88,8 @@ impl HeadlessServer {
                 terminal.and_then(|terminal| terminal.handoff_agent_state());
             handoff_runtime.agent_launch =
                 terminal.and_then(|terminal| terminal.handoff_agent_launch());
+            handoff_runtime.launch_incarnation =
+                terminal.and_then(|terminal| terminal.handoff_launch_incarnation());
             let has_agent_session =
                 terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
             if !has_agent_session {

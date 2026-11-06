@@ -648,7 +648,9 @@ fn restore_tab(
             terminal.restore_error = Some(placeholder.state.restore_error);
             terminal.manual_label = placeholder.state.label;
             terminal.launch_argv = saved_pane.and_then(|pane| pane.launch_argv.clone());
-            terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
+            terminal.agent_launcher = saved_pane
+                .and_then(|pane| pane.agent_launcher.clone())
+                .map(crate::agent_launcher::BoundAgentLauncher::without_launch_evidence);
             terminal.begin_handoff_observation_epoch(placeholder.observation_epoch);
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
@@ -758,6 +760,12 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        // The launch the old server bound to the pane's process; attested
+        // again only when detection identifies that same process.
+        #[cfg(unix)]
+        let handed_off_launch_incarnation = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.launch_incarnation.clone());
         // The handoff pane's agent runs on, paired as the old server left it.
         #[cfg(unix)]
         let handed_off_launch = imported_runtime
@@ -821,7 +829,9 @@ fn restore_tab(
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
             terminal.agent_launch_restore = startup.launch_options_restore;
-            terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
+            terminal.agent_launcher = saved_pane
+                .and_then(|pane| pane.agent_launcher.clone())
+                .map(crate::agent_launcher::BoundAgentLauncher::without_launch_evidence);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -925,7 +935,17 @@ fn restore_tab(
                 #[cfg(not(unix))]
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
-                terminal.agent_launcher = saved_pane.and_then(|pane| pane.agent_launcher.clone());
+                // Only a live handoff keeps the process that sent the report a
+                // binding's launch evidence came from.
+                terminal.agent_launcher = saved_pane
+                    .and_then(|pane| pane.agent_launcher.clone())
+                    .map(|binding| {
+                        if was_imported {
+                            binding
+                        } else {
+                            binding.without_launch_evidence()
+                        }
+                    });
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -973,6 +993,10 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(epoch) = observation_epoch {
                     terminal.begin_handoff_observation_epoch(epoch);
+                }
+                #[cfg(unix)]
+                if let Some(carried) = handed_off_launch_incarnation {
+                    terminal.restore_handoff_launch_incarnation(carried);
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -2181,6 +2205,7 @@ mod tests {
         env_value_len: usize,
     ) -> crate::agent_launcher::BoundAgentLauncher {
         crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: Vec::new(),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
@@ -3362,6 +3387,7 @@ mod tests {
         let terminal = terminals.values_mut().next().unwrap();
         record(terminal);
         let agent_launch = terminal.handoff_agent_launch();
+        let launch_incarnation = terminal.handoff_launch_incarnation();
         let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
         let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
         let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
@@ -3372,6 +3398,7 @@ mod tests {
             .unwrap();
         let mut state = runtime.handoff_runtime_state(pane_id.raw());
         state.agent_launch = agent_launch;
+        state.launch_incarnation = launch_incarnation;
         export(&mut state);
         let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
         let mut imports = HashMap::from([(
@@ -3587,6 +3614,130 @@ mod tests {
                 "{resumed:?}"
             );
         }
+    }
+
+    /// The old server's admitted launch, claimed by process 4242 and seen by
+    /// detection, with a launcher binding its process reported a session for.
+    #[cfg(unix)]
+    fn attested_launch_with_binding(terminal: &mut TerminalState) -> String {
+        let provider = crate::platform::ProcessInstance {
+            pid: 4242,
+            started: Some(7),
+        };
+        let (launch, _) = crate::terminal::launch_incarnation::LaunchIncarnation::admit(
+            crate::detect::Agent::Codex,
+        );
+        let token = launch.token().to_string();
+        terminal.admit_launch_incarnation(Some(launch));
+        terminal
+            .claim_launch_incarnation(provider, 10, Some(10))
+            .unwrap();
+        terminal.observe_agent_process(crate::detect::Agent::Codex, provider);
+        assert_eq!(terminal.launch_incarnation(), Some(token.as_str()));
+        terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            launcher: crate::api::schema::AgentLauncher {
+                executable: "/bin/sh".into(),
+                prefix_args: Vec::new(),
+                env: Default::default(),
+            },
+            agent: "codex".into(),
+            session: crate::agent_resume::AgentSessionRef::id("carried-session"),
+            argv: vec!["/bin/sh".into()],
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            observed: true,
+            session_launch_incarnation: Some(token.clone()),
+        });
+        token
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_attests_the_carried_launch_only_for_its_continuing_process() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let mut token = String::new();
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            token = attested_launch_with_binding(terminal);
+        })
+        .await;
+        assert_eq!(
+            terminal.launch_incarnation(),
+            None,
+            "the next server attests nothing it has not seen itself"
+        );
+        assert_eq!(
+            terminal
+                .agent_launcher
+                .as_ref()
+                .and_then(|binding| binding.session_launch_incarnation.as_deref()),
+            Some(token.as_str()),
+            "a live handoff keeps the binding's launch evidence"
+        );
+        terminal.observe_agent_process(
+            crate::detect::Agent::Codex,
+            crate::platform::ProcessInstance {
+                pid: 4242,
+                started: Some(7),
+            },
+        );
+        assert_eq!(terminal.launch_incarnation(), Some(token.as_str()));
+
+        // A process with the carried id but another start time is not it.
+        let mut terminal = handed_off(&snapshot, |terminal| {
+            attested_launch_with_binding(terminal);
+        })
+        .await;
+        terminal.observe_agent_process(
+            crate::detect::Agent::Codex,
+            crate::platform::ProcessInstance {
+                pid: 4242,
+                started: Some(8),
+            },
+        );
+        assert_eq!(terminal.launch_incarnation(), None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_cold_restore_revives_no_launch_and_no_binding_launch_evidence() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let (events, _events_rx) = mpsc::channel(32);
+        let restore_once = |snapshot: &SessionSnapshot| {
+            restore(
+                snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+        };
+        let (workspaces, mut terminals, runtimes) = restore_once(&snapshot);
+        attested_launch_with_binding(terminals.values_mut().next().unwrap());
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        assert!(
+            serde_json::to_string(&saved)
+                .unwrap()
+                .contains("session_launch_incarnation"),
+            "the saved binding records the launch evidence"
+        );
+        drop(runtimes);
+
+        let (_, restored, restored_runtimes) = restore_once(&saved);
+        let terminal = restored.values().next().unwrap();
+        assert_eq!(terminal.launch_incarnation(), None);
+        assert_eq!(terminal.handoff_launch_incarnation(), None);
+        let binding = terminal
+            .agent_launcher
+            .as_ref()
+            .expect("the binding is kept");
+        assert_eq!(binding.session_launch_incarnation, None);
+        drop(restored_runtimes);
     }
 
     #[tokio::test]

@@ -73,6 +73,13 @@ pub(crate) struct PtyIoActorConfig {
 
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
+    /// Written only while `process` still leads the terminal's foreground
+    /// process group, checked immediately before the first byte is written.
+    WriteGuarded {
+        bytes: Bytes,
+        process: crate::platform::ProcessInstance,
+        reply: std_mpsc::Sender<super::GuardedWrite>,
+    },
     SubmitUserInput {
         text: Bytes,
         enter: Bytes,
@@ -85,6 +92,7 @@ enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
+    UnreadInputBytes(std_mpsc::Sender<Option<usize>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
     ReleaseAfterCommit(std_mpsc::Sender<std::io::Result<()>>),
     Shutdown,
@@ -138,6 +146,44 @@ impl PtyIoActorHandle {
                 Err(mpsc::error::TrySendError::Closed(bytes))
             }
         }
+    }
+
+    /// Queues `bytes` to be written only if `process`, by id and start time,
+    /// still leads the terminal's foreground process group when the actor is
+    /// about to write them. The receiver answers whether they were written;
+    /// it closes without an answer when the write failed or was dropped.
+    pub(crate) fn queue_guarded_user_input(
+        &self,
+        bytes: Bytes,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std_mpsc::Receiver<super::GuardedWrite>> {
+        let user_writes = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !user_writes.accepting {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pty actor closed",
+            ));
+        }
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.data_tx
+            .try_send(PtyIoDataCommand::WriteGuarded {
+                bytes,
+                process,
+                reply: reply_tx,
+            })
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    std::io::Error::new(std::io::ErrorKind::WouldBlock, "pty input queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pty actor closed")
+                }
+            })?;
+        self.wake_actor();
+        Ok(reply_rx)
     }
 
     pub(crate) fn queue_user_input_submission(
@@ -308,6 +354,16 @@ impl PtyIoActorHandle {
         reply_rx.recv_timeout(Duration::from_secs(1)).ok()?
     }
 
+    /// Bytes this PTY's terminal side has not read yet; `None` when unknown.
+    pub(crate) fn unread_input_bytes(&self) -> Option<usize> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.control_tx
+            .send(PtyIoControlCommand::UnreadInputBytes(reply_tx))
+            .ok()?;
+        self.wake_actor();
+        reply_rx.recv_timeout(Duration::from_secs(1)).ok()?
+    }
+
     pub(crate) fn rollback_handoff(&self) -> std::io::Result<()> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.control_tx
@@ -469,7 +525,23 @@ struct ActiveSubmission {
 struct PendingWrite {
     bytes: Bytes,
     boundary: Option<SubmissionBoundary>,
+    guard: Option<WriteGuard>,
 }
+
+/// The process a guarded write may reach, and where its outcome goes.
+#[derive(Debug)]
+struct WriteGuard {
+    process: crate::platform::ProcessInstance,
+    reply: std_mpsc::Sender<super::GuardedWrite>,
+}
+
+impl PartialEq for WriteGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.process == other.process
+    }
+}
+
+impl Eq for WriteGuard {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionBoundary {
@@ -489,6 +561,7 @@ impl PtyIoActorRunner {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: None,
+                guard: None,
             });
         }
     }
@@ -498,6 +571,7 @@ impl PtyIoActorRunner {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: Some(boundary),
+                guard: None,
             });
         }
     }
@@ -641,6 +715,20 @@ impl PtyIoActorRunner {
                     self.enqueue_write(bytes);
                 }
             }
+            PtyIoDataCommand::WriteGuarded {
+                bytes,
+                process,
+                reply,
+            } => {
+                // A closed reply without an answer reports the write as failed.
+                if self.state == ActorState::Running {
+                    self.pending_writes.push_back(PendingWrite {
+                        bytes,
+                        boundary: None,
+                        guard: Some(WriteGuard { process, reply }),
+                    });
+                }
+            }
             PtyIoDataCommand::SubmitUserInput {
                 text,
                 enter,
@@ -690,6 +778,11 @@ impl PtyIoActorRunner {
                 let result =
                     crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd());
                 let _ = reply.send(result);
+            }
+            PtyIoControlCommand::UnreadInputBytes(reply) => {
+                let _ = reply.send(crate::platform::pty_unread_input_bytes(
+                    self.file.as_raw_fd(),
+                ));
             }
             PtyIoControlCommand::RollbackHandoff(reply) => {
                 self.pending_handoff.take();
@@ -930,6 +1023,30 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
+            // A guarded write is checked before every write attempt, a
+            // continuation after a short write included: the process it was
+            // meant for must still lead the foreground. A failed check stops
+            // the rest; the reply says how much was already written.
+            if let Some(guard) = write.guard.as_ref() {
+                let leader =
+                    crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd())
+                        .and_then(crate::terminal::launch_incarnation::group_leader);
+                if !crate::terminal::launch_incarnation::leads_foreground(guard.process, leader) {
+                    let stopped = self.pending_writes.pop_front().unwrap();
+                    let written = std::mem::take(&mut self.current_write_offset);
+                    if let Some(guard) = stopped.guard {
+                        let _ = guard.reply.send(if written == 0 {
+                            super::GuardedWrite::Refused
+                        } else {
+                            super::GuardedWrite::Stopped {
+                                written,
+                                total: stopped.bytes.len(),
+                            }
+                        });
+                    }
+                    continue;
+                }
+            }
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.write(chunk) {
                 Ok(0) => {
@@ -943,6 +1060,9 @@ impl PtyIoActorRunner {
                     if self.current_write_offset >= write.bytes.len() {
                         let completed = self.pending_writes.pop_front().unwrap();
                         self.current_write_offset = 0;
+                        if let Some(guard) = completed.guard {
+                            let _ = guard.reply.send(super::GuardedWrite::Written);
+                        }
                         if let Some(boundary) = completed.boundary {
                             self.file.flush()?;
                             return Ok(Some(boundary));
@@ -1093,10 +1213,14 @@ mod tests {
             .set_nonblocking(true)
             .expect("actor socket nonblocking");
         let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        (actor_runner_for_fd(owned), peer)
+    }
+
+    fn actor_runner_for_fd(owned: OwnedFd) -> PtyIoActorRunner {
         let (_data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
         let (_control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
-        let runner = PtyIoActorRunner {
+        PtyIoActorRunner {
             pane_id: 1,
             file: std::fs::File::from(owned),
             data_rx,
@@ -1112,8 +1236,162 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+        }
+    }
+
+    /// The process leading the foreground of the terminal behind `fd`, once
+    /// `ready` accepts it.
+    #[cfg(target_os = "linux")]
+    fn foreground_leader_once(
+        fd: std::os::fd::RawFd,
+        ready: impl Fn(&crate::platform::ProcessInstance) -> bool,
+    ) -> crate::platform::ProcessInstance {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(leader) = crate::platform::foreground_process_group_id_for_tty_fd(fd)
+                .and_then(crate::terminal::launch_incarnation::group_leader)
+                .filter(|leader| leader.started.is_some() && ready(leader))
+            {
+                return leader;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the foreground job never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A guarded write proves its process at the moment it is written, not
+    /// when it was queued: the job it was meant for can be replaced while it
+    /// waits in the writer's queue.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guarded_write_reaches_only_the_process_still_leading_the_foreground() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        // Job control puts each job in its own foreground group, as in a
+        // pane shell: a first job, and the replacement the shell runs next.
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "set -m; sleep 1000; sleep 1000"]);
+        let mut shell = pair.slave.spawn_command(cmd).expect("shell");
+        let shell_pid = shell.process_id().expect("shell pid");
+        let master = pair.master.as_raw_fd().expect("master fd");
+        let owned = unsafe { OwnedFd::from_raw_fd(libc::dup(master)) };
+        let mut runner = actor_runner_for_fd(owned);
+        let fd = runner.file.as_raw_fd();
+
+        let first = foreground_leader_once(fd, |leader| leader.pid != shell_pid);
+        let guarded = |process| {
+            let (reply, outcome) = std_mpsc::channel();
+            let command = PtyIoDataCommand::WriteGuarded {
+                bytes: Bytes::from_static(b"x"),
+                process,
+                reply,
+            };
+            (command, outcome)
         };
-        (runner, peer)
+
+        let (command, written) = guarded(first);
+        runner.handle_data_command(command);
+        runner.flush_pending_writes_once().unwrap();
+        assert_eq!(written.try_recv(), Ok(super::super::GuardedWrite::Written));
+
+        // Queued while the first job leads, then the job is replaced.
+        let (command, refused) = guarded(first);
+        runner.handle_data_command(command);
+        let (command, reused) = guarded(crate::platform::ProcessInstance {
+            pid: first.pid,
+            started: first.started.map(|started| started + 1),
+        });
+        runner.handle_data_command(command);
+        unsafe { libc::kill(first.pid as libc::pid_t, libc::SIGKILL) };
+        let second = foreground_leader_once(fd, |leader| {
+            leader.pid != shell_pid && leader.pid != first.pid
+        });
+        let (command, replacement) = guarded(second);
+        runner.handle_data_command(command);
+        runner.flush_pending_writes_once().unwrap();
+        assert_eq!(refused.try_recv(), Ok(super::super::GuardedWrite::Refused));
+        assert_eq!(reused.try_recv(), Ok(super::super::GuardedWrite::Refused));
+        assert_eq!(
+            replacement.try_recv(),
+            Ok(super::super::GuardedWrite::Written)
+        );
+        assert!(runner.pending_writes.is_empty());
+
+        unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
+        shell.kill().ok();
+        shell.wait().ok();
+    }
+
+    /// A guarded write too large for the terminal's input queue is written
+    /// in parts. The process is proved before every part: once a
+    /// replacement leads the foreground, the rest is not sent, and the
+    /// answer says how much was written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guarded_write_spanning_a_foreground_replacement_stops_at_the_replacement() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "set -m; sleep 1000; sleep 1000"]);
+        let mut shell = pair.slave.spawn_command(cmd).expect("shell");
+        let shell_pid = shell.process_id().expect("shell pid");
+        let master = pair.master.as_raw_fd().expect("master fd");
+        let owned = unsafe { OwnedFd::from_raw_fd(libc::dup(master)) };
+        fd::set_nonblocking(owned.as_raw_fd()).expect("nonblocking master");
+        let mut runner = actor_runner_for_fd(owned);
+        let fd = runner.file.as_raw_fd();
+        let first = foreground_leader_once(fd, |leader| leader.pid != shell_pid);
+
+        // No job reads the terminal, so its input queue fills part way.
+        let total = 256 * 1024;
+        let (reply, outcome) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::WriteGuarded {
+            bytes: Bytes::from(vec![b'\r'; total]),
+            process: first,
+            reply,
+        });
+        runner.flush_pending_writes_once().unwrap();
+        let written = runner.current_write_offset;
+        assert!(
+            written > 0 && written < total,
+            "the write is only partly done: {written} of {total}"
+        );
+        assert!(outcome.try_recv().is_err(), "no answer while writing");
+
+        unsafe { libc::kill(first.pid as libc::pid_t, libc::SIGKILL) };
+        let second = foreground_leader_once(fd, |leader| {
+            leader.pid != shell_pid && leader.pid != first.pid
+        });
+        runner.flush_pending_writes_once().unwrap();
+        assert_eq!(
+            outcome.try_recv(),
+            Ok(super::super::GuardedWrite::Stopped { written, total })
+        );
+        assert!(runner.pending_writes.is_empty(), "the rest is dropped");
+        assert_eq!(runner.current_write_offset, 0);
+
+        unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
+        shell.kill().ok();
+        shell.wait().ok();
     }
 
     #[test]
@@ -1726,10 +2004,12 @@ mod tests {
                 PendingWrite {
                     bytes: Bytes::from_static(b"live-light"),
                     boundary: None,
+                    guard: None,
                 },
                 PendingWrite {
                     bytes: Bytes::from_static(b"query-light"),
                     boundary: None,
+                    guard: None,
                 },
             ])
         );

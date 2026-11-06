@@ -3286,6 +3286,15 @@ impl HeadlessServer {
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::AgentSendKeys(params)
+                if params.expected_launch_incarnation.is_some()
+        ) {
+            self.app
+                .handle_deferred_agent_send_keys(msg.request, msg.respond_to);
+            return changed;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self
                 .app

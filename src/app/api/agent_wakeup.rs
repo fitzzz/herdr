@@ -1,0 +1,170 @@
+//! Release a prompt that Codex never read.
+//!
+//! Codex's terminal input reader (crossterm with edge-triggered epoll) can miss
+//! the readiness wake-up for a write. The prompt then sits unread in the PTY's
+//! kernel input queue until some later write arrives. Live captures held the
+//! whole prompt there for 15 s to over 60 s while every Codex thread slept, and
+//! a resend released it, which delivered the prompt twice. One focus-in report
+//! is a later write that Codex parses as an inert focus event, so it releases
+//! the queued prompt without a duplicate.
+
+use crate::api::schema::AgentTarget;
+use crate::api::{AgentInputWakeup, AgentInputWakeupProjectionResponse, WakeupNudge};
+use crate::app::App;
+use bytes::Bytes;
+
+use super::responses::encode_error;
+
+/// Nudge only bytes that are provably still queued, and only with a report the
+/// program asked for: with focus reporting off, `\e[I` would be ordinary input.
+pub(super) fn should_send_wakeup(unread_input_bytes: Option<usize>, focus_reporting: bool) -> bool {
+    unread_input_bytes.is_some_and(|bytes| bytes > 0) && focus_reporting
+}
+
+impl App {
+    /// Measure unread input for the prompted Codex and, when asked and when
+    /// `should_send_wakeup` allows it, write exactly one focus-in report. Text,
+    /// Enter and Esc are never written here. The caller makes at most one
+    /// `nudge` request per prompt, and the write needs that request's claim
+    /// (`WakeupNudge::claim_at`), taken after the measurement.
+    pub(super) fn handle_agent_input_wakeup(
+        &mut self,
+        id: String,
+        target: AgentTarget,
+        expected_terminal_id: &str,
+        nudge: Option<&WakeupNudge>,
+    ) -> String {
+        let not_eligible = |id: String, reason: &str| {
+            encode_error(id, "agent_wakeup_not_eligible", reason.to_string())
+        };
+        let Ok(resolved) = self.resolve_agent_target(&target.target) else {
+            return not_eligible(id, "agent not found");
+        };
+        if resolved.terminal_id != expected_terminal_id {
+            return not_eligible(id, "the target is no longer the prompted terminal");
+        }
+        let Some(terminal) = self.state.terminals.get(resolved.terminal_id.as_str()) else {
+            return not_eligible(id, "agent not found");
+        };
+        if terminal.effective_known_agent() != Some(crate::detect::Agent::Codex) {
+            return not_eligible(id, "the agent is not Codex");
+        }
+        if terminal.state != crate::detect::AgentState::Idle {
+            return not_eligible(id, "the agent is not idle");
+        }
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return not_eligible(id, "agent not found");
+        };
+        if !super::super::agents::runtime_hosts_agent(runtime, crate::detect::Agent::Codex) {
+            return not_eligible(id, "Codex is no longer the pane foreground process");
+        }
+
+        let unread_input_bytes = runtime.unread_input_bytes();
+        let focus_reporting = runtime.focus_reporting_enabled();
+        let mut nudged = false;
+        // The measurement can wait on the PTY actor, so the permission is
+        // checked only now, immediately before the write.
+        if let Some(nudge) = nudge.filter(|nudge| {
+            should_send_wakeup(unread_input_bytes, focus_reporting)
+                && nudge.claim_at(std::time::Instant::now())
+        }) {
+            match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
+                Ok(report) => match runtime.try_send_bytes(Bytes::from(report)) {
+                    Ok(()) => nudged = true,
+                    Err(err) => {
+                        tracing::warn!(err = %err, "failed to write the Codex input wake-up")
+                    }
+                },
+                Err(err) => tracing::warn!(err = %err, "failed to encode the Codex input wake-up"),
+            }
+            // Published before the reply, so a prompt whose wait ends first
+            // still learns whether the report was enqueued.
+            nudge.claim.finish(nudged);
+        }
+        let response = AgentInputWakeupProjectionResponse {
+            id: id.clone(),
+            result: AgentInputWakeup {
+                unread_input_bytes,
+                focus_reporting,
+                nudged,
+            },
+        };
+        serde_json::to_string(&response)
+            .unwrap_or_else(|error| encode_error(id, "serialization_error", error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_send_wakeup;
+    use crate::api::{WakeupClaim, WakeupNudge, WakeupWrite};
+    use std::time::{Duration, Instant};
+
+    fn nudge(not_after: Instant) -> WakeupNudge {
+        WakeupNudge {
+            not_after,
+            claim: WakeupClaim::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_wakeup_request_never_writes() {
+        let now = Instant::now();
+        let expired = nudge(now - Duration::from_millis(1));
+        assert!(!expired.claim_at(now), "a lapsed permission must not write");
+        assert_eq!(
+            expired.claim.withdraw(),
+            WakeupWrite::None,
+            "the waiting prompt learns that nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_wakeup_withdrawn_by_the_prompt_never_writes() {
+        let now = Instant::now();
+        let withdrawn = nudge(now + Duration::from_secs(5));
+        assert_eq!(withdrawn.claim.withdraw(), WakeupWrite::None);
+        assert!(!withdrawn.claim_at(now), "the prompt stopped waiting first");
+    }
+
+    #[test]
+    fn a_claimed_wakeup_cannot_be_withdrawn_or_claimed_twice() {
+        let now = Instant::now();
+        let live = nudge(now + Duration::from_secs(5));
+        assert!(live.claim_at(now));
+        assert!(!live.claim_at(now), "one write per request");
+        assert_eq!(
+            live.claim.withdraw(),
+            WakeupWrite::Unconfirmed,
+            "a claim alone is not a completed write"
+        );
+        live.claim.finish(true);
+        assert_eq!(live.claim.withdraw(), WakeupWrite::Enqueued);
+    }
+
+    #[test]
+    fn a_failed_enqueue_is_published_as_nothing_written() {
+        let now = Instant::now();
+        let failed = nudge(now + Duration::from_secs(5));
+        assert!(failed.claim_at(now));
+        failed.claim.finish(false);
+        assert_eq!(failed.claim.withdraw(), WakeupWrite::None);
+    }
+
+    #[test]
+    fn wakeup_needs_queued_bytes_and_focus_reporting() {
+        assert!(should_send_wakeup(Some(1571), true));
+        assert!(
+            !should_send_wakeup(Some(0), true),
+            "an empty queue is never nudged"
+        );
+        assert!(
+            !should_send_wakeup(None, true),
+            "an unmeasured queue is never nudged"
+        );
+        assert!(
+            !should_send_wakeup(Some(1571), false),
+            "without focus reporting the report would be ordinary input"
+        );
+    }
+}

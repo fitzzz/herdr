@@ -62,6 +62,11 @@ pub struct ServerCapabilities {
     /// native session equals it. Older servers ignore the field and write.
     #[serde(default)]
     pub agent_send_keys_expected_session: bool,
+    /// `agent.send_keys` honors `expected_launch_incarnation`: it refuses with
+    /// `agent_launch_mismatch`, writing nothing, unless the target's current
+    /// launch incarnation equals it. Older servers ignore the field and write.
+    #[serde(default)]
+    pub agent_send_keys_expected_launch_incarnation: bool,
     /// Agent kinds whose restore repeats the options the agent was launched
     /// with, read from its command line without what the prefix of the
     /// launcher it was started through passed on. Absent on servers that do
