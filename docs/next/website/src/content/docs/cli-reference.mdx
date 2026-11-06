@@ -423,7 +423,7 @@ Pass `--expect-launch INCARNATION` with the `launch_incarnation` that `agent sta
 | --- | --- |
 | `invalid_launch_incarnation` | The value is not a launch token. The CLI refuses before it connects. |
 | `terminal_not_found` | The terminal or target does not exist. |
-| `terminal_no_occupant` | No agent occupies the terminal. |
+| `terminal_no_occupant` | No agent occupies the terminal, as far as Herdr has seen. A replacement can give this until detection sees it, then `terminal_launch_not_attested`. |
 | `terminal_launch_mismatch` | Another attested launch occupies the terminal. The message names it. |
 | `terminal_launch_not_attested` | An agent occupies the terminal, and no launch is proved for it now: a hand-started agent, a replacement detection has not seen yet, or the launch's own foreground job. |
 | `terminal_attach_failed` | The admission itself turned the connection away, for example another client owns the terminal. The message is the server's reason. |

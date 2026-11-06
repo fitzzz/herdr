@@ -299,6 +299,7 @@ fn attach_with_the_right_launch_is_admitted_and_ends_when_that_launch_ends() {
     assert_eq!(attach.wait_for_exit(), 1, "{}", attach.output());
     let output = attach.output();
     assert!(output.contains("terminal_launch_ended"), "{output}");
+    assert!(!output.contains("server shut down"), "{output}");
     assert!(output.contains(&fixture.token), "{output}");
 
     // The terminal can be attached again: the stream released its ownership.
