@@ -158,7 +158,7 @@ fn negotiated_surface_decoder(
 }
 
 fn run_client_with_mode(
-    attach_request: Option<(String, bool)>,
+    attach_request: Option<(String, bool, Option<String>)>,
     attach_escape: Option<AttachEscapeState>,
     log_message: &'static str,
 ) -> io::Result<()> {
@@ -276,14 +276,27 @@ fn run_client_with_mode(
                     "Local needs a server update before it can participate in multi-machine viewing",
                 ));
             }
-            if let Some((terminal_id, takeover)) = attach_request {
-                write_to_server(
+            match attach_request {
+                Some((terminal_id, takeover, None)) => write_to_server(
                     &mut stream,
                     &ClientMessage::AttachTerminal {
                         terminal_id,
                         takeover,
                     },
-                )?;
+                )?,
+                // Answered before the terminal is touched: a refusal exits here.
+                Some((target, takeover, Some(expected_launch_incarnation))) => {
+                    terminal_sessions::request_guarded_admission(
+                        &mut stream,
+                        &protocol::terminal_launch_guard::AdmissionRequest {
+                            mode: protocol::terminal_launch_guard::AdmissionMode::Attach,
+                            target,
+                            takeover,
+                            expected_launch_incarnation,
+                        },
+                    )?;
+                }
+                None => {}
             }
             Ok((stream, handshake))
         })

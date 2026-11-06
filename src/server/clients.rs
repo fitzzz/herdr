@@ -133,6 +133,9 @@ impl ClientShellLocation {
 pub(crate) struct ClientConnection {
     /// Whether this connection owns the Herdr shell or one direct terminal stream.
     pub(crate) mode: ClientConnectionMode,
+    /// The launch this direct terminal stream was admitted for; the stream
+    /// ends as soon as that launch stops occupying the terminal.
+    pub(crate) launch_guard: Option<String>,
     /// The client's terminal size after clamping.
     pub(crate) terminal_size: (u16, u16),
     /// Pixel size of one client terminal cell.
@@ -225,6 +228,7 @@ impl ClientConnection {
     ) -> Self {
         Self {
             mode,
+            launch_guard: None,
             terminal_size,
             cell_size,
             last_activity,

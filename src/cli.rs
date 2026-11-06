@@ -42,9 +42,9 @@ mod workspace;
 mod worktree;
 
 const TERMINAL_SESSION_OBSERVE_USAGE: &str =
-    "usage: herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells]";
+    "usage: herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells] [--expect-launch INCARNATION]";
 const TERMINAL_SESSION_CONTROL_USAGE: &str =
-    "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells]";
+    "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells] [--expect-launch INCARNATION]";
 pub(crate) const AGENT_HELP_FOOTER: &str = concat!(
     "Are you an AI? Use these resources ONLY IF your task specifically asks you to:\n",
     "  Help a human understand or set up Herdr for the first time:\n",
@@ -541,15 +541,89 @@ fn session_delete(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
+    let (args, expected_launch) = match take_expect_launch(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
     let (terminal_id, takeover) = match parse_attach_target(
-        args,
-        "usage: herdr terminal attach <terminal_id> [--takeover]",
+        &args,
+        "usage: herdr terminal attach <terminal_id> [--takeover] [--expect-launch INCARNATION]",
     ) {
         Ok(parsed) => parsed,
         Err(code) => return Ok(code),
     };
-    crate::client::run_terminal_attach(terminal_id, takeover)?;
+    if let Some(code) = refuse_launch_guard_without_capability(&expected_launch)? {
+        return Ok(code);
+    }
+    crate::client::run_terminal_attach(terminal_id, takeover, expected_launch)?;
     Ok(0)
+}
+
+/// Splits `--expect-launch VALUE` from the arguments after the target. A value
+/// the launch token parser rejects, option-like values included, is refused
+/// here with a typed error, before any connection.
+fn take_expect_launch(args: &[String]) -> Result<(Vec<String>, Option<String>), i32> {
+    const FLAG: &str = "--expect-launch";
+    let args = expand_equals_args(args, &[FLAG]);
+    let mut rest = Vec::with_capacity(args.len());
+    let mut expected = None;
+    let mut remaining = args.into_iter();
+    if let Some(target) = remaining.next() {
+        rest.push(target);
+    }
+    while let Some(arg) = remaining.next() {
+        if arg != FLAG {
+            rest.push(arg);
+            continue;
+        }
+        let Some(value) = remaining.next() else {
+            eprintln!("missing value for {FLAG}");
+            return Err(2);
+        };
+        if expected.replace(value).is_some() {
+            eprintln!("{FLAG} given more than once");
+            return Err(2);
+        }
+    }
+    if let Some(value) = &expected {
+        if !crate::terminal::launch_incarnation::is_canonical_token(value) {
+            let refusal = crate::terminal::launch_incarnation::LaunchRefusal::Malformed;
+            let error = ErrorResponse {
+                id: "cli:terminal:admission".into(),
+                error: ErrorBody {
+                    code: refusal.code().into(),
+                    message: refusal.describe("", value),
+                },
+            };
+            eprintln!(
+                "{}",
+                serde_json::to_string(&error).expect("an error response serializes")
+            );
+            return Err(1);
+        }
+    }
+    Ok((rest, expected))
+}
+
+/// With an expected launch, asks the selected server whether it honors one.
+/// `Some` is the exit status of a refusal already reported.
+fn refuse_launch_guard_without_capability(
+    expected_launch: &Option<String>,
+) -> std::io::Result<Option<i32>> {
+    if expected_launch.is_none() {
+        return Ok(None);
+    }
+    let client = target::api_client()?;
+    let id = "cli:terminal:admission";
+    let status = ensure_server_protocol_compatible(&client, id)?;
+    let required: [RequiredCapability; 1] = [(
+        "terminal_attach_expected_launch_incarnation",
+        |capabilities| capabilities.terminal_attach_expected_launch_incarnation,
+    )];
+    match missing_capabilities_response(&status, id, &required)? {
+        Some(response) => print_response(&response).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn terminal_session(args: &[String]) -> std::io::Result<i32> {
@@ -579,6 +653,9 @@ fn terminal_session_control(args: &[String]) -> std::io::Result<i32> {
         Ok(options) => options,
         Err(code) => return Ok(code),
     };
+    if let Some(code) = refuse_launch_guard_without_capability(&options.expected_launch)? {
+        return Ok(code);
+    }
 
     crate::client::run_terminal_session_control(
         options.target,
@@ -586,6 +663,7 @@ fn terminal_session_control(args: &[String]) -> std::io::Result<i32> {
         options.cols,
         options.rows,
         options.output,
+        options.expected_launch,
     )?;
     Ok(0)
 }
@@ -600,12 +678,16 @@ fn terminal_session_observe(args: &[String]) -> std::io::Result<i32> {
         Ok(options) => options,
         Err(code) => return Ok(code),
     };
+    if let Some(code) = refuse_launch_guard_without_capability(&options.expected_launch)? {
+        return Ok(code);
+    }
 
     crate::client::run_terminal_session_observe(
         options.target,
         options.cols,
         options.rows,
         options.output,
+        options.expected_launch,
     )?;
     Ok(0)
 }
@@ -616,6 +698,7 @@ struct TerminalSessionOptions {
     rows: u16,
     takeover: bool,
     output: crate::client::TerminalSessionOutput,
+    expected_launch: Option<String>,
 }
 
 fn parse_terminal_session_options(
@@ -631,6 +714,10 @@ fn parse_terminal_session_options(
         eprintln!("{usage}");
         return Ok(Err(0));
     }
+    let (args, expected_launch) = match take_expect_launch(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(Err(code)),
+    };
     let Some(target) = args.first() else {
         eprintln!("{usage}");
         return Ok(Err(2));
@@ -692,6 +779,7 @@ fn parse_terminal_session_options(
         rows,
         takeover,
         output,
+        expected_launch,
     }))
 }
 
@@ -815,27 +903,40 @@ pub(super) fn send_request_requiring_capabilities(
 ) -> std::io::Result<serde_json::Value> {
     let client = target::api_client()?;
     let status = ensure_server_protocol_compatible(&client, &request.id)?;
+    if let Some(response) = missing_capabilities_response(&status, &request.id, required)? {
+        return Ok(response);
+    }
+    client
+        .request_value(request)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
+/// The `unsupported_capability` error when `status` lacks one of `required`.
+fn missing_capabilities_response(
+    status: &crate::api::RuntimeStatus,
+    request_id: &str,
+    required: &[RequiredCapability],
+) -> std::io::Result<Option<serde_json::Value>> {
     let missing: Vec<&str> = required
         .iter()
         .filter(|(_, advertised)| !status.capabilities.as_ref().is_some_and(advertised))
         .map(|(capability, _)| *capability)
         .collect();
-    if !missing.is_empty() {
-        return serde_json::to_value(ErrorResponse {
-            id: request.id.clone(),
-            error: ErrorBody {
-                code: "unsupported_capability".into(),
-                message: format!(
-                    "the Herdr server does not advertise {}; nothing was sent. Update the Herdr server to a build that advertises it.",
-                    missing.join(" and ")
-                ),
-            },
-        })
-        .map_err(std::io::Error::other);
+    if missing.is_empty() {
+        return Ok(None);
     }
-    client
-        .request_value(request)
-        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+    serde_json::to_value(ErrorResponse {
+        id: request_id.to_owned(),
+        error: ErrorBody {
+            code: "unsupported_capability".into(),
+            message: format!(
+                "the Herdr server does not advertise {}; nothing was sent. Update the Herdr server to a build that advertises it.",
+                missing.join(" and ")
+            ),
+        },
+    })
+    .map(Some)
+    .map_err(std::io::Error::other)
 }
 
 pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
@@ -1133,12 +1234,12 @@ fn print_config_help() {
 
 fn print_terminal_help() {
     eprintln!("herdr terminal commands:");
-    eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
+    eprintln!("  herdr terminal attach <terminal_id> [--takeover] [--expect-launch INCARNATION]");
     eprintln!(
-        "  herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells]"
+        "  herdr terminal session control <target> [--takeover] [--cols N] [--rows N] [--output ansi|cells] [--expect-launch INCARNATION]"
     );
     eprintln!(
-        "  herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells]"
+        "  herdr terminal session observe <target> [--cols N] [--rows N] [--output ansi|cells] [--expect-launch INCARNATION]"
     );
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");

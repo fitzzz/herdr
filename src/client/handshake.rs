@@ -102,7 +102,7 @@ fn direct_graphics_profile_allowed() -> bool {
 }
 
 #[cfg(windows)]
-fn set_handshake_recv_timeout(
+pub(super) fn set_handshake_recv_timeout(
     stream: &LocalStream,
     timeout: Option<Duration>,
     context: &'static str,
@@ -118,7 +118,7 @@ fn set_handshake_recv_timeout(
 }
 
 #[cfg(not(windows))]
-fn set_handshake_recv_timeout(
+pub(super) fn set_handshake_recv_timeout(
     stream: &LocalStream,
     timeout: Option<Duration>,
     _context: &'static str,

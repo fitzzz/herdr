@@ -180,6 +180,10 @@ const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
 /// otherwise idle. Keep this much slower than the old resize-poll cadence to
 /// avoid reintroducing the idle CPU spin.
 const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often a guarded terminal stream's launch is proved again while no
+/// input arrives from it. It costs one foreground read per guarded stream and
+/// nothing when there is none.
+const LAUNCH_GUARD_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 /// How often retained screens that nobody read are released. The loop wakes at
 /// least every `CLIENT_ACCEPT_POLL_INTERVAL`, so an unread screen is dropped
 /// within retention + this interval + one poll, even when the pane is quiet.
@@ -257,6 +261,7 @@ pub struct HeadlessServer {
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Next release of retained terminal screens that nobody has read.
     next_idle_screen_sweep: Instant,
+    next_launch_guard_check: Instant,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
     deferred_alt_screen_reads: Vec<api::ApiRequestMessage>,
     /// Monotonic activity counter used to pick the most recently active client.
@@ -403,6 +408,7 @@ impl HeadlessServer {
             terminal_attach_owners: HashMap::new(),
             pending_alt_screen_reads: Vec::new(),
             next_idle_screen_sweep: Instant::now() + IDLE_SCREEN_SWEEP_INTERVAL,
+            next_launch_guard_check: Instant::now() + LAUNCH_GUARD_CHECK_INTERVAL,
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
@@ -539,6 +545,14 @@ impl HeadlessServer {
                 }
             }
 
+            if now >= self.next_launch_guard_check {
+                self.next_launch_guard_check = now + LAUNCH_GUARD_CHECK_INTERVAL;
+                if self.end_guarded_streams_whose_launch_ended() {
+                    needs_render = true;
+                    needs_full_render = true;
+                }
+            }
+
             self.poll_pending_alt_screen_reads(now);
             if self.process_deferred_alt_screen_reads() {
                 needs_render = true;
@@ -635,6 +649,15 @@ impl HeadlessServer {
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
+            let next_deadline = if self
+                .clients
+                .values()
+                .any(|client| client.launch_guard.is_some())
+            {
+                next_deadline.map(|deadline| deadline.min(self.next_launch_guard_check))
+            } else {
+                next_deadline
+            };
             let next_deadline = self
                 .pending_alt_screen_reads
                 .iter()
@@ -1499,6 +1522,153 @@ impl HeadlessServer {
         self.attach_terminal_client(client_id, terminal_id, takeover)
     }
 
+    /// Admits a direct terminal stream only if the expected launch occupies
+    /// the terminal now. The check and the admission are one server step, and
+    /// a refusal changes nothing: it takes no ownership from another client
+    /// and writes nothing to the terminal.
+    fn handle_terminal_guarded_admission(
+        &mut self,
+        client_id: u64,
+        request: Option<protocol::terminal_launch_guard::AdmissionRequest>,
+    ) -> bool {
+        use crate::terminal::launch_incarnation::{is_canonical_token, LaunchRefusal};
+        use protocol::terminal_launch_guard::{AdmissionAnswer, AdmissionMode};
+
+        let Some(request) = request else {
+            self.refuse_guarded_admission(
+                client_id,
+                LaunchRefusal::Malformed.code(),
+                "the guarded terminal admission request could not be read".to_owned(),
+            );
+            return false;
+        };
+        let expected = request.expected_launch_incarnation;
+        let terminal_id = match request.mode {
+            AdmissionMode::Attach => self
+                .terminal_id_by_string(&request.target)
+                .map(|id| id.to_string()),
+            AdmissionMode::Control | AdmissionMode::Observe => {
+                self.resolve_terminal_target_id_string(&request.target)
+            }
+        };
+        let refusal = if !is_canonical_token(&expected) {
+            Some(LaunchRefusal::Malformed)
+        } else {
+            match &terminal_id {
+                Some(terminal_id) => self.app.launch_refusal(terminal_id, &expected),
+                None => Some(LaunchRefusal::TerminalGone),
+            }
+        };
+        let terminal_id = match (refusal, terminal_id) {
+            (None, Some(terminal_id)) => terminal_id,
+            (refusal, _) => {
+                let refusal = refusal.unwrap_or(LaunchRefusal::TerminalGone);
+                self.refuse_guarded_admission(
+                    client_id,
+                    refusal.code(),
+                    refusal.describe(&request.target, &expected),
+                );
+                return false;
+            }
+        };
+
+        let admitted = match request.mode {
+            AdmissionMode::Attach | AdmissionMode::Control => {
+                self.attach_terminal_client(client_id, terminal_id, request.takeover)
+            }
+            AdmissionMode::Observe => self.observe_terminal_client(client_id, terminal_id),
+        };
+        // A connection the admission itself turned away was told why and closed.
+        if admitted {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.launch_guard = Some(expected);
+            }
+            self.send_guarded_admission_answer(
+                client_id,
+                &AdmissionAnswer {
+                    admitted: true,
+                    code: None,
+                    message: None,
+                },
+            );
+        }
+        admitted
+    }
+
+    fn refuse_guarded_admission(&mut self, client_id: u64, code: &str, message: String) {
+        info!(client_id, code, "guarded terminal admission refused");
+        self.send_guarded_admission_answer(
+            client_id,
+            &protocol::terminal_launch_guard::AdmissionAnswer {
+                admitted: false,
+                code: Some(code.to_owned()),
+                message: Some(message),
+            },
+        );
+        self.remove_client_and_resize_if_needed(client_id);
+    }
+
+    fn send_guarded_admission_answer(
+        &mut self,
+        client_id: u64,
+        answer: &protocol::terminal_launch_guard::AdmissionAnswer,
+    ) {
+        match protocol::terminal_launch_guard::answer_message(answer) {
+            Ok(message) => {
+                self.send_to_client(client_id, message);
+            }
+            Err(err) => warn!(client_id, err = %err, "failed to encode guarded admission answer"),
+        }
+    }
+
+    /// Ends the guarded stream of `client_id` when its launch no longer
+    /// occupies the terminal, with the reason as the stream's close reason.
+    /// Returns whether it ended the stream.
+    fn end_guarded_stream_if_launch_ended(&mut self, client_id: u64) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        let Some(expected) = client.launch_guard.as_deref() else {
+            return false;
+        };
+        let (ClientConnectionMode::TerminalAttach { terminal_id }
+        | ClientConnectionMode::TerminalObserve { terminal_id }) = &client.mode
+        else {
+            return false;
+        };
+        let Some(refusal) = self.app.launch_refusal(terminal_id, expected) else {
+            return false;
+        };
+        let reason = format!(
+            "{}: {}",
+            protocol::terminal_launch_guard::LAUNCH_ENDED_CODE,
+            refusal.describe(terminal_id, expected)
+        );
+        info!(client_id, %reason, "guarded terminal stream ended");
+        self.send_to_client(
+            client_id,
+            ServerMessage::ServerShutdown {
+                reason: Some(reason),
+            },
+        );
+        self.remove_client_and_resize_if_needed(client_id);
+        true
+    }
+
+    fn end_guarded_streams_whose_launch_ended(&mut self) -> bool {
+        let guarded = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.launch_guard.is_some())
+            .map(|(&client_id, _)| client_id)
+            .collect::<Vec<_>>();
+        let mut ended = false;
+        for client_id in guarded {
+            ended |= self.end_guarded_stream_if_launch_ended(client_id);
+        }
+        ended
+    }
+
     fn handle_terminal_attach_scroll(
         &mut self,
         client_id: u64,
@@ -2051,6 +2221,19 @@ impl HeadlessServer {
             return false;
         }
 
+        // A guarded stream's input is proved against its launch before it can
+        // reach the terminal, so it never goes to a replacement the periodic
+        // check has not seen yet.
+        if let ServerEvent::ClientInput { client_id, .. }
+        | ServerEvent::ClientAttachScroll { client_id, .. }
+        | ServerEvent::ClientAttachMouse { client_id, .. }
+        | ServerEvent::ClientClipboardImage { client_id, .. } = &ev
+        {
+            if self.end_guarded_stream_if_launch_ended(*client_id) {
+                return false;
+            }
+        }
+
         match ev {
             ServerEvent::ClientConnected {
                 client_id,
@@ -2538,6 +2721,9 @@ impl HeadlessServer {
             ServerEvent::TerminalCellsHello { client_id, data } => {
                 self.handle_terminal_cells_hello(client_id, &data);
                 false
+            }
+            ServerEvent::TerminalGuardedAdmission { client_id, request } => {
+                self.handle_terminal_guarded_admission(client_id, request)
             }
             ServerEvent::ClientShellPresentationSync { client_id, token } => {
                 let Some(client) = self.clients.get_mut(&client_id) else {

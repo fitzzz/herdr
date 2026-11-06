@@ -18,6 +18,7 @@ mod surface_interest_tests;
 #[path = "surface_scroll.rs"]
 mod surface_scroll_tests;
 mod terminal_cells_negotiation;
+mod terminal_launch_guard;
 
 fn client_shell_projection(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -132,6 +133,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         terminal_attach_owners: HashMap::new(),
         pending_alt_screen_reads: Vec::new(),
         next_idle_screen_sweep: Instant::now() + IDLE_SCREEN_SWEEP_INTERVAL,
+        next_launch_guard_check: Instant::now() + LAUNCH_GUARD_CHECK_INTERVAL,
         deferred_alt_screen_reads: Vec::new(),
         next_activity_stamp: 1,
         headless_size,

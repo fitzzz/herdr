@@ -6,6 +6,7 @@ pub(crate) mod surface_delta;
 pub(crate) mod surface_reuse;
 pub(crate) mod surface_scroll;
 pub(crate) mod terminal_cells;
+pub(crate) mod terminal_launch_guard;
 mod wire;
 
 pub use wire::*;

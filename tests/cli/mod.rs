@@ -10,4 +10,5 @@ mod protocol;
 mod protocol_guard;
 mod sessions;
 mod surface;
+mod terminal_launch_guard;
 mod workspace;

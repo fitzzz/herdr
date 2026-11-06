@@ -67,6 +67,11 @@ pub struct ServerCapabilities {
     /// launch incarnation equals it. Older servers ignore the field and write.
     #[serde(default)]
     pub agent_send_keys_expected_launch_incarnation: bool,
+    /// `terminal attach`, `terminal session control` and `terminal session
+    /// observe` honor `--expect-launch`. Older servers ignore the guarded
+    /// admission and attach nothing, so the CLI refuses before asking them.
+    #[serde(default)]
+    pub terminal_attach_expected_launch_incarnation: bool,
     /// Agent kinds whose restore repeats the options the agent was launched
     /// with, read from its command line without what the prefix of the
     /// launcher it was started through passed on. Absent on servers that do

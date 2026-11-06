@@ -257,3 +257,81 @@ fn unrelated_messages_before_the_welcome_are_ignored() {
     assert_eq!(line["encoding"], "cells");
     assert!(rest.is_empty());
 }
+
+fn framed(messages: &[ServerMessage]) -> io::Cursor<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for message in messages {
+        protocol::write_message(&mut bytes, message).unwrap();
+    }
+    io::Cursor::new(bytes)
+}
+
+fn admission_answer(admitted: bool, code: Option<&str>, message: Option<&str>) -> ServerMessage {
+    protocol::terminal_launch_guard::answer_message(&AdmissionAnswer {
+        admitted,
+        code: code.map(str::to_owned),
+        message: message.map(str::to_owned),
+    })
+    .unwrap()
+}
+
+#[test]
+fn an_accepted_admission_keeps_what_arrived_ahead_of_it_in_order() {
+    let early = read_guarded_admission_answer(&mut framed(&[
+        welcome(Some(terminal_cells::CODEC), None),
+        admission_answer(true, None, None),
+        terminal(1, true, b"after"),
+    ]))
+    .unwrap();
+    assert_eq!(early.len(), 1);
+    assert!(matches!(
+        &early[0],
+        ServerMessage::EndpointControl { kind, .. } if kind == terminal_cells::WELCOME_KIND
+    ));
+}
+
+#[test]
+fn a_refused_admission_carries_the_servers_typed_error() {
+    let error = read_guarded_admission_answer(&mut framed(&[admission_answer(
+        false,
+        Some("terminal_launch_mismatch"),
+        Some("terminal t runs launch a"),
+    )]))
+    .unwrap_err();
+    assert_eq!(error.code, "terminal_launch_mismatch");
+    assert_eq!(error.message, "terminal t runs launch a");
+}
+
+#[test]
+fn a_connection_closed_without_an_answer_is_not_admitted() {
+    let shutdown_error = read_guarded_admission_answer(&mut framed(&[shutdown(Some(
+        "terminal attach failed: terminal t already has an attached client; retry with --takeover",
+    ))]))
+    .unwrap_err();
+    assert_eq!(shutdown_error.code, ADMISSION_FAILED_CODE);
+    assert!(shutdown_error.message.contains("--takeover"));
+
+    let closed = read_guarded_admission_answer(&mut framed(&[])).unwrap_err();
+    assert_eq!(closed.code, ADMISSION_FAILED_CODE);
+
+    let invalid = read_guarded_admission_answer(&mut framed(&[ServerMessage::EndpointControl {
+        kind: protocol::terminal_launch_guard::ANSWER_KIND.into(),
+        data: "not json".into(),
+    }]))
+    .unwrap_err();
+    assert_eq!(invalid.code, ADMISSION_FAILED_CODE);
+}
+
+#[test]
+fn a_server_that_never_answers_is_not_admitted() {
+    // What a read timeout on the socket reports, from a server that ignored
+    // the unknown control and attached nothing.
+    struct TimedOut;
+    impl io::Read for TimedOut {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+    let error = read_guarded_admission_answer(&mut TimedOut).unwrap_err();
+    assert_eq!(error.code, ADMISSION_UNANSWERED_CODE);
+}

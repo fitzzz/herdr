@@ -534,7 +534,7 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
         eprintln!("agent attach failed: response did not include terminal_id");
         return Ok(1);
     };
-    crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
+    crate::client::run_terminal_attach(terminal_id.to_owned(), takeover, None)?;
     Ok(0)
 }
 
