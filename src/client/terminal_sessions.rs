@@ -31,9 +31,14 @@ pub enum TerminalSessionOutput {
     Cells,
 }
 
-/// The admission itself turned the connection away, for example because
-/// another client owns the terminal. It carries the server's reason.
+/// The server said this connection was not admitted, for example because
+/// another client owns the terminal. It carries the server's reason. An answer
+/// is queued ahead of anything sent later on the connection, so a close reason
+/// that arrives first means the server did not admit it.
 const ADMISSION_FAILED_CODE: &str = "terminal_attach_failed";
+/// No valid answer arrived, so the outcome is unknown: the server may have
+/// admitted the connection and taken ownership from another client before the
+/// answer was lost.
 const ADMISSION_UNANSWERED_CODE: &str = "terminal_admission_unanswered";
 
 const RECORD_CELLS: u8 = 1;
@@ -177,13 +182,13 @@ pub(super) fn request_guarded_admission(
 }
 
 /// Reads up to the admission answer: what arrived ahead of an accepted one,
-/// or the typed error of a connection that was not admitted.
+/// or the typed error of a connection that was not shown to be admitted.
 fn read_guarded_admission_answer(
     stream: &mut impl io::Read,
 ) -> Result<Vec<ServerMessage>, crate::api::schema::ErrorBody> {
-    let failed = |message: String| crate::api::schema::ErrorBody {
-        code: ADMISSION_FAILED_CODE.to_owned(),
-        message,
+    let unanswered = |what: String| crate::api::schema::ErrorBody {
+        code: ADMISSION_UNANSWERED_CODE.to_owned(),
+        message: format!("{what}; the admission and any takeover may have taken effect"),
     };
     let mut early = Vec::new();
     loop {
@@ -191,8 +196,9 @@ fn read_guarded_admission_answer(
             Ok(ServerMessage::EndpointControl { kind, data })
                 if kind == protocol::terminal_launch_guard::ANSWER_KIND =>
             {
-                let answer = serde_json::from_str::<AdmissionAnswer>(&data)
-                    .map_err(|err| failed(format!("invalid guarded admission answer: {err}")))?;
+                let answer = serde_json::from_str::<AdmissionAnswer>(&data).map_err(|err| {
+                    unanswered(format!("the guarded admission answer was invalid: {err}"))
+                })?;
                 if answer.admitted {
                     return Ok(early);
                 }
@@ -203,20 +209,29 @@ fn read_guarded_admission_answer(
                     message: answer.message.unwrap_or_default(),
                 });
             }
-            Ok(ServerMessage::ServerShutdown { reason }) => {
-                return Err(failed(
-                    reason.unwrap_or_else(|| "the server closed the connection".to_owned()),
+            Ok(ServerMessage::ServerShutdown {
+                reason: Some(reason),
+            }) => {
+                return Err(crate::api::schema::ErrorBody {
+                    code: ADMISSION_FAILED_CODE.to_owned(),
+                    message: reason,
+                });
+            }
+            Ok(ServerMessage::ServerShutdown { reason: None }) => {
+                return Err(unanswered(
+                    "the server closed the connection before answering".to_owned(),
                 ));
             }
             Ok(message) => early.push(message),
             Err(protocol::FramingError::UnexpectedEof) => {
-                return Err(failed("the server closed the connection".to_owned()));
+                return Err(unanswered(
+                    "the connection closed before the server answered".to_owned(),
+                ));
             }
             Err(err) => {
-                return Err(crate::api::schema::ErrorBody {
-                    code: ADMISSION_UNANSWERED_CODE.to_owned(),
-                    message: format!("the server did not answer the guarded admission: {err}"),
-                });
+                return Err(unanswered(format!(
+                    "the server did not answer the guarded admission: {err}"
+                )));
             }
         }
     }

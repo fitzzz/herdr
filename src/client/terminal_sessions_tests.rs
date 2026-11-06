@@ -303,23 +303,50 @@ fn a_refused_admission_carries_the_servers_typed_error() {
 }
 
 #[test]
-fn a_connection_closed_without_an_answer_is_not_admitted() {
-    let shutdown_error = read_guarded_admission_answer(&mut framed(&[shutdown(Some(
+fn a_close_reason_ahead_of_any_answer_is_a_refusal() {
+    let error = read_guarded_admission_answer(&mut framed(&[shutdown(Some(
         "terminal attach failed: terminal t already has an attached client; retry with --takeover",
     ))]))
     .unwrap_err();
-    assert_eq!(shutdown_error.code, ADMISSION_FAILED_CODE);
-    assert!(shutdown_error.message.contains("--takeover"));
+    assert_eq!(error.code, ADMISSION_FAILED_CODE);
+    assert!(error.message.contains("--takeover"), "{}", error.message);
+}
 
-    let closed = read_guarded_admission_answer(&mut framed(&[])).unwrap_err();
-    assert_eq!(closed.code, ADMISSION_FAILED_CODE);
+/// The server takes ownership first and answers after, so an accepted takeover
+/// whose answer is lost looks like this from the client: the connection closes
+/// with nothing to say whether it happened.
+#[test]
+fn an_accepted_takeover_whose_answer_is_lost_is_an_unknown_outcome() {
+    let cases = [
+        ("closed at once", framed(&[])),
+        (
+            "closed after an earlier message",
+            framed(&[welcome(Some(terminal_cells::CODEC), None)]),
+        ),
+        ("closed without a reason", framed(&[shutdown(None)])),
+        (
+            "unreadable answer",
+            framed(&[ServerMessage::EndpointControl {
+                kind: protocol::terminal_launch_guard::ANSWER_KIND.into(),
+                data: "not json".into(),
+            }]),
+        ),
+    ];
+    for (name, mut stream) in cases {
+        let error = read_guarded_admission_answer(&mut stream).unwrap_err();
+        assert_eq!(error.code, ADMISSION_UNANSWERED_CODE, "{name}");
+        assert!(
+            error.message.contains("takeover"),
+            "{name}: {}",
+            error.message
+        );
+    }
 
-    let invalid = read_guarded_admission_answer(&mut framed(&[ServerMessage::EndpointControl {
-        kind: protocol::terminal_launch_guard::ANSWER_KIND.into(),
-        data: "not json".into(),
-    }]))
-    .unwrap_err();
-    assert_eq!(invalid.code, ADMISSION_FAILED_CODE);
+    // Cut off inside the answer's own frame.
+    let mut bytes = framed(&[admission_answer(true, None, None)]).into_inner();
+    bytes.truncate(bytes.len() - 1);
+    let error = read_guarded_admission_answer(&mut io::Cursor::new(bytes)).unwrap_err();
+    assert_eq!(error.code, ADMISSION_UNANSWERED_CODE);
 }
 
 #[test]

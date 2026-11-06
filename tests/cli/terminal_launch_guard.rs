@@ -550,6 +550,18 @@ impl StreamHelper {
         Self { child, stdout }
     }
 
+    fn spawn_control(fixture: &Fixture, target: &str, expected: &str) -> Self {
+        Self::new(
+            fixture
+                .command(&session_args("control", target, expected))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
     fn spawn_observe(fixture: &Fixture, target: &str, expected: Option<&str>) -> Self {
         let mut args = vec!["terminal", "session", "observe", target];
         if let Some(expected) = expected {
@@ -772,6 +784,63 @@ fn a_queued_stream_write_stops_when_the_launch_is_replaced() {
         thread::sleep(POLL);
     }
     assert!(read > 0, "the buffered prefix reached the replacement");
+    fixture.finish();
+}
+
+/// The server takes ownership before it answers. Here the answer to an accepted
+/// takeover is lost on the way back, so the client must not report a refusal.
+#[test]
+fn a_takeover_whose_answer_is_lost_reports_an_unknown_outcome() {
+    fn frame(stream: &mut UnixStream) -> Vec<u8> {
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).unwrap();
+        let mut body = vec![0_u8; u32::from_le_bytes(header) as usize];
+        stream.read_exact(&mut body).unwrap();
+        [header.as_slice(), body.as_slice()].concat()
+    }
+
+    let fixture = Fixture::start();
+    let mut owner = StreamHelper::spawn_control(&fixture, &fixture.pane_id, &fixture.token);
+    assert_eq!(owner.next_line()["type"], "terminal.frame");
+
+    // The client derives its stream socket from the API socket's name, so this
+    // name reaches the real API and a stream socket that drops the answer.
+    let runtime_dir = fixture.socket_path.parent().unwrap();
+    let proxied_api = runtime_dir.join("proxied.sock");
+    std::os::unix::fs::symlink(&fixture.socket_path, &proxied_api).unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("proxied-client.sock")).unwrap();
+    let server_stream = runtime_dir.join("herdr-client.sock");
+    let proxy = thread::spawn(move || {
+        let (mut client, _) = listener.accept().unwrap();
+        let mut server = UnixStream::connect(server_stream).unwrap();
+        server.write_all(&frame(&mut client)).unwrap(); // Hello.
+        client.write_all(&frame(&mut server)).unwrap(); // Welcome.
+        server.write_all(&frame(&mut client)).unwrap(); // Guarded takeover.
+        frame(&mut server) // The answer, dropped as both connections close.
+    });
+
+    let second = fixture
+        .command(&[
+            "terminal",
+            "session",
+            "control",
+            &fixture.pane_id,
+            "--takeover",
+            "--expect-launch",
+            &fixture.token,
+        ])
+        .env("HERDR_SOCKET_PATH", &proxied_api)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!proxy.join().unwrap().is_empty(), "the server answered");
+
+    let error = assert_refused(&second, "terminal_admission_unanswered");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("may have taken effect"), "{error}");
+    // The takeover did happen, which is why this cannot be called a refusal.
+    let (closed, _) = owner.closed_record();
+    assert_eq!(closed["reason"], "terminal attach taken over", "{closed}");
     fixture.finish();
 }
 
