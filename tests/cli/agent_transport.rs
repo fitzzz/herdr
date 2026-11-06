@@ -687,15 +687,15 @@ mode, submit_len, log = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 tty.setraw(0)
 
 def draw(title, body):
-    os.write(1, ("\x1b]0;%s\x07\x1b[H\x1b[2J\x1b[3J  >_ OpenAI Codex (fake)\n\n%s"
-                 "› Ask Codex to do anything\n\n  ? for shortcuts" % (title, body)).encode())
+    os.write(1, ("\x1b]0;%s\x07\x1b[H\x1b[2J\x1b[3JTEST-HEADER\n\n%s"
+                 "› TEST-EMPTY\n\n  TEST-FOOTER" % (title, body)).encode())
 
 def queued():
     return struct.unpack("i", fcntl.ioctl(0, termios.FIONREAD, b"\0\0\0\0"))[0]
 
 if mode != "no-focus":
     os.write(1, b"\x1b[?1004h")
-draw("fake-codex", "")
+draw("TEST-IDLE", "")
 poller = select.epoll()
 poller.register(0, select.EPOLLIN | select.EPOLLET)
 armed = False
@@ -715,7 +715,7 @@ while True:
     line = text.split(b"\r")[0].decode()
     with open(log + ".submissions", "a") as out:
         out.write(line + "\n")
-    draw("⠋ fake-codex", "› %s\n\n• Working (1s • esc to interrupt)\n\n" % line)
+    draw("TEST-WORKING", "› %s\n\n• TEST-STATUS\n\n" % line)
 "#,
     )
     .unwrap();
@@ -738,6 +738,7 @@ fn prompt_fake_wakeup_codex(mode: &str, prompt: &str) -> WakeupRun {
     let bin = base.join("bin");
     let log = base.join("codex-input");
     write_fake_wakeup_codex(&bin);
+    write_synthetic_codex_manifest(&config_home);
     let path = PathBuf::from(format!("{}:/usr/bin:/bin", bin.display()));
     let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&path));
     wait_for_socket(&socket_path, Duration::from_secs(5));
