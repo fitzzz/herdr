@@ -1282,7 +1282,7 @@ impl App {
             (
                 crate::api::ApiRequestProjection::AgentInputWakeup { terminal_id, nudge },
                 crate::api::schema::Method::AgentGet(target),
-            ) => self.handle_agent_input_wakeup(request.id, target, &terminal_id, nudge),
+            ) => self.handle_agent_input_wakeup(request.id, target, &terminal_id, nudge.as_ref()),
             _ => responses::encode_error(
                 request.id,
                 "internal_error",

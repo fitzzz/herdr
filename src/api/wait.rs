@@ -223,7 +223,7 @@ pub(super) fn prompt_agent(
 
     // Capture the screen before writing so evidence of new text on screen can be
     // distinguished from text that was already there.
-    let before_screen = read_agent_screen(&request_id, &target, api_tx).ok();
+    let before_screen = read_agent_screen(&request_id, &target, api_tx, APP_RESPONSE_TIMEOUT).ok();
     let baseline = before_screen
         .as_deref()
         .map(|screen| crate::detect::manifest::composer_text_occurrences(screen, &prompt_needle))
@@ -306,19 +306,17 @@ pub(super) fn prompt_agent(
     });
     // Only Codex is known to miss the read wake-up for its PTY input, and only
     // the gate's own stall decision (not the caller's deadline) may nudge it.
-    let wakeup_window_ms = remaining
-        .map(|remaining| remaining.saturating_sub(effect_timeout_ms))
-        .unwrap_or(PROMPT_WAKEUP_WINDOW_MS)
-        .min(PROMPT_WAKEUP_WINDOW_MS);
+    // Every later step is bounded by what then remains of the caller's budget.
     let wakeup = (expected_agent == Some(crate::detect::Agent::Codex)
         && matches!(timeout_kind, AgentWaitTimeoutKind::PromptStalled { .. })
-        && wakeup_window_ms > 0)
-        .then(|| PromptWakeup {
-            needle: prompt_needle.clone(),
-            baseline,
-            expected_agent,
-            window_ms: wakeup_window_ms,
-        });
+        && remaining.is_none_or(|remaining| remaining > effect_timeout_ms))
+    .then(|| PromptWakeup {
+        needle: prompt_needle.clone(),
+        baseline,
+        expected_agent,
+        caller_deadline: total_timeout_ms
+            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms)),
+    });
     let Some(outcome) = wait_for_resolved_agent(
         request_id.clone(),
         ResolvedAgentWait {
@@ -569,6 +567,7 @@ fn read_agent_screen(
     request_id: &str,
     target: &str,
     api_tx: &ApiRequestSender,
+    timeout: std::time::Duration,
 ) -> Result<String, ErrorResponse> {
     let response = dispatch_to_app_with_timeout(
         Request {
@@ -582,7 +581,7 @@ fn read_agent_screen(
             }),
         },
         api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
+        Some(timeout),
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.into(),
@@ -633,7 +632,42 @@ struct PromptWakeup {
     needle: String,
     baseline: usize,
     expected_agent: Option<crate::detect::Agent>,
-    window_ms: u64,
+    /// The caller's absolute deadline; `None` when it set no timeout.
+    caller_deadline: Option<std::time::Instant>,
+}
+
+impl PromptWakeup {
+    /// What remains of the caller's budget, capped at `cap`; `None` once spent.
+    fn budget(&self, cap: std::time::Duration) -> Option<std::time::Duration> {
+        let budget = match self.caller_deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(std::time::Instant::now())?
+                .min(cap),
+            None => cap,
+        };
+        (!budget.is_zero()).then_some(budget)
+    }
+}
+
+/// Withdraws a wake-up's write right when its prompt stops waiting, so a
+/// request still queued for the app writes nothing afterwards.
+struct CancelWakeupOnExit(crate::api::WakeupClaim);
+
+impl Drop for CancelWakeupOnExit {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// The outcome of offering the wake-up at the stall decision.
+enum WakeupStep {
+    /// Nothing was written: not eligible, budget spent, or withdrawn in time.
+    NotWritten(Option<crate::api::AgentInputWakeup>),
+    /// The app answered; `nudged` says whether it wrote the report.
+    Answered(crate::api::AgentInputWakeup),
+    /// The answer did not arrive in time, but the app had already claimed the
+    /// write, so the report was (or is being) written.
+    WrittenUnanswered,
 }
 
 struct PromptRejectionProbe {
@@ -706,6 +740,9 @@ fn wait_for_resolved_agent(
     let expected_terminal_id = wait.initial.terminal_id.clone();
     let mut wakeup_sent = false;
     let mut wakeup_report = None;
+    let wakeup_claim = crate::api::WakeupClaim::default();
+    let _cancel_wakeup = CancelWakeupOnExit(wakeup_claim.clone());
+    let mut pending_remeasure = None;
     let expected_name = wait
         .initial
         .name
@@ -826,7 +863,7 @@ fn wait_for_resolved_agent(
         }
 
         if wait.rejection_probe.is_some() || wait.acceptance_probe.is_some() {
-            let screen = read_agent_screen(&request_id, &wait.target, api_tx);
+            let screen = read_agent_screen(&request_id, &wait.target, api_tx, APP_RESPONSE_TIMEOUT);
             if let Err(error) = &screen {
                 tracing::debug!(
                     request_id = %request_id,
@@ -899,40 +936,56 @@ fn wait_for_resolved_agent(
                 return Ok(Some(matched_outcome(current, wakeup_sent)));
             }
             if let Some(wakeup) = wait.wakeup.take() {
-                if let Some(report) = prompt_wakeup_report(
+                let step = prompt_wakeup_report(
                     &request_id,
                     &wait.target,
                     &expected_terminal_id,
                     &current,
                     &wakeup,
+                    &wakeup_claim,
                     api_tx,
-                ) {
-                    if report.nudged {
-                        wakeup_sent = true;
-                        deadline = Some(
-                            std::time::Instant::now()
-                                + std::time::Duration::from_millis(wakeup.window_ms),
-                        );
+                );
+                match step {
+                    WakeupStep::NotWritten(report) => wakeup_report = report,
+                    WakeupStep::Answered(report) => {
+                        wakeup_sent = report.nudged;
+                        wakeup_report = Some(report);
                     }
-                    wakeup_report = Some(report);
-                    if wakeup_sent {
+                    WakeupStep::WrittenUnanswered => wakeup_sent = true,
+                }
+                if wakeup_sent {
+                    // The turn gets what remains of the caller's budget, up to
+                    // the window, measured from now rather than planned ahead.
+                    if let Some(window) =
+                        wakeup.budget(std::time::Duration::from_millis(PROMPT_WAKEUP_WINDOW_MS))
+                    {
+                        deadline = Some(std::time::Instant::now() + window);
+                        pending_remeasure = Some(wakeup);
                         continue;
                     }
                 }
-            } else if wakeup_sent {
-                // Report what is still queued now, not what the nudge saw.
-                wakeup_report = input_wakeup(
-                    &request_id,
-                    &wait.target,
-                    &expected_terminal_id,
-                    false,
-                    api_tx,
-                )
-                .or(wakeup_report);
+            } else if let Some(wakeup) = pending_remeasure.take() {
+                // Report what is still queued now, not what the nudge saw, if
+                // the caller's budget leaves room to ask.
+                if let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) {
+                    wakeup_report = input_wakeup(
+                        &request_id,
+                        &wait.target,
+                        &expected_terminal_id,
+                        None,
+                        budget,
+                        api_tx,
+                    )
+                    .ok()
+                    .or(wakeup_report);
+                }
             }
-            let unread_detail = wakeup_report
-                .as_ref()
-                .and_then(|report| unread_input_detail(report, wakeup_sent));
+            let unread_detail = match &wakeup_report {
+                Some(report) => unread_input_detail(report, wakeup_sent),
+                None => wakeup_sent.then(|| {
+                    "one focus-in wake-up was written, but no turn start was observed".to_string()
+                }),
+            };
             return agent_wait_timeout(
                 request_id,
                 wait.timeout_kind,
@@ -948,38 +1001,67 @@ fn wait_for_resolved_agent(
 
 /// At the stall decision for an idle or done Codex: when its input box is empty
 /// and the prompt is not shown anywhere new, ask the app to measure unread PTY
-/// input and send the one wake-up it allows. `None` means nothing was asked.
+/// input and send the one wake-up it allows. Every step is bounded by what
+/// remains of the caller's budget, and the write permission lapses when that
+/// step's wait does.
 fn prompt_wakeup_report(
     request_id: &str,
     target: &str,
     expected_terminal_id: &str,
     current: &crate::api::schema::AgentInfo,
     wakeup: &PromptWakeup,
+    claim: &crate::api::WakeupClaim,
     api_tx: &ApiRequestSender,
-) -> Option<crate::api::AgentInputWakeup> {
+) -> WakeupStep {
     if !matches!(
         current.agent_status,
         crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
     ) {
-        return None;
+        return WakeupStep::NotWritten(None);
     }
-    let screen = read_agent_screen(request_id, target, api_tx).ok()?;
+    let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) else {
+        return WakeupStep::NotWritten(None);
+    };
+    let Ok(screen) = read_agent_screen(request_id, target, api_tx, budget) else {
+        return WakeupStep::NotWritten(None);
+    };
     if composer_holds_input(wakeup.expected_agent, &screen)
         || crate::detect::manifest::composer_text_occurrences(&screen, &wakeup.needle)
             > wakeup.baseline
     {
-        return None;
+        return WakeupStep::NotWritten(None);
     }
-    input_wakeup(request_id, target, expected_terminal_id, true, api_tx)
+    let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) else {
+        return WakeupStep::NotWritten(None);
+    };
+    let nudge = crate::api::WakeupNudge {
+        not_after: std::time::Instant::now() + budget,
+        claim: claim.clone(),
+    };
+    match input_wakeup(
+        request_id,
+        target,
+        expected_terminal_id,
+        Some(nudge),
+        budget,
+        api_tx,
+    ) {
+        Ok(report) => WakeupStep::Answered(report),
+        // The request may still be queued: withdraw it, unless the app has
+        // already claimed the write.
+        Err(()) if claim.cancel() => WakeupStep::NotWritten(None),
+        Err(()) => WakeupStep::WrittenUnanswered,
+    }
 }
 
 fn input_wakeup(
     request_id: &str,
     target: &str,
     expected_terminal_id: &str,
-    nudge: bool,
+    nudge: Option<crate::api::WakeupNudge>,
+    timeout: std::time::Duration,
     api_tx: &ApiRequestSender,
-) -> Option<crate::api::AgentInputWakeup> {
+) -> Result<crate::api::AgentInputWakeup, ()> {
     let response = dispatch_projection_to_app_with_timeout(
         Request {
             id: format!("{request_id}:wakeup"),
@@ -992,11 +1074,11 @@ fn input_wakeup(
             nudge,
         },
         api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
+        Some(timeout),
     );
     serde_json::from_str::<crate::api::AgentInputWakeupProjectionResponse>(&response)
-        .ok()
         .map(|response| response.result)
+        .map_err(|_| ())
 }
 
 /// The stalled error's account of input the agent has not read, so a caller can
@@ -1867,6 +1949,206 @@ not = [{ contains = ["TEST-EMPTY"] }]
                 &working_probe(Some(&before), agent)
             ));
         }
+    }
+
+    fn wakeup_with_deadline(caller_deadline: Option<std::time::Instant>) -> PromptWakeup {
+        PromptWakeup {
+            needle: "review the diff".into(),
+            baseline: 0,
+            expected_agent: None,
+            caller_deadline,
+        }
+    }
+
+    /// Stand-in for the app: answers screen reads at once with an empty input
+    /// box, and hands each wake-up request to `on_wakeup`.
+    fn fake_app(
+        on_wakeup: impl Fn(crate::api::ApiRequestMessage) + Send + 'static,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<Vec<String>>) {
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                match &message.request.method {
+                    Method::AgentRead(_) => {
+                        seen.push("agent.read".to_string());
+                        let _ = message.respond_to.send(
+                            serde_json::json!({
+                                "id": message.request.id,
+                                "result": { "read": { "text": "idle screen\n" } }
+                            })
+                            .to_string(),
+                        );
+                    }
+                    Method::AgentGet(_) if message.projection.is_some() => {
+                        seen.push("wakeup".to_string());
+                        on_wakeup(message);
+                    }
+                    other => seen.push(format!("{other:?}")),
+                }
+            }
+            seen
+        });
+        (api_tx, app)
+    }
+
+    fn take_nudge(message: &crate::api::ApiRequestMessage) -> crate::api::WakeupNudge {
+        match &message.projection {
+            Some(crate::api::ApiRequestProjection::AgentInputWakeup {
+                nudge: Some(nudge), ..
+            }) => nudge.clone(),
+            other => panic!("expected a wake-up with permission to write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_spent_caller_budget_sends_no_wakeup_request_at_all() {
+        let (api_tx, app) = fake_app(|_| panic!("no wake-up may be requested"));
+        let claim = crate::api::WakeupClaim::default();
+        let spent = wakeup_with_deadline(Some(std::time::Instant::now()));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &spent,
+            &claim,
+            &api_tx,
+        );
+        assert!(matches!(step, WakeupStep::NotWritten(None)));
+        drop(api_tx);
+        assert!(app.join().unwrap().is_empty(), "not even a screen read");
+    }
+
+    #[test]
+    fn diagnostics_that_use_up_the_last_budget_send_no_wakeup() {
+        // The screen read answers only after the caller's deadline has passed.
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                seen.push(format!("{:?}", message.projection.is_some()));
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = message.respond_to.send(
+                    serde_json::json!({"id": "r", "result": {"read": {"text": "idle\n"}}})
+                        .to_string(),
+                );
+            }
+            seen
+        });
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(60),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        assert!(matches!(step, WakeupStep::NotWritten(None)));
+        drop(api_tx);
+        assert_eq!(
+            app.join().unwrap(),
+            vec!["false".to_string()],
+            "only the screen read was asked; no wake-up was requested"
+        );
+    }
+
+    #[test]
+    fn a_wakeup_handled_after_its_wait_lapsed_never_writes() {
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (api_tx, app) = fake_app(move |message| {
+            let nudge = take_nudge(&message);
+            // The app reaches the request only after the prompt stopped waiting.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = written_tx.send(nudge.claim_at(std::time::Instant::now()));
+        });
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(80),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        assert!(
+            matches!(step, WakeupStep::NotWritten(None)),
+            "the prompt withdrew the request when its wait ended"
+        );
+        assert!(
+            !written_rx.recv().unwrap(),
+            "the late request must not write"
+        );
+        drop(api_tx);
+        assert_eq!(app.join().unwrap(), vec!["agent.read", "wakeup"]);
+    }
+
+    #[test]
+    fn a_wakeup_claimed_before_the_wait_lapsed_is_reported_as_written() {
+        let (api_tx, app) = fake_app(|message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            // Written, but the answer comes too late for the prompt.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        });
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(80),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        assert!(matches!(step, WakeupStep::WrittenUnanswered));
+        drop(api_tx);
+        app.join().unwrap();
+    }
+
+    #[test]
+    fn a_prompt_that_returns_withdraws_its_queued_wakeup() {
+        let claim = crate::api::WakeupClaim::default();
+        let nudge = crate::api::WakeupNudge {
+            not_after: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            claim: claim.clone(),
+        };
+        drop(CancelWakeupOnExit(claim));
+        assert!(!nudge.claim_at(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn the_wakeup_budget_is_what_remains_of_the_caller_deadline() {
+        let cap = std::time::Duration::from_secs(2);
+        assert_eq!(wakeup_with_deadline(None).budget(cap), Some(cap));
+        assert_eq!(
+            wakeup_with_deadline(Some(std::time::Instant::now())).budget(cap),
+            None
+        );
+        let near = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ))
+        .budget(cap)
+        .unwrap();
+        assert!(near <= std::time::Duration::from_millis(500));
+        let far = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        assert_eq!(far.budget(cap), Some(cap));
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub enum AgentPromptEvidence {
     /// The prompt sat unread in the agent's terminal input queue until Herdr
     /// wrote one focus-in report; the agent then read it and started its turn.
     ReleasedAfterWakeup,
+    /// Evidence named by a newer server. The prompt was still accepted.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

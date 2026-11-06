@@ -7046,6 +7046,11 @@
               "const": "released_after_wakeup",
               "description": "The prompt sat unread in the agent's terminal input queue until Herdr\nwrote one focus-in report; the agent then read it and started its turn.",
               "type": "string"
+            },
+            {
+              "const": "unknown",
+              "description": "Evidence named by a newer server. The prompt was still accepted.",
+              "type": "string"
             }
           ]
         },

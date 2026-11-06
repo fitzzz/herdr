@@ -103,7 +103,7 @@ pub(crate) enum ApiRequestProjection {
     /// `App::handle_agent_input_wakeup`); without it, it only measures.
     AgentInputWakeup {
         terminal_id: String,
-        nudge: bool,
+        nudge: Option<WakeupNudge>,
     },
 }
 
@@ -130,6 +130,75 @@ pub(crate) struct PaneAgentStatusProjectionResponse {
     pub(crate) id: String,
     pub(crate) result: schema::PaneAgentStatusChangedEvent,
 }
+
+/// Permission for one wake-up write: it lapses at `not_after`, and the waiting
+/// prompt can withdraw it through `claim`. The app checks both immediately
+/// before it writes, after measuring, so a late request writes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WakeupNudge {
+    pub(crate) not_after: std::time::Instant,
+    pub(crate) claim: WakeupClaim,
+}
+
+impl WakeupNudge {
+    /// Whether the app may write now. Claiming is final: once this returns
+    /// true the prompt can no longer cancel, and it never returns true after
+    /// the prompt cancelled or the permission lapsed.
+    pub(crate) fn claim_at(&self, now: std::time::Instant) -> bool {
+        if now > self.not_after {
+            self.claim.cancel();
+            return false;
+        }
+        self.claim.claim()
+    }
+}
+
+/// One wake-up's single write right, shared by the waiting prompt and the app.
+/// Whichever side moves first wins: the app claims it immediately before it
+/// writes, and the prompt cancels it when it stops waiting for the answer or
+/// returns, so a request handled after that writes nothing, and a prompt that
+/// gave up knows whether the write happened.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WakeupClaim(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl WakeupClaim {
+    const PENDING: u8 = 0;
+    const CLAIMED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Withdraw the write right. True when no write happened or can happen;
+    /// false when the app already claimed it.
+    pub(crate) fn cancel(&self) -> bool {
+        match self.0.compare_exchange(
+            Self::PENDING,
+            Self::CANCELLED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == Self::CANCELLED,
+        }
+    }
+}
+
+impl PartialEq for WakeupClaim {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for WakeupClaim {}
 
 /// What the lost-wakeup check measured, and whether it wrote the one nudge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -1515,3 +1515,38 @@ fn pane_link_resolve_round_trips() {
         result
     );
 }
+
+#[test]
+fn agent_prompted_evidence_from_a_newer_server_still_decodes() {
+    let agent = serde_json::json!({
+        "terminal_id": "term_1",
+        "agent_status": "working",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "pane_id": "w1:p1",
+        "focused": true,
+        "revision": 0
+    });
+    let decode = |evidence: serde_json::Value| -> SuccessResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "prompt",
+            "result": { "type": "agent_prompted", "agent": agent, "evidence": evidence }
+        }))
+        .expect("an agent_prompted answer decodes")
+    };
+    let evidence = |response: SuccessResponse| match response.result {
+        ResponseResult::AgentPrompted { evidence, .. } => evidence,
+        other => panic!("expected agent_prompted, got {other:?}"),
+    };
+
+    assert_eq!(
+        evidence(decode(serde_json::json!("released_after_wakeup"))),
+        Some(AgentPromptEvidence::ReleasedAfterWakeup)
+    );
+    assert_eq!(
+        evidence(decode(serde_json::json!("observed_some_new_way"))),
+        Some(AgentPromptEvidence::Unknown),
+        "an unfamiliar explanation must not reject the whole success answer"
+    );
+    assert_eq!(evidence(decode(serde_json::Value::Null)), None);
+}

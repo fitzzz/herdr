@@ -9,7 +9,7 @@
 //! the queued prompt without a duplicate.
 
 use crate::api::schema::AgentTarget;
-use crate::api::{AgentInputWakeup, AgentInputWakeupProjectionResponse};
+use crate::api::{AgentInputWakeup, AgentInputWakeupProjectionResponse, WakeupNudge};
 use crate::app::App;
 use bytes::Bytes;
 
@@ -25,13 +25,14 @@ impl App {
     /// Measure unread input for the prompted Codex and, when asked and when
     /// `should_send_wakeup` allows it, write exactly one focus-in report. Text,
     /// Enter and Esc are never written here. The caller makes at most one
-    /// `nudge` request per prompt.
+    /// `nudge` request per prompt, and the write needs that request's claim
+    /// (`WakeupNudge::claim_at`), taken after the measurement.
     pub(super) fn handle_agent_input_wakeup(
         &mut self,
         id: String,
         target: AgentTarget,
         expected_terminal_id: &str,
-        nudge: bool,
+        nudge: Option<&WakeupNudge>,
     ) -> String {
         let not_eligible = |id: String, reason: &str| {
             encode_error(id, "agent_wakeup_not_eligible", reason.to_string())
@@ -61,7 +62,11 @@ impl App {
         let unread_input_bytes = runtime.unread_input_bytes();
         let focus_reporting = runtime.focus_reporting_enabled();
         let mut nudged = false;
-        if nudge && should_send_wakeup(unread_input_bytes, focus_reporting) {
+        // The measurement can wait on the PTY actor, so the permission is
+        // checked only now, immediately before the write.
+        if should_send_wakeup(unread_input_bytes, focus_reporting)
+            && nudge.is_some_and(|nudge| nudge.claim_at(std::time::Instant::now()))
+        {
             match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(report) => match runtime.try_send_bytes(Bytes::from(report)) {
                     Ok(()) => nudged = true,
@@ -88,6 +93,46 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::should_send_wakeup;
+    use crate::api::{WakeupClaim, WakeupNudge};
+    use std::time::{Duration, Instant};
+
+    fn nudge(not_after: Instant) -> WakeupNudge {
+        WakeupNudge {
+            not_after,
+            claim: WakeupClaim::default(),
+        }
+    }
+
+    #[test]
+    fn a_late_wakeup_request_never_writes() {
+        let now = Instant::now();
+        let expired = nudge(now - Duration::from_millis(1));
+        assert!(!expired.claim_at(now), "a lapsed permission must not write");
+        assert!(
+            expired.claim.cancel(),
+            "the waiting prompt learns that nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_wakeup_withdrawn_by_the_prompt_never_writes() {
+        let now = Instant::now();
+        let withdrawn = nudge(now + Duration::from_secs(5));
+        assert!(withdrawn.claim.cancel());
+        assert!(!withdrawn.claim_at(now), "the prompt stopped waiting first");
+    }
+
+    #[test]
+    fn a_claimed_wakeup_cannot_be_withdrawn_or_claimed_twice() {
+        let now = Instant::now();
+        let live = nudge(now + Duration::from_secs(5));
+        assert!(live.claim_at(now));
+        assert!(!live.claim_at(now), "one write per request");
+        assert!(
+            !live.claim.cancel(),
+            "a prompt that gave up learns the write happened"
+        );
+    }
 
     #[test]
     fn wakeup_needs_queued_bytes_and_focus_reporting() {
