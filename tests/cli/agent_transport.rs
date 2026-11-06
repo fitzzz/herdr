@@ -491,3 +491,160 @@ fn send_keys_expect_session_refuses_an_unsupported_server_before_sending_keys() 
             .contains("agent_send_keys_expected_session"));
     }
 }
+
+#[test]
+fn send_keys_expect_launch_is_sent_with_the_session_guard_and_its_refusal_is_reported() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let token = "launch_0123456789abcdef0123456789abcdef";
+
+    let server = thread::spawn(move || {
+        for answer in [
+            serde_json::json!({"result": {"type": "ok"}}),
+            serde_json::json!({
+                "error": {
+                    "code": "agent_launch_mismatch",
+                    "message": "agent reviewer runs no attested launch, not the expected launch launch_0123456789abcdef0123456789abcdef; no keys were sent"
+                }
+            }),
+        ] {
+            let (mut stream, line) = accept_fake_cli_operation_advertising(
+                &listener,
+                &[
+                    "agent_send_keys_expected_session",
+                    "agent_send_keys_expected_launch_incarnation",
+                ],
+            );
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "agent.send_keys");
+            assert_eq!(
+                request["params"],
+                serde_json::json!({
+                    "target": "reviewer",
+                    "keys": ["esc"],
+                    "expected_session": "ses_old",
+                    "expected_launch_incarnation": token
+                })
+            );
+            let mut response = answer;
+            response["id"] = request["id"].clone();
+            writeln!(stream, "{response}").unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let guarded_send = [
+        "agent",
+        "send-keys",
+        "reviewer",
+        "--expect-launch",
+        token,
+        "esc",
+        "--expect-session",
+        "ses_old",
+    ];
+    let accepted = run_cli(&socket_path, &guarded_send);
+    assert!(
+        accepted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let refused = run_cli(&socket_path, &guarded_send);
+    server.join().unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_launch_mismatch");
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn send_keys_expect_launch_refuses_a_server_without_the_launch_guard_before_sending_keys() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    // The launch guard alone, and both guards on a server that has only the
+    // session guard: nothing may reach a server that would ignore a field.
+    for (flags, advertised) in [
+        (vec!["--expect-launch", "launch_x"], None),
+        (vec!["--expect-launch", "launch_x"], Some(false)),
+        (
+            vec!["--expect-launch", "launch_x", "--expect-session", "ses"],
+            Some(false),
+        ),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let worker_operations = Arc::clone(&operations);
+        let server = thread::spawn(move || {
+            while !worker_done.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(err) => panic!("accept: {err}"),
+                };
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = if request["method"] == "ping" {
+                    let mut capabilities = serde_json::json!({
+                        "live_handoff": false,
+                        "agent_send_keys_expected_session": true
+                    });
+                    if let Some(supported) = advertised {
+                        capabilities["agent_send_keys_expected_launch_incarnation"] =
+                            supported.into();
+                    }
+                    serde_json::json!({
+                        "type": "pong", "version": "older-server",
+                        "protocol": CURRENT_PROTOCOL, "capabilities": capabilities
+                    })
+                } else {
+                    worker_operations.lock().unwrap().push(request.clone());
+                    serde_json::json!({"type": "ok"})
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({"id": request["id"], "result": result})
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let mut args = vec!["agent", "send-keys", "reviewer", "esc"];
+        args.extend(flags.iter().copied());
+        let output = run_cli(&socket_path, &args);
+        done.store(true, Ordering::Release);
+        server.join().unwrap();
+        cleanup_test_base(&base);
+        assert!(
+            operations.lock().unwrap().is_empty(),
+            "{flags:?} against {advertised:?} must send no mutating request"
+        );
+        assert_eq!(output.status.code(), Some(1), "{flags:?}");
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "unsupported_capability");
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("agent_send_keys_expected_launch_incarnation")
+                && !message.contains("agent_send_keys_expected_session"),
+            "only the missing guard is named: {message}"
+        );
+    }
+}

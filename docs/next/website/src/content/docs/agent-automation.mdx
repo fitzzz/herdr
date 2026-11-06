@@ -130,6 +130,13 @@ session=$(herdr agent get reviewer | jq -r '.result.agent.agent_session.value')
 herdr agent send-keys reviewer esc --expect-session "$session"
 ```
 
+A new launch can resume the same conversation under the same name, so also pin the key to the launch you started. Record `launch_incarnation` from the `agent start` reply; Herdr returns `agent_launch_mismatch` and writes nothing once that launch's process is gone:
+
+```bash
+launch=$(herdr agent start reviewer --kind codex --pane "$pane" | jq -r '.result.launch_incarnation')
+herdr agent send-keys reviewer esc --expect-session "$session" --expect-launch "$launch"
+```
+
 Run an ordinary process and wait for its output without treating it as an agent:
 
 ```bash

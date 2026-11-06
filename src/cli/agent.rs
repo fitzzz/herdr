@@ -851,23 +851,29 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str =
-        "usage: herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]";
+    const USAGE: &str = "usage: herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION] [--expect-launch INCARNATION]";
     let Some(target) = args.first() else {
         eprintln!("{USAGE}");
         return Ok(2);
     };
     let mut keys = Vec::new();
     let mut expected_session = None;
+    let mut expected_launch_incarnation = None;
     let mut index = 1;
     while index < args.len() {
-        if args[index] == "--expect-session" {
+        let guard = match args[index].as_str() {
+            "--expect-session" => Some(&mut expected_session),
+            "--expect-launch" => Some(&mut expected_launch_incarnation),
+            _ => None,
+        };
+        if let Some(guard) = guard {
+            let flag = &args[index];
             let Some(value) = args.get(index + 1) else {
-                eprintln!("missing value for --expect-session");
+                eprintln!("missing value for {flag}");
                 return Ok(2);
             };
-            if expected_session.replace(value.clone()).is_some() {
-                eprintln!("--expect-session given more than once");
+            if guard.replace(value.clone()).is_some() {
+                eprintln!("{flag} given more than once");
                 return Ok(2);
             }
             index += 2;
@@ -881,24 +887,33 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    let guarded = expected_session.is_some();
+    // An older server ignores a guard field and writes the keys anyway, so a
+    // guarded request goes only to a server that advertises every guard it uses.
+    let mut required: Vec<super::RequiredCapability> = Vec::new();
+    if expected_session.is_some() {
+        required.push(("agent_send_keys_expected_session", |capabilities| {
+            capabilities.agent_send_keys_expected_session
+        }));
+    }
+    if expected_launch_incarnation.is_some() {
+        required.push((
+            "agent_send_keys_expected_launch_incarnation",
+            |capabilities| capabilities.agent_send_keys_expected_launch_incarnation,
+        ));
+    }
     let request = Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
             target: target.clone(),
             keys,
             expected_session,
+            expected_launch_incarnation,
         }),
     };
-    // An older server ignores expected_session and writes the keys anyway.
-    let response = if guarded {
-        super::send_request_requiring_capability(
-            &request,
-            "agent_send_keys_expected_session",
-            |capabilities| capabilities.agent_send_keys_expected_session,
-        )?
-    } else {
+    let response = if required.is_empty() {
         super::send_request(&request)?
+    } else {
+        super::send_request_requiring_capabilities(&request, &required)?
     };
     super::print_response(&response)
 }
@@ -972,7 +987,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]");
+    eprintln!("  herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION] [--expect-launch INCARNATION]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
@@ -994,4 +1009,71 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+/// The helper an admitted agent start types: `__attest-launch <nonce> --
+/// <argv...>`. It claims the admission from its own process, then execs
+/// `argv` in that process, which keeps its id and start time. The agent runs
+/// whether or not the claim succeeded; without it the launch is never
+/// attested, so keys guarded by its launch incarnation are refused. Returns
+/// only when `argv` could not be executed.
+pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
+    let (Some(nonce), Some("--"), Some(argv)) = (
+        args.first(),
+        args.get(1).map(String::as_str),
+        args.get(2..).filter(|argv| !argv.is_empty()),
+    ) else {
+        eprintln!(
+            "usage: herdr {} <nonce> -- <command> [args...]",
+            crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND
+        );
+        return Ok(2);
+    };
+    if let Err(reason) = attest_launch(nonce) {
+        eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
+    }
+    exec_launch(argv)
+}
+
+fn attest_launch(nonce: &str) -> Result<(), String> {
+    let socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR)
+        .ok_or_else(|| format!("{} is not set", crate::api::SOCKET_PATH_ENV_VAR))?;
+    let client = crate::api::client::ApiClient::for_target(
+        crate::api::client::ConnectionTarget::SocketPath(socket.into()),
+    );
+    let request = Request {
+        id: "launch:attest".into(),
+        method: Method::AgentAttestLaunch(crate::api::schema::AgentAttestLaunchParams {
+            nonce: nonce.to_string(),
+        }),
+    };
+    // A server that does not answer must not keep the agent from starting;
+    // a late claim still names this same process.
+    let response = client
+        .request_value_with_timeout(&request, Duration::from_secs(10))
+        .map_err(|err| err.to_string())?;
+    match response.get("error") {
+        None => Ok(()),
+        Some(error) => Err(error["message"]
+            .as_str()
+            .unwrap_or("the server refused the attestation")
+            .to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn exec_launch(argv: &[String]) -> std::io::Result<i32> {
+    use std::os::unix::process::CommandExt as _;
+    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
+    eprintln!("herdr: could not run {}: {err}", argv[0]);
+    Ok(127)
+}
+
+#[cfg(not(unix))]
+fn exec_launch(argv: &[String]) -> std::io::Result<i32> {
+    eprintln!(
+        "herdr: launch attestation is not supported on this platform; not running {}",
+        argv[0]
+    );
+    Ok(2)
 }

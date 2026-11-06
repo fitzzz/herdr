@@ -589,6 +589,7 @@ mod tests {
         assert_eq!(capture_from_state(&state).version, 3);
         let terminal = state.terminals.values_mut().next().unwrap();
         terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: Vec::new(),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,

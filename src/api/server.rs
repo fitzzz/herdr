@@ -85,6 +85,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         terminal_input_literal: true,
         agent_prompt_outcome: true,
         agent_send_keys_expected_session: true,
+        agent_send_keys_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()
             .filter(|agent| crate::agent_resume::carries_launch_options(*agent))
@@ -470,12 +471,15 @@ fn handle_connection_with_stop(
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
         method_body => {
-            let peer_ancestry = matches!(method_body, Method::PaneReportAgentSession(_))
-                .then(|| crate::platform::local_stream_peer_process_id(&stream))
-                .flatten()
-                .map(|process_id| {
-                    crate::detect::process_ancestry(process_id, crate::platform::process_and_parent)
-                });
+            let peer_ancestry = matches!(
+                method_body,
+                Method::PaneReportAgentSession(_) | Method::AgentAttestLaunch(_)
+            )
+            .then(|| crate::platform::local_stream_peer_process_id(&stream))
+            .flatten()
+            .map(|process_id| {
+                crate::detect::process_ancestry(process_id, crate::platform::process_and_parent)
+            });
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let response = handle_request(
                 Request {
@@ -643,6 +647,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartWithLauncher(_) => "agent.start_with_launcher",
         Method::AgentLauncherInfo(_) => "agent.launcher_info",
+        Method::AgentAttestLaunch(_) => "agent.attest_launch",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
@@ -1532,6 +1537,7 @@ mod tests {
                 terminal_input_literal: false,
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
+                agent_send_keys_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),
             None,
@@ -1591,6 +1597,12 @@ mod tests {
     fn ping_advertises_agent_send_keys_expected_session() {
         let capabilities = default_capabilities().expect("capabilities");
         assert!(capabilities.agent_send_keys_expected_session);
+    }
+
+    #[test]
+    fn ping_advertises_agent_send_keys_expected_launch_incarnation() {
+        let capabilities = default_capabilities().expect("capabilities");
+        assert!(capabilities.agent_send_keys_expected_launch_incarnation);
     }
 
     #[test]

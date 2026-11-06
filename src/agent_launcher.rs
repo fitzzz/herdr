@@ -15,6 +15,22 @@ pub struct BoundAgentLauncher {
     /// Only a current-process native report can confirm a restored/admitted binding.
     #[serde(skip)]
     pub observed: bool,
+    /// The `launch_incarnation` of the admitted launch whose own process sent
+    /// an official native report of `session`. Set only from such a report,
+    /// never from a matching kind, a saved record or a report another process
+    /// sent. `agent.launcher_info` confirms the binding only while this equals
+    /// the terminal's current launch incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_launch_incarnation: Option<String>,
+}
+
+impl BoundAgentLauncher {
+    /// The binding as a server that did not see its launch's report keeps it:
+    /// a cold restore carries no process to attest a launch with.
+    pub(crate) fn without_launch_evidence(mut self) -> Self {
+        self.session_launch_incarnation = None;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

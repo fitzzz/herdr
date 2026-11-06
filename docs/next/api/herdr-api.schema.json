@@ -1228,6 +1228,18 @@
     },
     "request": {
       "$defs": {
+        "AgentAttestLaunchParams": {
+          "description": "Sent by the helper Herdr types for an admitted agent start, from the\nprocess that start runs, before it executes the agent. Not for clients:\nthe nonce is spent by its first use.",
+          "properties": {
+            "nonce": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "nonce"
+          ],
+          "type": "object"
+        },
         "AgentLauncher": {
           "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
           "properties": {
@@ -1348,6 +1360,13 @@
         },
         "AgentSendKeysParams": {
           "properties": {
+            "expected_launch_incarnation": {
+              "description": "The launch the caller expects the target to run: the\n`launch_incarnation` its `agent.start` or `agent.start_with_launcher`\nreply returned. When present, the server compares it, byte for byte,\nwith the target's current launch incarnation in the same step that\nchecks `expected_session` and writes the keys, and refuses with\n`agent_launch_mismatch`, writing nothing, when they differ or no launch\nis attested. Advertised by\n`ServerCapabilities::agent_send_keys_expected_launch_incarnation`;\nolder servers ignore the field.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "expected_session": {
               "description": "The native agent session the caller expects the target to occupy: the\n`agent_session.value` that `agent.get` reports. When present, the server\ncompares it with the occupant's current session in the same step that\nwrites the keys and refuses with `agent_session_mismatch`, writing\nnothing, when they differ or no session is known. Advertised by\n`ServerCapabilities::agent_send_keys_expected_session`; older servers\nignore the field.",
               "type": [
@@ -5610,6 +5629,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.attest_launch",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentAttestLaunchParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.prompt",
               "type": "string"
             },
@@ -6864,6 +6899,13 @@
             "interactive_ready": {
               "type": "boolean"
             },
+            "launch_incarnation": {
+              "description": "The admitted `agent.start` launch this agent is: present only while\nthe process that launch started, identified by its process id and\nstart time, is the terminal's agent process. Absent before Herdr has\nseen that process, and for good once it exits, the pane respawns,\nanother process takes the terminal or a new start is admitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "launch_pending": {
               "type": "boolean"
             },
@@ -7119,6 +7161,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "session_launch_incarnation": {
+              "description": "The `launch_incarnation` of the admitted launch whose own process sent\nan official native report of `session`. Set only from such a report,\nnever from a matching kind, a saved record or a report another process\nsent. `agent.launcher_info` confirms the binding only while this equals\nthe terminal's current launch incarnation.",
+              "type": [
+                "string",
+                "null"
               ]
             }
           },
@@ -9825,6 +9874,13 @@
                   },
                   "type": "array"
                 },
+                "launch_incarnation": {
+                  "description": "The token of this admission. Record it now: `agent.launch_incarnation`\nreports it only once Herdr has seen the launch's own process, and\nnever again after that process is gone. Absent where Herdr cannot\nattest a launch (Windows).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "agent_started",
                   "type": "string"
@@ -9847,6 +9903,13 @@
                     "type": "string"
                   },
                   "type": "array"
+                },
+                "launch_incarnation": {
+                  "description": "As for `AgentStarted`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "launcher": {
                   "$ref": "#/schemas/success_response/$defs/AgentLauncher"
@@ -10878,6 +10941,11 @@
             "agent_prompt_outcome": {
               "default": false,
               "description": "`agent.prompt` reports a truthful submission outcome: it refuses a busy\ncomposer with `agent_not_ready`, answers `agent_prompt_stalled` when\nacceptance evidence is missing, and answers `agent_prompt_not_submitted`\nwhen the text stayed in the composer or was rejected. A success answer\nmeans acceptance was observed.",
+              "type": "boolean"
+            },
+            "agent_send_keys_expected_launch_incarnation": {
+              "default": false,
+              "description": "`agent.send_keys` honors `expected_launch_incarnation`: it refuses with\n`agent_launch_mismatch`, writing nothing, unless the target's current\nlaunch incarnation equals it. Older servers ignore the field and write.",
               "type": "boolean"
             },
             "agent_send_keys_expected_session": {

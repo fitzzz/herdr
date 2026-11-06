@@ -337,6 +337,9 @@ fn agent_command() -> Command {
                 .arg(option("expect-session", "SESSION").help(
                     "Write nothing unless the agent still occupies this native session (agent get's agent_session.value)",
                 ))
+                .arg(option("expect-launch", "INCARNATION").help(
+                    "Write nothing unless the agent still runs this launch (the launch_incarnation its agent start reply returned)",
+                ))
                 .after_help("Use esc as the canonical Escape key name; escape is also accepted."),
         )
         .subcommand(
@@ -1281,6 +1284,10 @@ mod tests {
         assert!(has_option(
             command_path(&cmd, &["agent", "send-keys"]),
             "expect-session"
+        ));
+        assert!(has_option(
+            command_path(&cmd, &["agent", "send-keys"]),
+            "expect-launch"
         ));
 
         let pane = command_path(&cmd, &["pane"]);

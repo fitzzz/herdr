@@ -29,6 +29,25 @@ pub struct AgentSendKeysParams {
     /// ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_session: Option<String>,
+    /// The launch the caller expects the target to run: the
+    /// `launch_incarnation` its `agent.start` or `agent.start_with_launcher`
+    /// reply returned. When present, the server compares it, byte for byte,
+    /// with the target's current launch incarnation in the same step that
+    /// checks `expected_session` and writes the keys, and refuses with
+    /// `agent_launch_mismatch`, writing nothing, when they differ or no launch
+    /// is attested. Advertised by
+    /// `ServerCapabilities::agent_send_keys_expected_launch_incarnation`;
+    /// older servers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_launch_incarnation: Option<String>,
+}
+
+/// Sent by the helper Herdr types for an admitted agent start, from the
+/// process that start runs, before it executes the agent. Not for clients:
+/// the nonce is spent by its first use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentAttestLaunchParams {
+    pub nonce: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -238,6 +257,13 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// The admitted `agent.start` launch this agent is: present only while
+    /// the process that launch started, identified by its process id and
+    /// start time, is the terminal's agent process. Absent before Herdr has
+    /// seen that process, and for good once it exits, the pane respawns,
+    /// another process takes the terminal or a new start is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_incarnation: Option<String>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,

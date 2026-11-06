@@ -94,6 +94,12 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
+/// The attesting launch helper an admitted agent start types; see
+/// [`agent::run_attested_launch`].
+pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
+    agent::run_attested_launch(args)
+}
+
 pub(crate) fn maybe_run_machine(args: &[String]) -> Option<std::io::Result<CommandOutcome>> {
     target::maybe_run(args)
 }
@@ -794,24 +800,32 @@ pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Val
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
-/// Sends `request` only when the selected server advertises `capability`.
-/// Otherwise nothing is sent and the answer is an `unsupported_capability`
-/// error, for requests whose field an older server would ignore while still
-/// performing the effect.
-pub(super) fn send_request_requiring_capability(
+/// A capability a request needs, by its advertised name and how to read it.
+pub(super) type RequiredCapability = (&'static str, fn(&ServerCapabilities) -> bool);
+
+/// Sends `request` only when the selected server advertises every capability
+/// in `required`. Otherwise nothing is sent and the answer is an
+/// `unsupported_capability` error naming the missing ones, for requests whose
+/// field an older server would ignore while still performing the effect.
+pub(super) fn send_request_requiring_capabilities(
     request: &Request,
-    capability: &str,
-    advertised: fn(&ServerCapabilities) -> bool,
+    required: &[RequiredCapability],
 ) -> std::io::Result<serde_json::Value> {
     let client = target::api_client()?;
     let status = ensure_server_protocol_compatible(&client, &request.id)?;
-    if !status.capabilities.as_ref().is_some_and(advertised) {
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|(_, advertised)| !status.capabilities.as_ref().is_some_and(advertised))
+        .map(|(capability, _)| *capability)
+        .collect();
+    if !missing.is_empty() {
         return serde_json::to_value(ErrorResponse {
             id: request.id.clone(),
             error: ErrorBody {
                 code: "unsupported_capability".into(),
                 message: format!(
-                    "the Herdr server does not advertise {capability}; nothing was sent. Update the Herdr server to a build that advertises it."
+                    "the Herdr server does not advertise {}; nothing was sent. Update the Herdr server to a build that advertises it.",
+                    missing.join(" and ")
                 ),
             },
         })

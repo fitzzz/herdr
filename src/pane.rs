@@ -297,22 +297,24 @@ async fn publish_agent_process_detected_event(
 /// the program its command line ran (`argv[0]`) when it was read.
 type PublishedAgentLaunch = (Agent, crate::platform::ProcessInstance, Option<String>);
 
-/// Claude, Codex, Grok and OpenCode restore repeats the options read from the agent's
-/// command line, so each new agent process is reported once, also when a wrapper runs
-/// one after another in the same process group, or a later process reuses the
-/// id (told apart by its start time). A process is reported once more when a
-/// later probe reads a command line it could not read before (the read is
-/// skipped while the process sleeps uninterruptibly), and when its program
-/// changed, as when a launcher script execs the agent in its own process.
-/// Returns the observation to publish, if any.
+/// Each new agent process is reported once, of any agent kind: a launch
+/// incarnation is attested only while detection shows its own process (see
+/// [`crate::terminal::launch_incarnation`]), and Claude, Codex, Grok and
+/// OpenCode restore repeats the options read from the agent's command line.
+/// A process is new also when a wrapper runs one after another in the same
+/// process group, or a later process reuses the id (told apart by its start
+/// time). A process is reported once more when a later probe reads a command
+/// line it could not read before (the read is skipped while the process
+/// sleeps uninterruptibly), and when its program changed, as when a launcher
+/// script execs the agent in its own process. Returns the observation to
+/// publish, if any.
 fn agent_launch_observation(
     agent: Option<Agent>,
     agent_process: Option<crate::platform::ProcessInstance>,
     argv: Option<&[String]>,
     last_published: &mut Option<PublishedAgentLaunch>,
 ) -> Option<(Agent, crate::platform::ProcessInstance)> {
-    let Some(agent) = agent.filter(|agent| crate::agent_resume::carries_launch_options(*agent))
-    else {
+    let Some(agent) = agent else {
         *last_published = None;
         return None;
     };
@@ -2356,6 +2358,7 @@ impl PaneRuntime {
             initial_history_ansi: None,
             agent_state: None,
             agent_launch: None,
+            launch_incarnation: None,
             input_streams: Some(Box::new(self.input_streams.lock().export_for_handoff())),
         }
     }
@@ -2572,6 +2575,7 @@ impl PaneRuntime {
             initial_history_ansi,
             agent_state: _,
             agent_launch: _,
+            launch_incarnation: _,
             input_streams,
         } = state;
         let input_streams = crate::terminal::input_streams::TerminalInputStreams::from_table(
@@ -5953,7 +5957,8 @@ mod tests {
                 crate::platform::ProcessInstance::unknown_start(11)
             ))
         );
-        // Other agents carry no launch options and reset the tracking.
+        // Agents without launch options are reported too, for their launch
+        // incarnation.
         assert_eq!(
             agent_launch_observation(
                 Some(Agent::Pi),
@@ -5961,9 +5966,11 @@ mod tests {
                 Some(&claude_argv),
                 &mut last
             ),
-            None
+            Some((
+                Agent::Pi,
+                crate::platform::ProcessInstance::unknown_start(12)
+            ))
         );
-        assert_eq!(last, None);
         assert_eq!(
             agent_launch_observation(
                 None,

@@ -1450,6 +1450,7 @@ impl AppState {
                 account,
             } => {
                 self.update_terminal_state(pane_id, |terminal| {
+                    terminal.observe_agent_process(agent, process);
                     let options = crate::agent_resume::launch_options_from_process_argv(
                         agent,
                         argv.as_deref(),
@@ -3626,6 +3627,7 @@ mod tests {
             .get_mut(&terminal_id)
             .unwrap()
             .agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: launcher.argv(&native),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,

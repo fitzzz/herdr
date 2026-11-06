@@ -145,7 +145,7 @@ impl App {
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+    ) -> Result<StartedAgent, AgentStartError> {
         self.start_agent_using_launcher(params, None)
     }
 
@@ -153,7 +153,7 @@ impl App {
         &mut self,
         params: AgentStartParams,
         launcher: Option<crate::api::schema::AgentLauncher>,
-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+    ) -> Result<StartedAgent, AgentStartError> {
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -204,15 +204,38 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
+        // The shell runs the attesting helper, which claims this admission
+        // from its own process and then execs `argv` in it.
+        let attestation = attestable_launch(kind);
+        let typed = |argv: &[String]| match &attestation {
+            Some((helper, _, nonce)) => [
+                helper.clone(),
+                crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND.to_string(),
+                nonce.clone(),
+                "--".to_string(),
+            ]
+            .into_iter()
+            .chain(argv.iter().cloned())
+            .collect(),
+            None => argv.to_vec(),
+        };
         let (argv, command) = if let Some(launcher) = &launcher {
-            let command = launcher
-                .command(&params.args, &shell_name)
+            launcher
+                .validate()
                 .map_err(AgentStartError::InvalidLauncher)?;
-            (launcher.argv(&params.args), command)
+            let argv = launcher.argv(&params.args);
+            let command =
+                crate::platform::agent_launcher_command(&typed(&argv), &launcher.env, &shell_name)
+                    .ok_or_else(|| {
+                        AgentStartError::InvalidLauncher(
+                            "launcher cannot be encoded for the target shell".into(),
+                        )
+                    })?;
+            (argv, command)
         } else {
             let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
             argv.extend(params.args);
-            let command = crate::platform::interactive_shell_command(&argv, &shell_name)
+            let command = crate::platform::interactive_shell_command(&typed(&argv), &shell_name)
                 .ok_or(AgentStartError::InvalidArgument)?;
             (argv, command)
         };
@@ -237,6 +260,10 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
+        let launch_incarnation = attestation
+            .as_ref()
+            .map(|(_, launch, _)| launch.token().to_string());
+        terminal.admit_launch_incarnation(attestation.map(|(_, launch, _)| launch));
         if let Some(options) = launch_options {
             terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
                 agent: kind,
@@ -252,6 +279,7 @@ impl App {
         }
         if let Some(launcher) = launcher {
             let binding = crate::agent_launcher::BoundAgentLauncher {
+                session_launch_incarnation: None,
                 observed: false,
                 argv: argv.clone(),
                 argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
@@ -274,7 +302,11 @@ impl App {
         let agent = self
             .agent_info(ws_idx, pane_id)
             .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
-        Ok((agent, argv))
+        Ok(StartedAgent {
+            agent,
+            argv,
+            launch_incarnation,
+        })
     }
 
     pub(super) fn agent_start_error_body(
@@ -450,6 +482,7 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            launch_incarnation: terminal.launch_incarnation().map(str::to_string),
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,
@@ -477,6 +510,34 @@ impl App {
             })
             .collect()
     }
+}
+
+/// An admitted start: the agent as the reply shows it, the argv its launch
+/// runs, and the token of the admission when Herdr can attest it.
+pub(super) struct StartedAgent {
+    pub(super) agent: crate::api::schema::AgentInfo,
+    pub(super) argv: Vec<String>,
+    pub(super) launch_incarnation: Option<String>,
+}
+
+/// The helper executable, the new admission and the nonce its helper claims
+/// it with, where Herdr can attest a launch: on Unix, where the server reads
+/// the sender of a local connection and its start time, and `exec` keeps the
+/// process id and start time the claim was bound to. Windows has no `exec`
+/// and Herdr reads no process start times there, so no launch is attested.
+fn attestable_launch(
+    agent: crate::detect::Agent,
+) -> Option<(
+    String,
+    crate::terminal::launch_incarnation::LaunchIncarnation,
+    String,
+)> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let helper = crate::platform::launch_executable().ok()?;
+    let (launch, nonce) = crate::terminal::launch_incarnation::LaunchIncarnation::admit(agent);
+    Some((helper.display().to_string(), launch, nonce))
 }
 
 fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {

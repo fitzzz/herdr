@@ -1564,3 +1564,159 @@ fn agent_wait_ignores_other_panes_and_errors_when_its_pane_closes() {
 
     cleanup_spawned_herdr(herdr, base);
 }
+
+#[test]
+fn agent_start_attests_its_own_process_and_send_keys_follows_only_that_launch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let lines = base.join("pi-lines");
+    let pids = base.join("pi-pids");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\necho $$ >> '{pids}'\nexport HERDR_AGENT=pi\n'{herdr}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\n  printf 'line:%s\\n' \"$line\" >> '{lines}'\ndone\n",
+            pids = pids.display(),
+            herdr = env!("CARGO_BIN_EXE_herdr"),
+            lines = lines.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let shell_pid = run_cli_json(&socket_path, &["pane", "process-info", "--pane", &pane_id])
+        ["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .expect("the pane reports its shell");
+
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+        ],
+    );
+    assert_eq!(started["result"]["type"], "agent_started", "{started}");
+    let token = started["result"]["launch_incarnation"]
+        .as_str()
+        .expect("the start reply carries the launch incarnation")
+        .to_string();
+    assert_eq!(started["result"]["argv"], serde_json::json!(["pi"]));
+    // The helper exec'd the agent in its own process, which the shell forked.
+    let agent_pid: u32 = fs::read_to_string(&pids).unwrap().trim().parse().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{agent_pid}/stat")).unwrap();
+        let after_comm = stat.rsplit_once(") ").unwrap().1;
+        let parent: u64 = after_comm
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(parent, shell_pid, "the agent is the shell's own child");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (agent_pid, shell_pid);
+    let attested = || {
+        run_cli_json(&socket_path, &["agent", "get", &pane_id])["result"]["agent"]
+            ["launch_incarnation"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            attested().as_deref() == Some(token.as_str())
+        }),
+        "agent get attests the started launch"
+    );
+
+    let send = |expected: &str| {
+        run_cli(
+            &socket_path,
+            &[
+                "agent",
+                "send-keys",
+                &pane_id,
+                "--expect-launch",
+                expected,
+                "enter",
+            ],
+        )
+    };
+    let wrong = send("launch_00000000000000000000000000000000");
+    assert_eq!(wrong.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&wrong.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_launch_mismatch", "{error}");
+    let right = send(&token);
+    assert!(
+        right.status.success(),
+        "{}",
+        String::from_utf8_lossy(&right.stderr)
+    );
+    // The PTY is ordered: once the accepted key arrived, the refused one
+    // would have arrived before it.
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || fs::read_to_string(&lines).is_ok_and(|text| text == "line:\n")
+    ));
+
+    // The launch's process exits and the user starts another pi in the pane.
+    for args in [
+        ["pane", "send-text", &pane_id, "quit"],
+        ["pane", "send-keys", &pane_id, "enter"],
+        ["pane", "send-text", &pane_id, "pi"],
+        ["pane", "send-keys", &pane_id, "enter"],
+    ] {
+        let output = run_cli(&socket_path, &args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || fs::read_to_string(&pids).is_ok_and(|text| text.lines().count() == 2)
+    ));
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            let agent = run_cli_json(&socket_path, &["agent", "list"]);
+            agent["result"]["agents"].as_array().is_some_and(|agents| {
+                agents.iter().any(|agent| {
+                    agent["pane_id"] == pane_id.as_str()
+                        && agent["agent"] == "pi"
+                        && agent.get("launch_incarnation").is_none()
+                })
+            })
+        }),
+        "the replacement pi is an agent with no launch incarnation"
+    );
+    let stale = send(&token);
+    assert_eq!(stale.status.code(), Some(1));
+    let error: serde_json::Value = serde_json::from_slice(&stale.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "agent_launch_mismatch", "{error}");
+    assert_eq!(fs::read_to_string(&lines).unwrap(), "line:\n");
+    cleanup_spawned_herdr(herdr, base);
+}

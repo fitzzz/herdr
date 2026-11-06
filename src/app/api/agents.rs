@@ -85,6 +85,10 @@ impl App {
                                 &current.agent,
                             )
                     })
+                // The session was reported by the process of the launch that
+                // still holds the terminal.
+                && agent.launch_incarnation.is_some()
+                && binding.session_launch_incarnation == agent.launch_incarnation
                 && crate::detect::parse_agent_label(&binding.agent).is_some_and(|kind| {
                     self.state
                         .terminals
@@ -103,6 +107,72 @@ impl App {
                 confirmed,
             },
         )
+    }
+
+    /// The launch helper an admitted start typed claims that admission from
+    /// its own process, read from the connection as `peer_ancestry` (the
+    /// sender first). The nonce is spent by this first use whatever the
+    /// outcome; only the pane shell's direct child with a readable start time
+    /// binds the launch.
+    pub(super) fn handle_agent_attest_launch(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentAttestLaunchParams,
+        peer_ancestry: Option<&[crate::platform::AncestorProcess]>,
+    ) -> String {
+        let Some(terminal_id) = self
+            .state
+            .terminals
+            .iter()
+            .find(|(_, terminal)| terminal.launch_awaits_claim(&params.nonce))
+            .map(|(terminal_id, _)| terminal_id.clone())
+        else {
+            return encode_error(
+                id,
+                "launch_attestation_refused",
+                "no admitted agent start waits for this attestation",
+            );
+        };
+        let shell = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(crate::terminal::TerminalRuntime::child_pid);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return encode_error(
+                id,
+                "launch_attestation_refused",
+                "the admitted agent start's terminal is gone",
+            );
+        };
+        let claimed = match peer_ancestry.and_then(<[_]>::first) {
+            Some(sender) => terminal.claim_launch_incarnation(
+                crate::platform::ProcessInstance {
+                    pid: sender.process.pid,
+                    started: sender.process.started,
+                },
+                sender.parent,
+                shell,
+            ),
+            None => {
+                terminal.admit_launch_incarnation(None);
+                Err(crate::terminal::launch_incarnation::ClaimRefusal::UnknownBirth)
+            }
+        };
+        match claimed {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(refusal) => encode_error(
+                id,
+                "launch_attestation_refused",
+                match refusal {
+                    crate::terminal::launch_incarnation::ClaimRefusal::UnknownBirth => {
+                        "the server could not read the launching process and its start time"
+                    }
+                    crate::terminal::launch_incarnation::ClaimRefusal::NotTheShellsChild => {
+                        "the launching process is not the pane shell's own child"
+                    }
+                },
+            ),
+        }
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
@@ -124,12 +194,19 @@ impl App {
     }
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
-        let (agent, argv) = match self.start_agent(params) {
+        let started = match self.start_agent(params) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
 
-        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+        encode_success(
+            id,
+            ResponseResult::AgentStarted {
+                agent: started.agent,
+                argv: started.argv,
+                launch_incarnation: started.launch_incarnation,
+            },
+        )
     }
 
     pub(super) fn handle_agent_start_with_launcher(
@@ -146,12 +223,13 @@ impl App {
             timeout_ms: params.timeout_ms,
         };
         match self.start_agent_using_launcher(native, Some(launcher.clone())) {
-            Ok((agent, argv)) => encode_success(
+            Ok(started) => encode_success(
                 id,
                 ResponseResult::AgentStartedWithLauncher {
-                    agent,
-                    argv,
+                    agent: started.agent,
+                    argv: started.argv,
                     launcher,
+                    launch_incarnation: started.launch_incarnation,
                 },
             ),
             Err(err) => encode_error_body(id, self.agent_start_error_body(err)),
@@ -467,18 +545,23 @@ impl App {
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        // Checked in the same step that enqueues the bytes: a replacement
-        // native session can only be recorded by another app-loop step, so it
-        // cannot land between this comparison and the write.
+        // Both guards are checked in the same step that enqueues the bytes: a
+        // replacement native session or launch can only be recorded by another
+        // app-loop step, so it cannot land between these comparisons and the
+        // write.
+        let terminal = self.state.terminals.get(terminal_id);
         if let Some(expected) = params.expected_session.as_deref() {
-            let current = self
-                .state
-                .terminals
-                .get(terminal_id)
+            let current = terminal
                 .and_then(super::super::creation::terminal_agent_session_info)
                 .map(|session| session.value);
             if current.as_deref() != Some(expected) {
                 return agent_session_mismatch(id, &params.target, expected, current.as_deref());
+            }
+        }
+        if let Some(expected) = params.expected_launch_incarnation.as_deref() {
+            let current = terminal.and_then(crate::terminal::TerminalState::launch_incarnation);
+            if current != Some(expected) {
+                return agent_launch_mismatch(id, &params.target, expected, current);
             }
         }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
@@ -512,6 +595,23 @@ fn agent_session_mismatch(
         ),
     };
     encode_error(id, "agent_session_mismatch", message)
+}
+
+fn agent_launch_mismatch(
+    id: String,
+    target: &str,
+    expected: &str,
+    current: Option<&str>,
+) -> String {
+    let message = match current {
+        Some(current) => format!(
+            "agent {target} runs launch {current}, not the expected launch {expected}; no keys were sent"
+        ),
+        None => format!(
+            "agent {target} runs no attested launch, not the expected launch {expected}; no keys were sent"
+        ),
+    };
+    encode_error(id, "agent_launch_mismatch", message)
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -1011,6 +1111,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["enter".into(), "not-a-key".into()],
                 expected_session: None,
+                expected_launch_incarnation: None,
             },
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
@@ -1023,6 +1124,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["up".into(), "enter".into()],
                 expected_session: None,
+                expected_launch_incarnation: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&sent).unwrap();
@@ -1088,6 +1190,7 @@ contains = ["TEST-DRAFT"]
                 target: "reviewer".into(),
                 keys: vec!["esc".into()],
                 expected_session: expected_session.map(str::to_string),
+                expected_launch_incarnation: None,
             },
         )
     }
@@ -1336,3 +1439,7 @@ contains = ["TEST-DRAFT"]
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_launch_incarnation_tests.rs"]
+mod launch_incarnation_tests;

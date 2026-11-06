@@ -100,11 +100,20 @@ pub enum ResponseResult {
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+        /// The token of this admission. Record it now: `agent.launch_incarnation`
+        /// reports it only once Herdr has seen the launch's own process, and
+        /// never again after that process is gone. Absent where Herdr cannot
+        /// attest a launch (Windows).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_incarnation: Option<String>,
     },
     AgentStartedWithLauncher {
         agent: AgentInfo,
         argv: Vec<String>,
         launcher: super::agents::AgentLauncher,
+        /// As for `AgentStarted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_incarnation: Option<String>,
     },
     AgentLauncherInfo {
         agent: AgentInfo,
