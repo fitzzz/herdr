@@ -26,6 +26,8 @@ struct Fixture {
     token: String,
     lines: std::path::PathBuf,
     pids: std::path::PathBuf,
+    held: std::path::PathBuf,
+    gate: std::path::PathBuf,
 }
 
 impl Fixture {
@@ -38,15 +40,19 @@ impl Fixture {
         let bin = base.join("bin");
         let lines = base.join("pi-lines");
         let pids = base.join("pi-pids");
+        let held = base.join("pi-held");
+        let gate = base.join("pi-gate");
         fs::create_dir_all(&bin).unwrap();
         let fake_pi = bin.join("pi");
         fs::write(
             &fake_pi,
             format!(
-                "#!/bin/sh\necho $$ >> '{pids}'\nexport HERDR_AGENT=pi\n'{herdr}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\n  printf 'line:%s\\n' \"$line\" >> '{lines}'\ndone\n",
+                "#!/bin/sh\necho $$ >> '{pids}'\nexport HERDR_AGENT=pi\n'{herdr}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\n  if [ \"$line\" = hold ]; then\n    : > '{held}'\n    while [ ! -e '{gate}' ]; do sleep 0.01; done\n    exit 0\n  fi\n  printf 'line:%s\\n' \"$line\" >> '{lines}'\ndone\n",
                 pids = pids.display(),
                 herdr = env!("CARGO_BIN_EXE_herdr"),
                 lines = lines.display(),
+                held = held.display(),
+                gate = gate.display(),
             ),
         )
         .unwrap();
@@ -72,6 +78,8 @@ impl Fixture {
             token: String::new(),
             lines,
             pids,
+            held,
+            gate,
         };
         fixture.token = fixture.start_pi("worker");
         fixture
@@ -643,6 +651,8 @@ fn guarded_control_writes_to_the_launch_until_it_ends_then_stops() {
     let mut stdin = child.stdin.take().unwrap();
     let mut control = StreamHelper::new(child);
     assert_eq!(control.next_line()["type"], "terminal.frame");
+    // Empty input is no write at all, and the stream carries on.
+    writeln!(stdin, r#"{{"type":"terminal.input","text":""}}"#).unwrap();
     writeln!(
         stdin,
         r#"{{"type":"terminal.input","text":"via-control\n"}}"#
@@ -670,6 +680,98 @@ fn guarded_control_writes_to_the_launch_until_it_ends_then_stops() {
         "{}",
         fixture.lines()
     );
+    fixture.finish();
+}
+
+/// Unread bytes waiting in the terminal `pid` reads as its stdin.
+fn unread_terminal_input(pid: u32) -> Option<i32> {
+    let path = std::ffi::CString::new(format!("/proc/{pid}/fd/0")).unwrap();
+    // SAFETY: the path is a valid C string and the descriptor is closed below.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    let mut unread: libc::c_int = 0;
+    // SAFETY: `fd` is open and FIONREAD writes one int to the pointer.
+    let result = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut unread) };
+    // SAFETY: `fd` is open and owned here.
+    unsafe { libc::close(fd) };
+    (result == 0).then_some(unread)
+}
+
+/// The bytes the writer has not reached yet must not outlive the launch they
+/// were accepted for. The launch holds still with its terminal full, so one
+/// long input is partly written and waits in the writer's queue. The launch
+/// then exits and its shell starts a replacement, which reads whatever follows.
+#[test]
+fn a_queued_stream_write_stops_when_the_launch_is_replaced() {
+    const TOTAL: usize = 256 * 1024;
+    let fixture = Fixture::start();
+    let launch_pid: u32 = fs::read_to_string(&fixture.pids)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut child = fixture
+        .command(&session_args("control", &fixture.pane_id, &fixture.token))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut control = StreamHelper::new(child);
+    assert_eq!(control.next_line()["type"], "terminal.frame");
+
+    // The replacement's start is already queued behind the line that holds A.
+    let typed = run_cli(
+        &fixture.socket_path,
+        &["pane", "send-text", &fixture.pane_id, "hold\npi\n"],
+    );
+    assert!(typed.status.success(), "{typed:?}");
+    assert!(wait_until(WAIT, POLL, || fixture.held.exists()), "A holds");
+
+    let input = serde_json::json!({"type": "terminal.input", "text": "\n".repeat(TOTAL)});
+    writeln!(stdin, "{input}").unwrap();
+    stdin.flush().unwrap();
+    // The terminal is full while A still leads it: this is a partial write.
+    assert!(
+        wait_until(WAIT, POLL, || unread_terminal_input(launch_pid)
+            .is_some_and(|unread| unread >= 1024)),
+        "the input reached the terminal while A led it"
+    );
+    assert_eq!(fixture.started_pis(), 1, "A is still the only one");
+    assert!(fixture.lines().is_empty(), "A read none of it");
+
+    fs::write(&fixture.gate, "").unwrap();
+    assert!(
+        wait_until(WAIT, POLL, || fixture.started_pis() == 2),
+        "the replacement started"
+    );
+    let (closed, _) = control.closed_record();
+    let reason = closed["reason"].as_str().unwrap();
+    assert!(reason.starts_with("terminal_launch_ended: "), "{reason}");
+
+    // The replacement reads what was written while A led. That is what the
+    // terminal's buffers held, far less than the input; the rest never comes.
+    let limit = TOTAL / 4;
+    let mut read = 0;
+    let mut unchanged_since = Instant::now();
+    while unchanged_since.elapsed() < Duration::from_secs(1) {
+        let now = fixture.lines().lines().count();
+        assert!(now < limit, "the replacement read {now} lines of {TOTAL}");
+        if now != read {
+            read = now;
+            unchanged_since = Instant::now();
+        }
+        thread::sleep(POLL);
+    }
+    assert!(read > 0, "the buffered prefix reached the replacement");
     fixture.finish();
 }
 

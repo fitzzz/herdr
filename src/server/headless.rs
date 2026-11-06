@@ -64,9 +64,12 @@ use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
 use crate::server::pane_input::{
-    apply_client_pane_input_events, apply_client_popup_input_events, apply_terminal_attach_input,
-    apply_terminal_attach_scroll, terminal_attach_mouse_position,
+    apply_client_pane_input_events, apply_client_popup_input_events, guarded_write_failure,
+    terminal_attach_mouse_position, write_terminal_attach_events, write_terminal_attach_input,
+    write_terminal_attach_scroll, GuardedStream, InputWriter,
 };
+#[cfg(test)]
+use crate::server::pane_input::{apply_terminal_attach_input, apply_terminal_attach_scroll};
 use crate::server::socket_paths::{
     client_socket_path, prepare_socket_path, restrict_socket_permissions,
 };
@@ -1357,6 +1360,7 @@ impl HeadlessServer {
         client_id: u64,
         target: protocol::ClientClipboardImageTarget,
         path: String,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> bool {
         match target {
             protocol::ClientClipboardImageTarget::DirectTerminal => {
@@ -1369,9 +1373,12 @@ impl HeadlessServer {
                 };
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
+                    let mut writer = InputWriter::new(runtime, guard);
+                    if let Err(err) = writer.send(Bytes::from(payload)) {
                         warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
                     }
+                    let writes = writer.into_guarded_writes();
+                    self.keep_guarded_writes(client_id, writes);
                 }
                 true
             }
@@ -1555,7 +1562,7 @@ impl HeadlessServer {
             Some(LaunchRefusal::Malformed)
         } else {
             match &terminal_id {
-                Some(terminal_id) => self.app.launch_refusal(terminal_id, &expected),
+                Some(terminal_id) => self.app.prove_launch(terminal_id, &expected).err(),
                 None => Some(LaunchRefusal::TerminalGone),
             }
         };
@@ -1621,28 +1628,33 @@ impl HeadlessServer {
         }
     }
 
-    /// Ends the guarded stream of `client_id` when its launch no longer
-    /// occupies the terminal, with the reason as the stream's close reason.
-    /// Returns whether it ended the stream.
-    fn end_guarded_stream_if_launch_ended(&mut self, client_id: u64) -> bool {
-        let Some(client) = self.clients.get(&client_id) else {
-            return false;
+    /// Proves a stream's guard now: the writer has refused none of its input,
+    /// and its launch occupies the terminal. A stream that fails ends here,
+    /// with the reason as its close reason.
+    fn prove_guarded_stream(&mut self, client_id: u64) -> GuardedStream {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return GuardedStream::Unguarded;
         };
         let Some(expected) = client.launch_guard.as_deref() else {
-            return false;
+            return GuardedStream::Unguarded;
         };
         let (ClientConnectionMode::TerminalAttach { terminal_id }
         | ClientConnectionMode::TerminalObserve { terminal_id }) = &client.mode
         else {
-            return false;
+            return GuardedStream::Unguarded;
         };
-        let Some(refusal) = self.app.launch_refusal(terminal_id, expected) else {
-            return false;
+        let failure = match guarded_write_failure(&mut client.launch_guard_writes) {
+            Some(failure) => {
+                format!("terminal {terminal_id} stopped running launch {expected}: {failure}")
+            }
+            None => match self.app.prove_launch(terminal_id, expected) {
+                Ok(process) => return GuardedStream::Proved(process),
+                Err(refusal) => refusal.describe(terminal_id, expected),
+            },
         };
         let reason = format!(
-            "{}: {}",
-            protocol::terminal_launch_guard::LAUNCH_ENDED_CODE,
-            refusal.describe(terminal_id, expected)
+            "{}: {failure}",
+            protocol::terminal_launch_guard::LAUNCH_ENDED_CODE
         );
         info!(client_id, %reason, "guarded terminal stream ended");
         self.send_to_client(
@@ -1652,7 +1664,7 @@ impl HeadlessServer {
             },
         );
         self.remove_client_and_resize_if_needed(client_id);
-        true
+        GuardedStream::Ended
     }
 
     fn end_guarded_streams_whose_launch_ended(&mut self) -> bool {
@@ -1664,9 +1676,20 @@ impl HeadlessServer {
             .collect::<Vec<_>>();
         let mut ended = false;
         for client_id in guarded {
-            ended |= self.end_guarded_stream_if_launch_ended(client_id);
+            ended |= matches!(self.prove_guarded_stream(client_id), GuardedStream::Ended);
         }
         ended
+    }
+
+    /// Keeps the writer's answers owed for a guarded stream's input.
+    fn keep_guarded_writes(
+        &mut self,
+        client_id: u64,
+        writes: Vec<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>>,
+    ) {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.launch_guard_writes.extend(writes);
+        }
     }
 
     fn handle_terminal_attach_scroll(
@@ -1678,6 +1701,7 @@ impl HeadlessServer {
         column: Option<u16>,
         row: Option<u16>,
         modifiers: u8,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> bool {
         let Some(ClientConnection {
             mode: ClientConnectionMode::TerminalAttach { terminal_id },
@@ -1690,11 +1714,20 @@ impl HeadlessServer {
             return false;
         };
 
-        if let Err(err) =
-            apply_terminal_attach_scroll(runtime, source, direction, lines, column, row, modifiers)
-        {
+        let mut writer = InputWriter::new(runtime, guard);
+        if let Err(err) = write_terminal_attach_scroll(
+            &mut writer,
+            source,
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
+        ) {
             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
         }
+        let writes = writer.into_guarded_writes();
+        self.keep_guarded_writes(client_id, writes);
         true
     }
 
@@ -1706,6 +1739,7 @@ impl HeadlessServer {
         geometry: Option<protocol::ClientMouseGeometry>,
         modifiers: u8,
         lines: u16,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> bool {
         if self.handoff_in_progress {
             return false;
@@ -1742,9 +1776,12 @@ impl HeadlessServer {
             modifiers,
             lines: lines.max(1),
         };
-        if let Err(err) = apply_client_pane_input_events(runtime, &[event]) {
+        let mut writer = InputWriter::new(runtime, guard);
+        if let Err(err) = write_terminal_attach_events(&mut writer, &[event]) {
             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach mouse input failed");
         }
+        let writes = writer.into_guarded_writes();
+        self.keep_guarded_writes(client_id, writes);
         true
     }
 
@@ -2221,16 +2258,20 @@ impl HeadlessServer {
             return false;
         }
 
-        // A guarded stream's input is proved against its launch before it can
-        // reach the terminal, so it never goes to a replacement the periodic
-        // check has not seen yet.
+        // A guarded stream's input is proved against its launch before it is
+        // queued, so it never goes to a replacement the periodic check has not
+        // seen yet. The proved process travels with the bytes, and the writer
+        // checks it again before every write it makes.
+        let mut stream_guard = None;
         if let ServerEvent::ClientInput { client_id, .. }
         | ServerEvent::ClientAttachScroll { client_id, .. }
         | ServerEvent::ClientAttachMouse { client_id, .. }
         | ServerEvent::ClientClipboardImage { client_id, .. } = &ev
         {
-            if self.end_guarded_stream_if_launch_ended(*client_id) {
-                return false;
+            match self.prove_guarded_stream(*client_id) {
+                GuardedStream::Unguarded => {}
+                GuardedStream::Proved(process) => stream_guard = Some(process),
+                GuardedStream::Ended => return false,
             }
         }
 
@@ -2452,7 +2493,14 @@ impl HeadlessServer {
                 row,
                 modifiers,
             } => self.handle_terminal_attach_scroll(
-                client_id, source, direction, lines, column, row, modifiers,
+                client_id,
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+                stream_guard,
             ),
             ServerEvent::ClientAttachMouse {
                 client_id,
@@ -2462,7 +2510,13 @@ impl HeadlessServer {
                 modifiers,
                 lines,
             } => self.handle_terminal_attach_mouse(
-                client_id, kind, position, geometry, modifiers, lines,
+                client_id,
+                kind,
+                position,
+                geometry,
+                modifiers,
+                lines,
+                stream_guard,
             ),
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
@@ -2481,9 +2535,12 @@ impl HeadlessServer {
                     return false;
                 };
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                    if let Err(err) = apply_terminal_attach_input(runtime, data) {
+                    let mut writer = InputWriter::new(runtime, stream_guard);
+                    if let Err(err) = write_terminal_attach_input(&mut writer, data) {
                         warn!(client_id, terminal_id = %terminal_id, err = %err);
                     }
+                    let writes = writer.into_guarded_writes();
+                    self.keep_guarded_writes(client_id, writes);
                 }
                 true
             }
@@ -2531,6 +2588,7 @@ impl HeadlessServer {
                             client_id,
                             target,
                             staged.paste_text,
+                            stream_guard,
                         );
                         if routed {
                             if let Some(client) = self.clients.get_mut(&client_id) {

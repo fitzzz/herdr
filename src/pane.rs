@@ -3865,11 +3865,7 @@ impl PaneRuntime {
         }
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.try_send_bytes(self.paste_payload(text))
-    }
-
-    fn paste_payload(&self, text: String) -> Bytes {
+    pub(crate) fn paste_payload(&self, text: String) -> Bytes {
         let text = crate::platform::prepare_paste_text_for_pty(text);
         let bracketed = self.bracketed_paste_enabled();
         let payload = if bracketed {

@@ -3,6 +3,99 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, ClientPaneInputEvent};
 
+/// Sends the input bytes of one direct terminal stream. A guarded stream's
+/// bytes go through the terminal's guarded writer with the launch's proved
+/// process, so the writer checks that process before every write it makes,
+/// however long the bytes wait in its queue. An unguarded stream's bytes take
+/// the ordinary path.
+pub(super) struct InputWriter<'a> {
+    runtime: &'a crate::terminal::TerminalRuntime,
+    guard: Option<crate::platform::ProcessInstance>,
+    guarded_writes: Vec<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>>,
+}
+
+impl<'a> InputWriter<'a> {
+    pub(super) fn new(
+        runtime: &'a crate::terminal::TerminalRuntime,
+        guard: Option<crate::platform::ProcessInstance>,
+    ) -> Self {
+        Self {
+            runtime,
+            guard,
+            guarded_writes: Vec::new(),
+        }
+    }
+
+    pub(super) fn send(&mut self, bytes: Bytes) -> Result<(), String> {
+        let Some(process) = self.guard else {
+            return self
+                .runtime
+                .try_send_bytes(bytes)
+                .map_err(|err| err.to_string());
+        };
+        // The ordinary path drops empty input too; the writer cannot write it.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let answer = self
+            .runtime
+            .queue_guarded_user_input(bytes, process)
+            .map_err(|err| err.to_string())?;
+        self.guarded_writes.push(answer);
+        Ok(())
+    }
+
+    /// The writer's answers owed for what was sent, oldest first.
+    pub(super) fn into_guarded_writes(
+        self,
+    ) -> Vec<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>> {
+        self.guarded_writes
+    }
+}
+
+/// What proving a direct terminal stream's guard found.
+pub(super) enum GuardedStream {
+    /// The stream has no guard.
+    Unguarded,
+    /// The launch's process, read from the process table now.
+    Proved(crate::platform::ProcessInstance),
+    /// The proof failed and the stream was ended.
+    Ended,
+}
+
+/// Takes the writer's answers that have arrived, oldest first, and describes
+/// the first write it refused or stopped. A write the writer dropped without
+/// an answer counts: its bytes may not have reached the launch.
+pub(super) fn guarded_write_failure(
+    writes: &mut std::collections::VecDeque<
+        std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>,
+    >,
+) -> Option<String> {
+    use crate::pty::actor::GuardedWrite;
+    use std::sync::mpsc::TryRecvError;
+
+    while let Some(answer) = writes.front() {
+        match answer.try_recv() {
+            Ok(GuardedWrite::Written) => {
+                writes.pop_front();
+            }
+            Ok(GuardedWrite::Refused) => {
+                return Some("the terminal writer refused its input".to_owned());
+            }
+            Ok(GuardedWrite::Stopped { written, total }) => {
+                return Some(format!(
+                    "{written} of {total} bytes of its input were written and the rest were not sent"
+                ));
+            }
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                return Some("the terminal writer closed without answering".to_owned());
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn downgrade_ineligible_pixel_mouse(
     events: &mut [ClientPaneInputEvent],
     pixel_mouse: bool,
@@ -121,6 +214,7 @@ pub(super) fn terminal_attach_mouse_position(
     exact.or_else(|| cell_fallback(column, row))
 }
 
+#[cfg(test)]
 pub(super) fn apply_terminal_attach_scroll(
     runtime: &crate::terminal::TerminalRuntime,
     source: AttachScrollSource,
@@ -130,8 +224,28 @@ pub(super) fn apply_terminal_attach_scroll(
     row: Option<u16>,
     modifiers: u8,
 ) -> Result<(), String> {
+    write_terminal_attach_scroll(
+        &mut InputWriter::new(runtime, None),
+        source,
+        direction,
+        lines,
+        column,
+        row,
+        modifiers,
+    )
+}
+
+pub(super) fn write_terminal_attach_scroll(
+    writer: &mut InputWriter<'_>,
+    source: AttachScrollSource,
+    direction: AttachScrollDirection,
+    lines: u16,
+    column: Option<u16>,
+    row: Option<u16>,
+    modifiers: u8,
+) -> Result<(), String> {
     apply_scroll(
-        runtime,
+        writer,
         source,
         direction,
         lines,
@@ -144,13 +258,14 @@ pub(super) fn apply_terminal_attach_scroll(
 }
 
 fn apply_scroll(
-    runtime: &crate::terminal::TerminalRuntime,
+    writer: &mut InputWriter<'_>,
     source: AttachScrollSource,
     direction: AttachScrollDirection,
     lines: u16,
     position: crate::input::mouse::Position,
     modifiers: u8,
 ) -> Result<(), String> {
+    let runtime = writer.runtime;
     let wheel_kind = match direction {
         AttachScrollDirection::Up => MouseEventKind::ScrollUp,
         AttachScrollDirection::Down => MouseEventKind::ScrollDown,
@@ -166,7 +281,7 @@ fn apply_scroll(
             }
             return Ok(());
         }
-        return apply_terminal_attach_input(runtime, input);
+        return write_terminal_attach_input(writer, input);
     }
 
     match runtime.wheel_routing() {
@@ -181,8 +296,8 @@ fn apply_scroll(
                     "failed to encode terminal attach mouse wheel event: {wheel_kind:?}"
                 ));
             };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
+            writer
+                .send(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
@@ -190,8 +305,8 @@ fn apply_scroll(
             let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
                 return Ok(());
             };
-            runtime
-                .try_send_bytes(Bytes::from(bytes))
+            writer
+                .send(Bytes::from(bytes))
                 .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
         }
         Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
@@ -202,18 +317,27 @@ fn apply_scroll(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn apply_terminal_attach_input(
     runtime: &crate::terminal::TerminalRuntime,
     data: Vec<u8>,
 ) -> Result<(), String> {
+    write_terminal_attach_input(&mut InputWriter::new(runtime, None), data)
+}
+
+pub(super) fn write_terminal_attach_input(
+    writer: &mut InputWriter<'_>,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let runtime = writer.runtime;
     runtime.scroll_reset();
     if let Some(text) = crate::raw_input::complete_text_bracketed_paste(&data) {
-        runtime
-            .try_send_paste(text.to_owned())
+        writer
+            .send(runtime.paste_payload(text.to_owned()))
             .map_err(|err| format!("terminal attach paste failed: {err}"))
     } else {
-        runtime
-            .try_send_bytes(Bytes::from(data))
+        writer
+            .send(Bytes::from(data))
             .map_err(|err| format!("terminal attach input failed: {err}"))
     }
 }
@@ -222,21 +346,30 @@ pub(super) fn apply_client_pane_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<(), String> {
-    apply_client_terminal_input_events(runtime, events, true)
+    write_client_terminal_input_events(&mut InputWriter::new(runtime, None), events, true)
+}
+
+/// A direct terminal stream's mouse input, which reuses the pane encoding.
+pub(super) fn write_terminal_attach_events(
+    writer: &mut InputWriter<'_>,
+    events: &[ClientPaneInputEvent],
+) -> Result<(), String> {
+    write_client_terminal_input_events(writer, events, true)
 }
 
 pub(super) fn apply_client_popup_input_events(
     runtime: &crate::terminal::TerminalRuntime,
     events: &[ClientPaneInputEvent],
 ) -> Result<(), String> {
-    apply_client_terminal_input_events(runtime, events, false)
+    write_client_terminal_input_events(&mut InputWriter::new(runtime, None), events, false)
 }
 
-fn apply_client_terminal_input_events(
-    runtime: &crate::terminal::TerminalRuntime,
+fn write_client_terminal_input_events(
+    writer: &mut InputWriter<'_>,
     events: &[ClientPaneInputEvent],
     host_page_keys: bool,
 ) -> Result<(), String> {
+    let runtime = writer.runtime;
     for event in events {
         if let ClientPaneInputEvent::Mouse {
             kind,
@@ -274,7 +407,7 @@ fn apply_client_terminal_input_events(
                         AttachScrollDirection::Down
                     };
                     apply_scroll(
-                        runtime,
+                        writer,
                         AttachScrollSource::Wheel,
                         direction,
                         (*lines).max(1),
@@ -299,8 +432,8 @@ fn apply_client_terminal_input_events(
                 if kind != MouseEventKind::Moved {
                     runtime.scroll_reset();
                 }
-                runtime
-                    .try_send_bytes(Bytes::from(bytes))
+                writer
+                    .send(Bytes::from(bytes))
                     .map_err(|err| format!("targeted pane mouse input failed: {err}"))?;
             }
             continue;
@@ -331,21 +464,21 @@ fn apply_client_terminal_input_events(
                 runtime.scroll_reset();
                 let bytes = runtime.encode_terminal_key(key);
                 if !bytes.is_empty() {
-                    runtime
-                        .try_send_bytes(Bytes::from(bytes))
+                    writer
+                        .send(Bytes::from(bytes))
                         .map_err(|err| format!("targeted pane key input failed: {err}"))?;
                 }
             }
             crate::raw_input::RawInputEvent::Text(text) => {
                 runtime.scroll_reset();
-                runtime
-                    .try_send_bytes(Bytes::copy_from_slice(text.as_str().as_bytes()))
+                writer
+                    .send(Bytes::copy_from_slice(text.as_str().as_bytes()))
                     .map_err(|err| format!("targeted pane text input failed: {err}"))?;
             }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 runtime.scroll_reset();
-                runtime
-                    .try_send_paste(text)
+                writer
+                    .send(runtime.paste_payload(text))
                     .map_err(|err| format!("targeted pane paste failed: {err}"))?;
             }
             crate::raw_input::RawInputEvent::Mouse(_)

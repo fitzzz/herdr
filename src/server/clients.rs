@@ -136,6 +136,10 @@ pub(crate) struct ClientConnection {
     /// The launch this direct terminal stream was admitted for; the stream
     /// ends as soon as that launch stops occupying the terminal.
     pub(crate) launch_guard: Option<String>,
+    /// The writer's answers still owed for this stream's guarded input, oldest
+    /// first. A refused or interrupted write ends the stream.
+    pub(crate) launch_guard_writes:
+        std::collections::VecDeque<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>>,
     /// The client's terminal size after clamping.
     pub(crate) terminal_size: (u16, u16),
     /// Pixel size of one client terminal cell.
@@ -229,6 +233,7 @@ impl ClientConnection {
         Self {
             mode,
             launch_guard: None,
+            launch_guard_writes: std::collections::VecDeque::new(),
             terminal_size,
             cell_size,
             last_activity,

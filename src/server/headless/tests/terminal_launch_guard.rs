@@ -437,6 +437,8 @@ fn an_owner_the_admission_turns_away_is_told_why_and_never_gets_the_guard() {
     });
 }
 
+use self::answer as answer_of;
+
 /// The reason in the stream's closing message.
 fn closed_reason(control: &std::sync::mpsc::Receiver<Vec<u8>>) -> String {
     loop {
@@ -601,5 +603,282 @@ fn an_unguarded_stream_ignores_launches_entirely() {
         assert_eq!(occupied.input.try_recv().unwrap().as_ref(), b"typed");
         assert!(server.clients.contains_key(&7));
         assert!(server.clients.contains_key(&8));
+    });
+}
+
+/// One way a direct stream's input becomes bytes for the terminal, with the
+/// terminal modes it needs.
+struct InputPath {
+    name: &'static str,
+    modes: &'static [u8],
+    event: fn(u64) -> ServerEvent,
+    /// Whether two streams send the same bytes. A staged clipboard file has a
+    /// path of its own.
+    same_bytes: bool,
+}
+
+fn input_paths() -> [InputPath; 7] {
+    const MOUSE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+    const ALTERNATE: &[u8] = b"\x1b[?1049h\x1b[?1007h";
+    fn wheel(client_id: u64) -> ServerEvent {
+        ServerEvent::ClientAttachScroll {
+            client_id,
+            source: AttachScrollSource::Wheel,
+            direction: AttachScrollDirection::Up,
+            lines: 1,
+            column: Some(1),
+            row: Some(1),
+            modifiers: 0,
+        }
+    }
+    [
+        InputPath {
+            name: "raw input",
+            modes: b"",
+            event: |client_id| ServerEvent::ClientInput {
+                client_id,
+                data: b"typed".to_vec(),
+            },
+            same_bytes: true,
+        },
+        InputPath {
+            name: "paste",
+            modes: b"\x1b[?2004h",
+            event: |client_id| ServerEvent::ClientInput {
+                client_id,
+                data: b"\x1b[200~pasted\x1b[201~".to_vec(),
+            },
+            same_bytes: true,
+        },
+        InputPath {
+            name: "page key",
+            modes: ALTERNATE,
+            event: |client_id| ServerEvent::ClientAttachScroll {
+                client_id,
+                source: AttachScrollSource::PageKey {
+                    input: b"\x1b[5~".to_vec(),
+                },
+                direction: AttachScrollDirection::Up,
+                lines: 1,
+                column: None,
+                row: None,
+                modifiers: 0,
+            },
+            same_bytes: true,
+        },
+        InputPath {
+            name: "encoded mouse wheel",
+            modes: MOUSE,
+            event: wheel,
+            same_bytes: true,
+        },
+        InputPath {
+            name: "alternate scroll",
+            modes: ALTERNATE,
+            event: wheel,
+            same_bytes: true,
+        },
+        InputPath {
+            name: "encoded mouse button",
+            modes: MOUSE,
+            event: |client_id| ServerEvent::ClientAttachMouse {
+                client_id,
+                kind: protocol::ClientMouseKind::Down(protocol::ClientMouseButton::Left),
+                position: protocol::ClientMousePosition::Cell { column: 1, row: 1 },
+                geometry: None,
+                modifiers: 0,
+                lines: 1,
+            },
+            same_bytes: true,
+        },
+        InputPath {
+            name: "clipboard image",
+            modes: b"",
+            event: |client_id| ServerEvent::ClientClipboardImage {
+                client_id,
+                target: protocol::ClientClipboardImageTarget::DirectTerminal,
+                extension: "png".to_owned(),
+                data: b"image".to_vec(),
+            },
+            same_bytes: false,
+        },
+    ]
+}
+
+fn drained(input: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while let Ok(chunk) = input.try_recv() {
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes
+}
+
+/// The writer's answer is owed only for bytes that went through the guarded
+/// writer, so this tells the two writers apart. The bytes themselves match
+/// what an unguarded stream sends for the same input.
+#[test]
+fn every_input_path_of_a_guarded_stream_goes_through_the_guarded_writer() {
+    for path in input_paths() {
+        with_occupied_terminal(|server, mut occupied| {
+            let runtime = server
+                .app
+                .terminal_runtimes
+                .get(&occupied.terminal)
+                .unwrap();
+            runtime.test_process_pty_bytes(path.modes);
+            let target = occupied.terminal_string.clone();
+            let expected = occupied.token.clone();
+
+            connect_pending_terminal_client(server, 7);
+            assert!(admit(
+                server,
+                7,
+                AdmissionMode::Control,
+                &target,
+                false,
+                &expected
+            ));
+            server.handle_server_event((path.event)(7));
+            let guarded = drained(&mut occupied.input);
+            assert!(!guarded.is_empty(), "{}: bytes were sent", path.name);
+            let client = server.clients.get(&7).unwrap();
+            assert_eq!(client.launch_guard_writes.len(), 1, "{}", path.name);
+            server.handle_server_event(ServerEvent::ClientDetach { client_id: 7 });
+
+            connect_pending_terminal_client(server, 8);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                    client_id: 8,
+                    terminal_id: target.clone(),
+                    takeover: false,
+                })
+            );
+            server.handle_server_event((path.event)(8));
+            let unguarded = drained(&mut occupied.input);
+            let client = server.clients.get(&8).unwrap();
+            assert!(client.launch_guard_writes.is_empty(), "{}", path.name);
+            if path.same_bytes {
+                assert_eq!(guarded, unguarded, "{}", path.name);
+            } else {
+                assert!(!unguarded.is_empty(), "{}", path.name);
+            }
+        });
+    }
+}
+
+#[test]
+fn a_refused_or_interrupted_write_ends_the_stream_with_its_reason() {
+    use crate::pty::actor::GuardedWrite;
+    let cases: [(Option<GuardedWrite>, &str); 3] = [
+        (Some(GuardedWrite::Refused), "refused its input"),
+        (
+            Some(GuardedWrite::Stopped {
+                written: 15360,
+                total: 100_000,
+            }),
+            "15360 of 100000 bytes",
+        ),
+        (None, "closed without answering"),
+    ];
+    for (answer, expected_text) in cases {
+        with_occupied_terminal(|server, mut occupied| {
+            let control = connect_pending_terminal_client_with_control_rx(server, 7);
+            let target = occupied.terminal_string.clone();
+            let expected = occupied.token.clone();
+            assert!(admit(
+                server,
+                7,
+                AdmissionMode::Control,
+                &target,
+                false,
+                &expected
+            ));
+            assert!(answer_of(&control).admitted);
+
+            // The launch still leads; only the writer has seen otherwise.
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Some(answer) = answer {
+                tx.send(answer).unwrap();
+            }
+            drop(tx);
+            server
+                .clients
+                .get_mut(&7)
+                .unwrap()
+                .launch_guard_writes
+                .push_back(rx);
+
+            // The next input learns it first and is not sent.
+            assert!(!server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 7,
+                data: b"late".to_vec(),
+            }));
+            let reason = closed_reason(&control);
+            assert!(reason.starts_with(LAUNCH_ENDED_CODE), "{reason}");
+            assert!(reason.contains(expected_text), "{reason}");
+            assert!(occupied.input.try_recv().is_err(), "nothing was written");
+            assert_nothing_attached(server, 7, &occupied);
+        });
+    }
+}
+
+#[test]
+fn the_periodic_check_reads_the_writers_answers_in_order() {
+    use crate::pty::actor::GuardedWrite;
+    with_occupied_terminal(|server, occupied| {
+        let control = connect_pending_terminal_client_with_control_rx(server, 7);
+        let target = occupied.terminal_string.clone();
+        let expected = occupied.token.clone();
+        assert!(admit(
+            server,
+            7,
+            AdmissionMode::Control,
+            &target,
+            false,
+            &expected
+        ));
+        assert!(answer_of(&control).admitted);
+
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        written_tx.send(GuardedWrite::Written).unwrap();
+        let writes = &mut server.clients.get_mut(&7).unwrap().launch_guard_writes;
+        writes.push_back(written_rx);
+        writes.push_back(pending_rx);
+
+        // A written answer is taken; one still owed keeps the stream open.
+        assert!(!server.end_guarded_streams_whose_launch_ended());
+        assert_eq!(server.clients.get(&7).unwrap().launch_guard_writes.len(), 1);
+
+        pending_tx.send(GuardedWrite::Refused).unwrap();
+        assert!(server.end_guarded_streams_whose_launch_ended());
+        let reason = closed_reason(&control);
+        assert!(reason.contains("refused its input"), "{reason}");
+        assert_nothing_attached(server, 7, &occupied);
+    });
+}
+
+/// The real writer cannot write nothing, and the ordinary path ignores it.
+#[test]
+fn empty_input_from_a_guarded_stream_queues_nothing() {
+    with_occupied_terminal(|server, mut occupied| {
+        connect_pending_terminal_client(server, 7);
+        let target = occupied.terminal_string.clone();
+        let expected = occupied.token.clone();
+        assert!(admit(
+            server,
+            7,
+            AdmissionMode::Control,
+            &target,
+            false,
+            &expected
+        ));
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 7,
+            data: Vec::new(),
+        });
+        assert!(occupied.input.try_recv().is_err());
+        let client = server.clients.get(&7).unwrap();
+        assert!(client.launch_guard_writes.is_empty());
     });
 }

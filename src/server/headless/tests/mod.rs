@@ -3384,6 +3384,7 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
         11,
         crate::protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
         "/tmp/client-image.png".into(),
+        None,
     ));
     assert_eq!(
         input_rx.try_recv().expect("targeted clipboard image path"),
@@ -3393,11 +3394,13 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
         11,
         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
         "/tmp/wrong-target.png".into(),
+        None,
     ));
     assert!(!server.paste_client_clipboard_image_path(
         11,
         crate::protocol::ClientClipboardImageTarget::Popup("missing-popup".into()),
         "/tmp/wrong-target.png".into(),
+        None,
     ));
     assert!(input_rx.try_recv().is_err());
 
@@ -3582,6 +3585,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         12,
         crate::protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
         "/tmp/popup-image.png".into(),
+        None,
     ));
     assert_eq!(
         popup_input.try_recv().expect("popup clipboard image path"),
@@ -3591,6 +3595,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         12,
         crate::protocol::ClientClipboardImageTarget::Popup("stale-popup".into()),
         "/tmp/wrong-popup.png".into(),
+        None,
     ));
     assert!(popup_input.try_recv().is_err());
 

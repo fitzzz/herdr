@@ -516,8 +516,8 @@ impl TerminalRuntime {
             .queue_user_input_submission(text, enter, delay, deadline)
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_paste(text)
+    pub(crate) fn paste_payload(&self, text: String) -> bytes::Bytes {
+        self.0.paste_payload(text)
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
