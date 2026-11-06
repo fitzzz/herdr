@@ -45,7 +45,7 @@ fn composer_manifest(composer: &str) -> String {
         r#"
 id = "codex"
 version = "9999.01.01.1"
-min_engine_version = 4
+min_engine_version = 5
 updated_at = "2026-06-10T12:00:00Z"
 
 [[rules]]
@@ -916,6 +916,169 @@ contains = ["Queued follow-up inputs"]
             "missing",
         ));
     });
+}
+
+#[test]
+fn submitted_evidence_counts_prompt_marker_entries_with_the_needle() {
+    with_manifest_dirs("composer-submitted", || {
+        write_local_codex(&composer_manifest(
+            r#"
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
+"#,
+        ));
+        let input = |screen| DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        };
+        assert!(submitted_evidence_supported(Agent::Codex));
+        assert!(!queued_evidence_supported(Agent::Codex));
+
+        let baseline = "• start\n• TEST-STATUS\n› \n";
+        let screen =
+            "• start\n› Hello World\n• reply\n› hello\n  world\n• TEST-STATUS\n› Hello World\n";
+        // The current prompt line and the live status line above it are not
+        // history; the wrapped entry counts.
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(screen),
+                "hello world"
+            ),
+            Some(2)
+        );
+        assert!(composer_match(Agent::Codex, input(screen)).is_none());
+
+        // Text outside a prompt-marker entry is not submitted evidence.
+        let output_only = "• start\n• Ran echo Hello World\n  Hello World\n› \n";
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(output_only),
+                "hello world"
+            )
+            .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(screen),
+                "missing"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            composer_submitted_evidence_since(Agent::Codex, input(baseline), input(screen), " "),
+            None
+        );
+
+        // Only entries after the last history both screens share are new.
+        let grown = "› Hello World\n• start\n• TEST-STATUS\n› \n";
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(grown),
+                "hello world"
+            ),
+            Some(0),
+            "an entry revealed above shared history is old"
+        );
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input("• other\n• TEST-STATUS\n› \n"),
+                input(screen),
+                "hello world"
+            ),
+            None,
+            "screens without shared history cannot be ordered"
+        );
+    });
+}
+
+#[test]
+fn composer_validation_accepts_requires_submitted_text_on_submitted_state() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 5
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+requires_submitted_text = true
+contains = ["›"]
+"#;
+    assert!(parse_manifest(manifest).is_ok());
+}
+
+#[test]
+fn submitted_evidence_requires_engine_five_while_other_composer_states_keep_four() {
+    let with_state = |state: &str, engine: u32| {
+        format!(
+            r#"
+id = "codex"
+version = "1"
+min_engine_version = {engine}
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "evidence"
+state = "{state}"
+requires_submitted_text = true
+contains = ["›"]
+"#
+        )
+    };
+    let error = parse_manifest(&with_state("submitted_evidence", 4))
+        .expect_err("engine 4 cannot deserialize submitted_evidence");
+    assert!(
+        error.contains("submitted_evidence composer rules require min_engine_version 5"),
+        "{error}"
+    );
+    assert!(parse_manifest(&with_state("submitted_evidence", 5)).is_ok());
+    assert!(parse_manifest(&with_state("queued_evidence", 4)).is_ok());
+}
+
+#[test]
+fn remote_manifest_for_a_newer_engine_than_five_is_refused() {
+    let manifest = r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 6
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+"#;
+    let Err(error) = parse_remote_manifest_for_agent(Agent::Codex, manifest) else {
+        panic!("a manifest for a newer engine must not load");
+    };
+    assert!(
+        error.contains("requires engine 6, current engine is 5"),
+        "{error}"
+    );
 }
 
 #[test]

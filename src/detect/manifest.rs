@@ -126,6 +126,7 @@ pub enum ComposerState {
     PartialCommand,
     Draft,
     QueuedEvidence,
+    SubmittedEvidence,
 }
 
 impl ComposerState {
@@ -135,7 +136,7 @@ impl ComposerState {
             Self::SelectionList => Some("a selection list is open"),
             Self::PartialCommand => Some("a slash command is already in the input box"),
             Self::Draft => Some("unsent typed text is present in the agent's input box"),
-            Self::QueuedEvidence => None,
+            Self::QueuedEvidence | Self::SubmittedEvidence => None,
         }
     }
 }
@@ -188,7 +189,7 @@ struct ManifestComposerRule {
     priority: i32,
     #[serde(default = "default_region")]
     region: String,
-    /// Only valid with state = "queued_evidence".
+    /// Only valid with state = "queued_evidence" or "submitted_evidence".
     #[serde(default)]
     requires_submitted_text: bool,
     #[serde(default)]
@@ -212,6 +213,15 @@ enum ManifestComposerState {
     PartialCommand,
     Draft,
     QueuedEvidence,
+    /// The submitted text appears as a prompt-marker entry in the region.
+    SubmittedEvidence,
+}
+
+impl ManifestComposerState {
+    /// Evidence states describe what a submission left behind, not the input box.
+    fn is_submission_evidence(self) -> bool {
+        matches!(self, Self::QueuedEvidence | Self::SubmittedEvidence)
+    }
 }
 
 impl From<ManifestComposerState> for ComposerState {
@@ -221,6 +231,7 @@ impl From<ManifestComposerState> for ComposerState {
             ManifestComposerState::PartialCommand => Self::PartialCommand,
             ManifestComposerState::Draft => Self::Draft,
             ManifestComposerState::QueuedEvidence => Self::QueuedEvidence,
+            ManifestComposerState::SubmittedEvidence => Self::SubmittedEvidence,
         }
     }
 }
@@ -500,7 +511,7 @@ pub fn composer_match(agent: Agent, input: DetectionInput<'_>) -> Option<Compose
         .iter()
         .zip(loaded.compiled_composer.iter())
     {
-        if rule.state == ManifestComposerState::QueuedEvidence {
+        if rule.state.is_submission_evidence() {
             continue;
         }
         let region_text = region(input, &rule.region);
@@ -523,12 +534,20 @@ pub fn composer_evidence_supported(agent: Agent) -> bool {
 }
 
 pub fn queued_evidence_supported(agent: Agent) -> bool {
+    composer_state_supported(agent, ManifestComposerState::QueuedEvidence)
+}
+
+pub fn submitted_evidence_supported(agent: Agent) -> bool {
+    composer_state_supported(agent, ManifestComposerState::SubmittedEvidence)
+}
+
+fn composer_state_supported(agent: Agent, state: ManifestComposerState) -> bool {
     load_manifest(agent).is_some_and(|loaded| {
         loaded
             .manifest
             .composer
             .iter()
-            .any(|rule| rule.state == ManifestComposerState::QueuedEvidence)
+            .any(|rule| rule.state == state)
     })
 }
 
@@ -555,6 +574,46 @@ pub fn composer_queued_evidence(agent: Agent, input: DetectionInput<'_>, needle:
             }
             compiled_rule_matches(compiled_rule, region_text)
         })
+}
+
+/// Count the prompt-marker entries (a `›` line and its indented continuation
+/// lines) containing `needle` that `input` shows after all the history it
+/// shares with `baseline`, inside a matching `submitted_evidence` region.
+///
+/// Counts alone are not evidence: a detection window that grows reveals older
+/// history above what the baseline showed, including old entries with the same
+/// text. History only grows at the bottom, so the two snapshots are aligned in
+/// order and only entries after the last shared item count. `None` means they
+/// share nothing and cannot be ordered, which is no evidence either way.
+pub fn composer_submitted_evidence_since(
+    agent: Agent,
+    baseline: DetectionInput<'_>,
+    input: DetectionInput<'_>,
+    needle: &str,
+) -> Option<usize> {
+    let loaded = load_manifest(agent)?;
+    let normalized_needle = normalize_composer_text(needle);
+    if normalized_needle.is_empty() {
+        return None;
+    }
+    loaded
+        .manifest
+        .composer
+        .iter()
+        .zip(loaded.compiled_composer.iter())
+        .filter(|(rule, _)| rule.state == ManifestComposerState::SubmittedEvidence)
+        .filter_map(|(rule, compiled_rule)| {
+            let region_text = region(input, &rule.region);
+            if !compiled_rule_matches(compiled_rule, region_text) {
+                return None;
+            }
+            new_history_entries(
+                &history_items(region(baseline, &rule.region)),
+                &history_items(region_text),
+                &normalized_needle,
+            )
+        })
+        .max()
 }
 
 fn normalize_composer_text(text: &str) -> String {
@@ -1096,6 +1155,17 @@ fn validate_manifest(manifest: &AgentManifest) -> Result<(), String> {
     if !manifest.composer.is_empty() && manifest.min_engine_version.unwrap_or(0) < 4 {
         return Err("composer rules require min_engine_version 4".to_string());
     }
+    // Engine 4 deserializes only the original composer states.
+    if manifest
+        .composer
+        .iter()
+        .any(|rule| rule.state == ManifestComposerState::SubmittedEvidence)
+        && manifest.min_engine_version.unwrap_or(0) < SUBMITTED_EVIDENCE_ENGINE_VERSION
+    {
+        return Err(format!(
+            "submitted_evidence composer rules require min_engine_version {SUBMITTED_EVIDENCE_ENGINE_VERSION}"
+        ));
+    }
 
     let mut complexity = ManifestComplexity::default();
     for rule in &manifest.rules {
@@ -1160,9 +1230,9 @@ fn validate_composer_rule(
     }
     validate_region_name(&rule.region)
         .map_err(|err| format!("composer rule {} uses invalid region: {err}", rule.id))?;
-    if rule.requires_submitted_text && rule.state != ManifestComposerState::QueuedEvidence {
+    if rule.requires_submitted_text && !rule.state.is_submission_evidence() {
         return Err(format!(
-            "composer rule {} uses requires_submitted_text without state = \"queued_evidence\"",
+            "composer rule {} uses requires_submitted_text without state = \"queued_evidence\" or \"submitted_evidence\"",
             rule.id
         ));
     }
@@ -1550,6 +1620,7 @@ fn region_count(spec: &str, name: &str) -> Option<usize> {
 }
 
 const TOP_NON_EMPTY_LINES_ENGINE_VERSION: u32 = 3;
+const SUBMITTED_EVIDENCE_ENGINE_VERSION: u32 = 5;
 const MAX_TOP_REGION_LINE_COUNT: usize = u16::MAX as usize;
 
 fn top_region_count(spec: &str) -> Option<usize> {
@@ -1686,6 +1757,102 @@ fn queued_input_block(content: &str) -> &str {
         return "";
     };
     slice_from_line_index(content, &lines, index)
+}
+
+/// One ordered item of visible history: a prompt-marker entry with the indented
+/// lines a wrapped message continues on, or another unindented line. Text is
+/// normalized, so a rewrapped item still compares equal.
+struct HistoryItem {
+    text: String,
+    entry: bool,
+}
+
+/// The ordered history in a region. The unindented line nearest the input box
+/// is the agent's live status (a running timer, for example), not history.
+fn history_items(content: &str) -> Vec<HistoryItem> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut items = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        index += 1;
+        if codex_prompt_line(line) {
+            let start = index - 1;
+            while index < lines.len()
+                && lines[index].starts_with(' ')
+                && !lines[index].trim().is_empty()
+            {
+                index += 1;
+            }
+            items.push(HistoryItem {
+                text: normalize_composer_text(&lines[start..index].join("\n")),
+                entry: true,
+            });
+        } else if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            items.push(HistoryItem {
+                text: normalize_composer_text(line),
+                entry: false,
+            });
+        }
+    }
+    if items.last().is_some_and(|item| !item.entry) {
+        items.pop();
+    }
+    items
+}
+
+/// Entries containing `needle` after the last item of `sample` that an
+/// order-preserving alignment with `baseline` can share. Taking the latest
+/// such item keeps an insertion above existing history, or a repeat of old
+/// text, from counting. `None` when the two share no item.
+fn new_history_entries(
+    baseline: &[HistoryItem],
+    sample: &[HistoryItem],
+    needle: &str,
+) -> Option<usize> {
+    let (b, s) = (baseline.len(), sample.len());
+    let same = |i: usize, j: usize| baseline[i].text == sample[j].text;
+    // prefix[i][j]: common subsequence length of baseline[..i] and sample[..j];
+    // suffix[i][j]: the same for baseline[i..] and sample[j..].
+    let mut prefix = vec![vec![0usize; s + 1]; b + 1];
+    for i in 1..=b {
+        for j in 1..=s {
+            prefix[i][j] = if same(i - 1, j - 1) {
+                prefix[i - 1][j - 1] + 1
+            } else {
+                prefix[i - 1][j].max(prefix[i][j - 1])
+            };
+        }
+    }
+    let mut suffix = vec![vec![0usize; s + 1]; b + 1];
+    for i in (0..b).rev() {
+        for j in (0..s).rev() {
+            suffix[i][j] = if same(i, j) {
+                suffix[i + 1][j + 1] + 1
+            } else {
+                suffix[i + 1][j].max(suffix[i][j + 1])
+            };
+        }
+    }
+    let shared = prefix[b][s];
+    if shared == 0 {
+        return None;
+    }
+    let (last_baseline, last_sample) = (0..s).rev().find_map(|j| {
+        (0..b)
+            .find(|&i| same(i, j) && prefix[i][j] + 1 + suffix[i + 1][j + 1] == shared)
+            .map(|i| (i, j))
+    })?;
+    let matching = |items: &[HistoryItem]| {
+        items
+            .iter()
+            .filter(|item| item.entry && item.text.contains(needle))
+            .count()
+    };
+    Some(
+        matching(&sample[last_sample + 1..])
+            .saturating_sub(matching(&baseline[last_baseline + 1..])),
+    )
 }
 
 fn codex_block_marker_line(line: &str) -> bool {

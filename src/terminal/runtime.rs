@@ -331,6 +331,16 @@ impl TerminalRuntime {
         self.0.mouse_reporting_enabled()
     }
 
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.0.focus_reporting_enabled()
+    }
+
+    /// Bytes written to the PTY that its program has not read yet, or `None`
+    /// when the platform cannot measure them. Waits for the PTY actor.
+    pub fn unread_input_bytes(&self) -> Option<usize> {
+        self.0.unread_input_bytes()
+    }
+
     pub fn sgr_pixel_mouse_enabled(&self) -> bool {
         self.0.sgr_pixel_mouse_enabled()
     }

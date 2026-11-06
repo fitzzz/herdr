@@ -9,8 +9,9 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_caller_timeout, dispatch_to_app_with_timeout, should_stop_connection,
-    APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
+    dispatch_projection_to_app_with_timeout, dispatch_to_app_with_caller_timeout,
+    dispatch_to_app_with_timeout, should_stop_connection, APP_RESPONSE_TIMEOUT,
+    CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
@@ -20,6 +21,9 @@ use crate::ipc::LocalStream;
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
 const NOT_SUBMITTED_SETTLE_MS: u64 = 500;
 const NOT_SUBMITTED_STREAK: u32 = 2;
+/// How long a prompt released by the one focus-in wake-up has to start its turn.
+/// Codex starts a turn within tens of milliseconds of reading queued input.
+const PROMPT_WAKEUP_WINDOW_MS: u64 = 2_000;
 
 pub(super) fn wait_for_output(
     request_id: String,
@@ -167,13 +171,16 @@ pub(super) fn wait_for_agent(
             rejection_probe: None,
             acceptance_probe: None,
             match_status: true,
+            wakeup: None,
         },
         stream,
         api_tx,
         event_hub,
         running,
     )? {
-        Some(AgentWaitOutcome::Matched(agent)) => agent_wait_success(request_id, *agent).map(Some),
+        Some(AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent)) => {
+            agent_wait_success(request_id, *agent).map(Some)
+        }
         Some(AgentWaitOutcome::Response(response)) => Ok(Some(response)),
         None => Ok(None),
     }
@@ -209,17 +216,24 @@ pub(super) fn prompt_agent(
         .agent
         .as_deref()
         .and_then(crate::detect::parse_agent_label);
-    let queued_evidence_supported = crate::detect::queued_evidence_supported(expected_agent);
+    let working_evidence_supported = crate::detect::queued_evidence_supported(expected_agent)
+        || crate::detect::submitted_evidence_supported(expected_agent);
     let prompt_needle = prompt_evidence_needle(&params.text);
     let target = params.target.clone();
 
     // Capture the screen before writing so evidence of new text on screen can be
     // distinguished from text that was already there.
-    let before_screen = read_agent_screen(&request_id, &target, api_tx).ok();
+    let before_screen = read_agent_screen(&request_id, &target, api_tx, APP_RESPONSE_TIMEOUT).ok();
     let baseline = before_screen
         .as_deref()
         .map(|screen| crate::detect::manifest::composer_text_occurrences(screen, &prompt_needle))
         .unwrap_or(0);
+    tracing::debug!(
+        request_id = %request_id,
+        baseline_read = before_screen.is_some(),
+        text_baseline = baseline,
+        "agent prompt evidence baseline"
+    );
 
     if let Some(prompt_wait) = params.wait.as_mut() {
         prompt_wait.submission_deadline = total_timeout_ms
@@ -254,7 +268,7 @@ pub(super) fn prompt_agent(
     let mut initial = prompted;
     let prompt_started_working = initial.agent_status == crate::api::schema::AgentStatus::Working;
 
-    if prompt_started_working && !queued_evidence_supported {
+    if prompt_started_working && !working_evidence_supported {
         return agent_prompt_stalled(
             &request_id,
             &initial,
@@ -275,7 +289,9 @@ pub(super) fn prompt_agent(
         expected_agent,
     };
     let acceptance_mode = if prompt_started_working {
-        Some(PromptAcceptanceMode::QueuedEvidence)
+        Some(PromptAcceptanceMode::Working {
+            baseline_screen: before_screen,
+        })
     } else if crate::detect::composer_evidence_supported(expected_agent) {
         Some(PromptAcceptanceMode::ComposerCleared)
     } else {
@@ -287,6 +303,19 @@ pub(super) fn prompt_agent(
         baseline,
         earliest,
         expected_agent,
+    });
+    // Only Codex is known to miss the read wake-up for its PTY input, and only
+    // the gate's own stall decision (not the caller's deadline) may nudge it.
+    // Every later step is bounded by what then remains of the caller's budget.
+    let wakeup = (expected_agent == Some(crate::detect::Agent::Codex)
+        && matches!(timeout_kind, AgentWaitTimeoutKind::PromptStalled { .. })
+        && remaining.is_none_or(|remaining| remaining > effect_timeout_ms))
+    .then(|| PromptWakeup {
+        needle: prompt_needle.clone(),
+        baseline,
+        expected_agent,
+        caller_deadline: total_timeout_ms
+            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms)),
     });
     let Some(outcome) = wait_for_resolved_agent(
         request_id.clone(),
@@ -302,6 +331,7 @@ pub(super) fn prompt_agent(
             rejection_probe: Some(rejection_probe),
             acceptance_probe,
             match_status: !prompt_started_working,
+            wakeup,
         },
         stream,
         api_tx,
@@ -311,17 +341,19 @@ pub(super) fn prompt_agent(
     else {
         return Ok(None);
     };
+    let evidence = matches!(outcome, AgentWaitOutcome::MatchedAfterWakeup(_))
+        .then_some(crate::api::schema::AgentPromptEvidence::ReleasedAfterWakeup);
     initial = match outcome {
-        AgentWaitOutcome::Matched(agent) => *agent,
+        AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
 
     let Some(wait) = wait else {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, evidence).map(Some);
     };
     let until = agent_wait_statuses(wait.until);
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, evidence).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -340,6 +372,7 @@ pub(super) fn prompt_agent(
             rejection_probe: None,
             acceptance_probe: None,
             match_status: true,
+            wakeup: None,
         },
         stream,
         api_tx,
@@ -350,10 +383,10 @@ pub(super) fn prompt_agent(
         return Ok(None);
     };
     let agent = match outcome {
-        AgentWaitOutcome::Matched(agent) => *agent,
+        AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    agent_prompt_success(request_id, agent, evidence).map(Some)
 }
 
 /// First non-empty line of the submitted text, bounded so a long paste does not
@@ -401,10 +434,11 @@ fn prompt_effect_timeout(
 fn agent_prompt_success(
     request_id: String,
     agent: crate::api::schema::AgentInfo,
+    evidence: Option<crate::api::schema::AgentPromptEvidence>,
 ) -> std::io::Result<String> {
     serde_json::to_string(&SuccessResponse {
         id: request_id,
-        result: ResponseResult::AgentPrompted { agent },
+        result: ResponseResult::AgentPrompted { agent, evidence },
     })
     .map_err(std::io::Error::other)
 }
@@ -450,30 +484,61 @@ fn agent_prompt_stalled(
 }
 
 fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bool {
-    if crate::detect::manifest::composer_text_occurrences(screen, &probe.needle) <= probe.baseline {
-        return false;
-    }
-    match probe.mode {
-        PromptAcceptanceMode::QueuedEvidence => crate::detect::composer_queued_evidence(
-            probe.expected_agent,
-            screen,
-            "",
-            "",
-            &probe.needle,
-        ),
+    let text_occurrences =
+        crate::detect::manifest::composer_text_occurrences(screen, &probe.needle);
+    let new_text = text_occurrences > probe.baseline;
+    match &probe.mode {
+        PromptAcceptanceMode::Working { baseline_screen } => {
+            let queued = new_text
+                && crate::detect::composer_queued_evidence(
+                    probe.expected_agent,
+                    screen,
+                    "",
+                    "",
+                    &probe.needle,
+                );
+            // A steered prompt is a submitted entry after all the history this
+            // sample shares with the pre-submission screen, above an input box
+            // that no longer holds a draft, a command or a selection list. A
+            // window that grows reveals old entries above that history, which
+            // never count. Without a baseline, or when the two screens share no
+            // history, there is no evidence either way.
+            let new_entries = baseline_screen.as_deref().and_then(|baseline| {
+                crate::detect::composer_submitted_evidence_since(
+                    probe.expected_agent,
+                    baseline,
+                    screen,
+                    &probe.needle,
+                )
+            });
+            let holds_input = composer_holds_input(probe.expected_agent, screen);
+            let steered = new_entries.is_some_and(|new_entries| new_entries > 0) && !holds_input;
+            tracing::debug!(
+                text_occurrences,
+                text_baseline = probe.baseline,
+                new_entries = ?new_entries,
+                holds_input,
+                queued,
+                steered,
+                "agent prompt working evidence sample"
+            );
+            queued || steered
+        }
         PromptAcceptanceMode::ComposerCleared => {
-            !crate::detect::composer_match(probe.expected_agent, screen, "", "").is_some_and(
-                |composer| {
-                    matches!(
-                        composer.state,
-                        crate::detect::ComposerState::SelectionList
-                            | crate::detect::ComposerState::PartialCommand
-                            | crate::detect::ComposerState::Draft
-                    )
-                },
-            )
+            new_text && !composer_holds_input(probe.expected_agent, screen)
         }
     }
+}
+
+fn composer_holds_input(agent: Option<crate::detect::Agent>, screen: &str) -> bool {
+    crate::detect::composer_match(agent, screen, "", "").is_some_and(|composer| {
+        matches!(
+            composer.state,
+            crate::detect::ComposerState::SelectionList
+                | crate::detect::ComposerState::PartialCommand
+                | crate::detect::ComposerState::Draft
+        )
+    })
 }
 
 fn prompt_not_submitted_evidence(
@@ -502,6 +567,7 @@ fn read_agent_screen(
     request_id: &str,
     target: &str,
     api_tx: &ApiRequestSender,
+    timeout: std::time::Duration,
 ) -> Result<String, ErrorResponse> {
     let response = dispatch_to_app_with_timeout(
         Request {
@@ -515,7 +581,7 @@ fn read_agent_screen(
             }),
         },
         api_tx,
-        Some(APP_RESPONSE_TIMEOUT),
+        Some(timeout),
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.into(),
@@ -554,6 +620,67 @@ struct ResolvedAgentWait {
     rejection_probe: Option<PromptRejectionProbe>,
     acceptance_probe: Option<PromptAcceptanceProbe>,
     match_status: bool,
+    wakeup: Option<PromptWakeup>,
+}
+
+/// The one-shot release for a prompt an idle Codex never read. At the stall
+/// decision, with the input box empty and the prompt not shown anywhere new,
+/// the app measures the PTY's unread input and writes at most one focus-in
+/// report (`App::handle_agent_input_wakeup`). The prompt then has `window_ms`
+/// to start its turn.
+struct PromptWakeup {
+    needle: String,
+    baseline: usize,
+    expected_agent: Option<crate::detect::Agent>,
+    /// The caller's absolute deadline; `None` when it set no timeout.
+    caller_deadline: Option<std::time::Instant>,
+}
+
+impl PromptWakeup {
+    /// The absolute end of a stage starting now and lasting at most `cap`,
+    /// never past the caller's deadline; `None` once that deadline has passed.
+    /// The stage keeps this instant: later waits derive their timeouts from
+    /// it, so a delay between steps never extends the stage.
+    fn stage_deadline(&self, cap: std::time::Duration) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let end = self
+            .caller_deadline
+            .map_or(now + cap, |deadline| deadline.min(now + cap));
+        (end > now).then_some(end)
+    }
+}
+
+/// The time left until `deadline`, measured now; `None` once it has passed.
+fn time_left(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
+/// Withdraws a wake-up's write right when its prompt stops waiting, so a
+/// request still queued for the app writes nothing afterwards.
+struct CancelWakeupOnExit(crate::api::WakeupClaim);
+
+impl Drop for CancelWakeupOnExit {
+    fn drop(&mut self) {
+        self.0.withdraw();
+    }
+}
+
+/// The outcome of offering the wake-up at the stall decision: the app's
+/// measurement if it answered in time, and what the shared claim says about
+/// the write. Only the claim decides whether a report was enqueued.
+#[derive(Debug)]
+struct WakeupStep {
+    report: Option<crate::api::AgentInputWakeup>,
+    write: crate::api::WakeupWrite,
+}
+
+impl WakeupStep {
+    const NOT_OFFERED: Self = Self {
+        report: None,
+        write: crate::api::WakeupWrite::None,
+    };
 }
 
 struct PromptRejectionProbe {
@@ -563,9 +690,13 @@ struct PromptRejectionProbe {
     expected_agent: Option<crate::detect::Agent>,
 }
 
-#[derive(Clone, Copy)]
 enum PromptAcceptanceMode {
-    QueuedEvidence,
+    /// The agent was already working: the prompt must appear as a queued
+    /// message or, when the pre-submission screen was read, as a steered
+    /// entry after the history both screens share.
+    Working {
+        baseline_screen: Option<String>,
+    },
     ComposerCleared,
 }
 
@@ -580,7 +711,7 @@ struct PromptAcceptanceProbe {
 impl PromptAcceptanceProbe {
     fn required_streak(&self) -> u32 {
         match self.mode {
-            PromptAcceptanceMode::QueuedEvidence => 1,
+            PromptAcceptanceMode::Working { .. } => 1,
             PromptAcceptanceMode::ComposerCleared => NOT_SUBMITTED_STREAK,
         }
     }
@@ -595,21 +726,36 @@ enum AgentWaitTimeoutKind {
 
 enum AgentWaitOutcome {
     Matched(Box<crate::api::schema::AgentInfo>),
+    /// Matched only after the one wake-up released unread input.
+    MatchedAfterWakeup(Box<crate::api::schema::AgentInfo>),
     Response(String),
+}
+
+fn matched_outcome(agent: crate::api::schema::AgentInfo, after_wakeup: bool) -> AgentWaitOutcome {
+    if after_wakeup {
+        AgentWaitOutcome::MatchedAfterWakeup(Box::new(agent))
+    } else {
+        AgentWaitOutcome::Matched(Box::new(agent))
+    }
 }
 
 fn wait_for_resolved_agent(
     request_id: String,
-    wait: ResolvedAgentWait,
+    mut wait: ResolvedAgentWait,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<AgentWaitOutcome>> {
-    let deadline = wait
+    let mut deadline = wait
         .timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let expected_terminal_id = wait.initial.terminal_id.clone();
+    let mut wakeup_write = crate::api::WakeupWrite::None;
+    let mut wakeup_report = None;
+    let wakeup_claim = crate::api::WakeupClaim::default();
+    let _cancel_wakeup = CancelWakeupOnExit(wakeup_claim.clone());
+    let mut pending_remeasure = None;
     let expected_name = wait
         .initial
         .name
@@ -625,6 +771,11 @@ fn wait_for_resolved_agent(
     loop {
         if should_stop_connection(stream, running)? {
             return Ok(None);
+        }
+        // A wake-up the app claimed before the prompt stopped waiting for its
+        // answer counts as written only once the app publishes the enqueue.
+        if wakeup_write == crate::api::WakeupWrite::Unconfirmed {
+            wakeup_write = wakeup_claim.withdraw();
         }
 
         let mut should_probe = false;
@@ -647,7 +798,10 @@ fn wait_for_resolved_agent(
                             {
                                 let mut matched = wait.initial.clone();
                                 matched.agent_status = status;
-                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                                return Ok(Some(matched_outcome(
+                                    matched,
+                                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                                )));
                             }
                         }
                         return agent_wait_not_running(request_id)
@@ -721,16 +875,30 @@ fn wait_for_resolved_agent(
                 if let Some(status) = matched_event_status {
                     let mut matched = current;
                     matched.agent_status = status;
-                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                    return Ok(Some(matched_outcome(
+                        matched,
+                        wakeup_write == crate::api::WakeupWrite::Enqueued,
+                    )));
                 }
                 if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
-                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                    return Ok(Some(matched_outcome(
+                        current,
+                        wakeup_write == crate::api::WakeupWrite::Enqueued,
+                    )));
                 }
             }
         }
 
         if wait.rejection_probe.is_some() || wait.acceptance_probe.is_some() {
-            if let Ok(screen) = read_agent_screen(&request_id, &wait.target, api_tx) {
+            let screen = read_agent_screen(&request_id, &wait.target, api_tx, APP_RESPONSE_TIMEOUT);
+            if let Err(error) = &screen {
+                tracing::debug!(
+                    request_id = %request_id,
+                    code = %error.error.code,
+                    "agent prompt evidence screen read failed"
+                );
+            }
+            if let Ok(screen) = screen {
                 if let Some(probe) = &wait.rejection_probe {
                     if std::time::Instant::now() >= probe.earliest {
                         if let Some(evidence) = prompt_not_submitted_evidence(
@@ -760,7 +928,10 @@ fn wait_for_resolved_agent(
                             if acceptance_streak >= probe.required_streak() {
                                 let current = agent_get(&request_id, &wait.target, api_tx)
                                     .unwrap_or_else(|_| wait.initial.clone());
-                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                                return Ok(Some(matched_outcome(
+                                    current,
+                                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                                )));
                             }
                         } else {
                             acceptance_streak = 0;
@@ -792,13 +963,209 @@ fn wait_for_resolved_agent(
             if wait.match_status
                 && agent_wait_matches(&current, &wait.until, wait.after_state_change_seq)
             {
-                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                return Ok(Some(matched_outcome(
+                    current,
+                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                )));
             }
-            return agent_wait_timeout(request_id, wait.timeout_kind, &current)
-                .map(AgentWaitOutcome::Response)
-                .map(Some);
+            if let Some(wakeup) = wait.wakeup.take() {
+                let step = prompt_wakeup_report(
+                    &request_id,
+                    &wait.target,
+                    &expected_terminal_id,
+                    &current,
+                    &wakeup,
+                    &wakeup_claim,
+                    api_tx,
+                );
+                wakeup_report = step.report;
+                wakeup_write = step.write;
+                if wakeup_write != crate::api::WakeupWrite::None {
+                    // The turn gets what remains of the caller's budget, up to
+                    // the window, from a stage that starts now.
+                    if let Some(window_end) = wakeup
+                        .stage_deadline(std::time::Duration::from_millis(PROMPT_WAKEUP_WINDOW_MS))
+                    {
+                        deadline = Some(window_end);
+                        pending_remeasure = Some(wakeup);
+                        continue;
+                    }
+                }
+            } else if let Some(wakeup) = pending_remeasure.take() {
+                // Report what is still queued now, not what the nudge saw, if
+                // the caller's budget leaves room to ask.
+                if let Some(timeout) = wakeup
+                    .stage_deadline(APP_RESPONSE_TIMEOUT)
+                    .and_then(time_left)
+                {
+                    wakeup_report = input_wakeup(
+                        &request_id,
+                        &wait.target,
+                        &expected_terminal_id,
+                        None,
+                        timeout,
+                        api_tx,
+                    )
+                    .ok()
+                    .or(wakeup_report);
+                }
+            }
+            if wakeup_write == crate::api::WakeupWrite::Unconfirmed {
+                wakeup_write = wakeup_claim.withdraw();
+            }
+            let unread_detail = match &wakeup_report {
+                Some(report) => unread_input_detail(report, wakeup_write),
+                None => wakeup_write_detail(wakeup_write),
+            };
+            return agent_wait_timeout(
+                request_id,
+                wait.timeout_kind,
+                &current,
+                unread_detail.as_deref(),
+            )
+            .map(AgentWaitOutcome::Response)
+            .map(Some);
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+/// At the stall decision for an idle or done Codex: when its input box is empty
+/// and the prompt is not shown anywhere new, ask the app to measure unread PTY
+/// input and send the one wake-up it allows. Every step is bounded by what
+/// remains of the caller's budget, and the write permission lapses when that
+/// step's wait does.
+fn prompt_wakeup_report(
+    request_id: &str,
+    target: &str,
+    expected_terminal_id: &str,
+    current: &crate::api::schema::AgentInfo,
+    wakeup: &PromptWakeup,
+    claim: &crate::api::WakeupClaim,
+    api_tx: &ApiRequestSender,
+) -> WakeupStep {
+    if !matches!(
+        current.agent_status,
+        crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+    ) {
+        return WakeupStep::NOT_OFFERED;
+    }
+    let Some(timeout) = wakeup
+        .stage_deadline(APP_RESPONSE_TIMEOUT)
+        .and_then(time_left)
+    else {
+        return WakeupStep::NOT_OFFERED;
+    };
+    let Ok(screen) = read_agent_screen(request_id, target, api_tx, timeout) else {
+        return WakeupStep::NOT_OFFERED;
+    };
+    if composer_holds_input(wakeup.expected_agent, &screen)
+        || crate::detect::manifest::composer_text_occurrences(&screen, &wakeup.needle)
+            > wakeup.baseline
+    {
+        return WakeupStep::NOT_OFFERED;
+    }
+    let Some(not_after) = wakeup.stage_deadline(APP_RESPONSE_TIMEOUT) else {
+        return WakeupStep::NOT_OFFERED;
+    };
+    let nudge = crate::api::WakeupNudge {
+        not_after,
+        claim: claim.clone(),
+    };
+    let Some(timeout) = time_left(not_after) else {
+        return WakeupStep::NOT_OFFERED;
+    };
+    let report = input_wakeup(
+        request_id,
+        target,
+        expected_terminal_id,
+        Some(nudge),
+        timeout,
+        api_tx,
+    )
+    .ok();
+    // The app publishes the write's result before it replies; a request still
+    // queued is withdrawn here, so it can no longer write.
+    WakeupStep {
+        report,
+        write: claim.withdraw(),
+    }
+}
+
+fn input_wakeup(
+    request_id: &str,
+    target: &str,
+    expected_terminal_id: &str,
+    nudge: Option<crate::api::WakeupNudge>,
+    timeout: std::time::Duration,
+    api_tx: &ApiRequestSender,
+) -> Result<crate::api::AgentInputWakeup, ()> {
+    let response = dispatch_projection_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:wakeup"),
+            method: Method::AgentGet(crate::api::schema::AgentTarget {
+                target: target.to_string(),
+            }),
+        },
+        crate::api::ApiRequestProjection::AgentInputWakeup {
+            terminal_id: expected_terminal_id.to_string(),
+            nudge,
+        },
+        api_tx,
+        Some(timeout),
+    );
+    serde_json::from_str::<crate::api::AgentInputWakeupProjectionResponse>(&response)
+        .map(|response| response.result)
+        .map_err(|_| ())
+}
+
+/// The stalled error's account of input the agent has not read, so a caller can
+/// tell queued input from lost input. `None` when there is nothing to add.
+fn unread_input_detail(
+    report: &crate::api::AgentInputWakeup,
+    write: crate::api::WakeupWrite,
+) -> Option<String> {
+    use crate::api::WakeupWrite;
+    let Some(bytes) = report.unread_input_bytes else {
+        return wakeup_write_detail(write);
+    };
+    if bytes == 0 {
+        return match write {
+            WakeupWrite::Enqueued => Some(
+                "the agent read its queued input after one focus-in wake-up, but no turn start was observed".to_string(),
+            ),
+            WakeupWrite::Unconfirmed => Some(
+                "the agent read its queued input after a focus-in wake-up attempt whose write was not confirmed, but no turn start was observed".to_string(),
+            ),
+            WakeupWrite::None => None,
+        };
+    }
+    let queued = format!(
+        "{bytes} input bytes are still unread in the agent's terminal input queue (queued, not lost)"
+    );
+    Some(match write {
+        WakeupWrite::Enqueued => format!("{queued} after one focus-in wake-up"),
+        WakeupWrite::Unconfirmed => {
+            format!("{queued}; a focus-in wake-up was attempted, but its write was not confirmed")
+        }
+        WakeupWrite::None if !report.focus_reporting => {
+            format!("{queued}; focus reporting is off, so no wake-up was sent")
+        }
+        WakeupWrite::None => format!("{queued}; the wake-up could not be written"),
+    })
+}
+
+/// The stalled error's account of the wake-up write when no measurement says
+/// more. `None` when nothing was written.
+fn wakeup_write_detail(write: crate::api::WakeupWrite) -> Option<String> {
+    match write {
+        crate::api::WakeupWrite::Enqueued => Some(
+            "one focus-in wake-up was written, but no turn start was observed".to_string(),
+        ),
+        crate::api::WakeupWrite::Unconfirmed => Some(
+            "a focus-in wake-up was attempted, but its write was not confirmed and no turn start was observed".to_string(),
+        ),
+        crate::api::WakeupWrite::None => None,
     }
 }
 
@@ -940,6 +1307,7 @@ fn agent_wait_timeout(
     request_id: String,
     kind: AgentWaitTimeoutKind,
     current: &crate::api::schema::AgentInfo,
+    unread_detail: Option<&str>,
 ) -> std::io::Result<String> {
     let (code, message) = match kind {
         AgentWaitTimeoutKind::Status => {
@@ -950,7 +1318,10 @@ fn agent_wait_timeout(
             (
                 "agent_prompt_stalled",
                 format!(
-                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; input was written and may still be in the agent's input box, so check the agent before resending (current status is {status})"
+                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; input was written and may still be in the agent's input box, so check the agent before resending (current status is {status}){}",
+                    unread_detail
+                        .map(|detail| format!("; {detail}"))
+                        .unwrap_or_default()
                 ),
             )
         }
@@ -1165,7 +1536,7 @@ mod tests {
 
     #[test]
     fn prompt_success_has_no_outcome_fields() {
-        let response = agent_prompt_success("req".into(), test_agent()).unwrap();
+        let response = agent_prompt_success("req".into(), test_agent(), None).unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["type"], "agent_prompted");
         assert!(response["result"].get("outcome").is_none());
@@ -1244,7 +1615,9 @@ mod tests {
     #[test]
     fn acceptance_evidence_requires_queued_message_or_cleared_composer() {
         let queued = PromptAcceptanceProbe {
-            mode: PromptAcceptanceMode::QueuedEvidence,
+            mode: PromptAcceptanceMode::Working {
+                baseline_screen: Some(String::new()),
+            },
             needle: "hello".into(),
             baseline: 0,
             earliest: std::time::Instant::now(),
@@ -1270,12 +1643,685 @@ mod tests {
         assert!(!prompt_acceptance_evidence("\u{203a} hello\n", &cleared));
     }
 
+    /// A private-config manifest override, so these tests exercise the evidence
+    /// contract with synthetic rules rather than the bundled agent grammar.
+    struct SyntheticManifests {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl SyntheticManifests {
+        fn install(manifests: &[(&str, &str)]) -> Self {
+            let lock = crate::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-wait-manifest-{}-{stamp}",
+                std::process::id()
+            ));
+            let overrides = dir
+                .join(crate::config::app_dir_name())
+                .join("agent-detection");
+            std::fs::create_dir_all(&overrides).unwrap();
+            for (agent, manifest) in manifests {
+                std::fs::write(overrides.join(format!("{agent}.toml")), manifest).unwrap();
+            }
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            crate::detect::manifest::reload_manifests();
+            Self {
+                _lock: lock,
+                previous,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for SyntheticManifests {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            crate::detect::manifest::reload_manifests();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    // Codex is only the registry key; every gate below is synthetic.
+    const SYNTHETIC_CODEX: &str = r#"
+id = "codex"
+version = "9999.01.01.1"
+min_engine_version = 5
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["TEST-IDLE"]
+
+[[composer]]
+id = "selection"
+state = "selection_list"
+priority = 1000
+region = "whole_recent"
+contains = ["TEST-SELECTION"]
+
+[[composer]]
+id = "partial"
+state = "partial_command"
+priority = 900
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+/']
+
+[[composer]]
+id = "draft"
+state = "draft"
+priority = 600
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n]']
+not = [{ contains = ["TEST-EMPTY"] }]
+
+[[composer]]
+id = "queued"
+state = "queued_evidence"
+priority = 100
+region = "whole_recent"
+requires_submitted_text = true
+contains = ["TEST-QUEUED"]
+
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
+"#;
+
+    // Another agent kind with input-box rules but no submitted-evidence rule.
+    const SYNTHETIC_CLAUDE: &str = r#"
+id = "claude"
+version = "9999.01.01.1"
+min_engine_version = 5
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["TEST-IDLE"]
+
+[[composer]]
+id = "draft"
+state = "draft"
+region = "current_prompt_line"
+regex = ['(?m)^›[ \t]+[^/\r\n]']
+not = [{ contains = ["TEST-EMPTY"] }]
+"#;
+
+    const STEER_NEEDLE: &str = "review the diff";
+    const SCREEN_HEAD: &str = "TEST-HEADER\n\u{203a} first request\n\u{2022} reply\n";
+    const STEER_ENTRY: &str = "\u{203a} review the diff\n";
+    const SCREEN_TAIL: &str = "\u{2022} TEST-WORKING\n\n";
+    const EMPTY_INPUT: &str = "\u{203a} TEST-EMPTY\n  TEST-FOOTER\n";
+    const DRAFT_INPUT: &str = "\u{203a} review the diff\n  TEST-FOOTER\n";
+
+    fn working_screen(head: &str, entries: &[&str], input: &str) -> String {
+        let mut screen = head.to_string();
+        for entry in entries {
+            screen.push_str(entry);
+        }
+        screen.push_str(SCREEN_TAIL);
+        screen.push_str(input);
+        screen
+    }
+
+    fn working_probe(
+        before_screen: Option<&str>,
+        expected_agent: Option<crate::detect::Agent>,
+    ) -> PromptAcceptanceProbe {
+        PromptAcceptanceProbe {
+            mode: PromptAcceptanceMode::Working {
+                baseline_screen: before_screen.map(str::to_string),
+            },
+            needle: STEER_NEEDLE.into(),
+            baseline: before_screen
+                .map(|screen| {
+                    crate::detect::manifest::composer_text_occurrences(screen, STEER_NEEDLE)
+                })
+                .unwrap_or(0),
+            earliest: std::time::Instant::now(),
+            expected_agent,
+        }
+    }
+
+    #[test]
+    fn a_prompt_steered_into_a_working_turn_is_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        assert!(crate::detect::submitted_evidence_supported(codex));
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let steered = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
+        assert!(prompt_acceptance_evidence(
+            &steered,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A steer whose first line wrapped onto an indented continuation line
+        // is still the same entry.
+        let wrapped = working_screen(SCREEN_HEAD, &["\u{203a} review the\n  diff\n"], EMPTY_INPUT);
+        assert!(prompt_acceptance_evidence(
+            &wrapped,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steer_still_in_the_input_line_is_not_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let still_typed = working_screen(SCREEN_HEAD, &[], DRAFT_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &still_typed,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A matching history entry does not count while the input box holds a
+        // draft, a slash command or a selection list.
+        for input in [
+            DRAFT_INPUT,
+            "\u{203a} /model\n  TEST-FOOTER\n",
+            "\u{203a} TEST-EMPTY\nTEST-SELECTION\n",
+        ] {
+            let steered_with_input = working_screen(SCREEN_HEAD, &[STEER_ENTRY], input);
+            assert!(
+                !prompt_acceptance_evidence(
+                    &steered_with_input,
+                    &working_probe(Some(&before), codex)
+                ),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_steered_entry_already_in_the_baseline_is_not_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &before,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // Without a pre-submission screen there is no baseline to rise above.
+        assert!(!prompt_acceptance_evidence(
+            &before,
+            &working_probe(None, codex)
+        ));
+    }
+
+    #[test]
+    fn revealing_the_marker_of_an_older_entry_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // The detection window starts inside an older multiline message, so its
+        // continuation with the prompt text is visible but its marker is not.
+        let old_tail = "  review the diff\n\u{2022} reply\n";
+        let before = working_screen(old_tail, &[], EMPTY_INPUT);
+        // The window grows by one row and reveals that message's marker. No
+        // text was submitted: the prompt text count stays 1 while the entry
+        // count rises from 0 to 1. The revealed entry lies above the history
+        // both screens share, so it is not new.
+        let revealed_head = format!("\u{203a} Old multiline request\n{old_tail}");
+        let revealed = working_screen(&revealed_head, &[], EMPTY_INPUT);
+        assert_eq!(
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &revealed,
+                STEER_NEEDLE
+            ),
+            Some(0)
+        );
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A reveal together with a real steer: the steer follows the shared
+        // history, so the screens order it as new while the reveal stays old.
+        let revealed_and_steered = working_screen(&revealed_head, &[STEER_ENTRY], EMPTY_INPUT);
+        assert_eq!(
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &revealed_and_steered,
+                STEER_NEEDLE
+            ),
+            Some(1)
+        );
+        assert!(prompt_acceptance_evidence(
+            &revealed_and_steered,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn revealing_an_old_entry_with_the_same_text_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // An old message repeats the prompt text on its continuation line. The
+        // window first shows only that continuation, then grows by one row and
+        // reveals the message's own first line: the text count goes 1 -> 2 and
+        // the entry count 0 -> 1 with nothing submitted.
+        let continuation = "  review the diff\n\u{2022} reply\n";
+        let before = working_screen(continuation, &[], EMPTY_INPUT);
+        let revealed = working_screen(
+            &format!("\u{203a} review the diff\n{continuation}"),
+            &[],
+            EMPTY_INPUT,
+        );
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn revealing_a_whole_old_entry_above_existing_history_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let anchor = "\u{2022} reply\n";
+        let before = working_screen(anchor, &[], EMPTY_INPUT);
+        let revealed = working_screen(&format!("{STEER_ENTRY}{anchor}"), &[], EMPTY_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn screens_without_shared_history_are_not_steer_evidence() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen("\u{2022} older output\n", &[], EMPTY_INPUT);
+        let unrelated = working_screen("\u{2022} other output\n", &[STEER_ENTRY], EMPTY_INPUT);
+        assert_eq!(
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &unrelated,
+                STEER_NEEDLE
+            ),
+            None,
+            "screens that share no history cannot be ordered"
+        );
+        assert!(!prompt_acceptance_evidence(
+            &unrelated,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steer_repeating_an_earlier_prompt_is_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // The same text was submitted before and is still on screen; the new
+        // steer follows the history both screens share.
+        let before = working_screen(SCREEN_HEAD, &[STEER_ENTRY, "\u{2022} done\n"], EMPTY_INPUT);
+        let repeated = working_screen(
+            SCREEN_HEAD,
+            &[STEER_ENTRY, "\u{2022} done\n", STEER_ENTRY],
+            EMPTY_INPUT,
+        );
+        assert!(prompt_acceptance_evidence(
+            &repeated,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn queued_evidence_still_accepts_a_working_prompt() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let queued = working_screen(
+            SCREEN_HEAD,
+            &["TEST-QUEUED\n  review the diff\n"],
+            EMPTY_INPUT,
+        );
+        assert!(prompt_acceptance_evidence(
+            &queued,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steered_entry_is_not_evidence_for_other_agent_kinds() {
+        let _manifests = SyntheticManifests::install(&[
+            ("codex", SYNTHETIC_CODEX),
+            ("claude", SYNTHETIC_CLAUDE),
+        ]);
+        let before = working_screen(SCREEN_HEAD, &[], EMPTY_INPUT);
+        let steered = working_screen(SCREEN_HEAD, &[STEER_ENTRY], EMPTY_INPUT);
+        for agent in [Some(crate::detect::Agent::Claude), None] {
+            assert!(!crate::detect::submitted_evidence_supported(agent));
+            assert!(!prompt_acceptance_evidence(
+                &steered,
+                &working_probe(Some(&before), agent)
+            ));
+        }
+    }
+
+    fn wakeup_with_deadline(caller_deadline: Option<std::time::Instant>) -> PromptWakeup {
+        PromptWakeup {
+            needle: "review the diff".into(),
+            baseline: 0,
+            expected_agent: None,
+            caller_deadline,
+        }
+    }
+
+    /// Stand-in for the app: answers screen reads at once with an empty input
+    /// box, and hands each wake-up request to `on_wakeup`.
+    fn fake_app(
+        on_wakeup: impl Fn(crate::api::ApiRequestMessage) + Send + 'static,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<Vec<String>>) {
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                match &message.request.method {
+                    Method::AgentRead(_) => {
+                        seen.push("agent.read".to_string());
+                        let _ = message.respond_to.send(
+                            serde_json::json!({
+                                "id": message.request.id,
+                                "result": { "read": { "text": "idle screen\n" } }
+                            })
+                            .to_string(),
+                        );
+                    }
+                    Method::AgentGet(_) if message.projection.is_some() => {
+                        seen.push("wakeup".to_string());
+                        on_wakeup(message);
+                    }
+                    other => seen.push(format!("{other:?}")),
+                }
+            }
+            seen
+        });
+        (api_tx, app)
+    }
+
+    fn take_nudge(message: &crate::api::ApiRequestMessage) -> crate::api::WakeupNudge {
+        match &message.projection {
+            Some(crate::api::ApiRequestProjection::AgentInputWakeup {
+                nudge: Some(nudge), ..
+            }) => nudge.clone(),
+            other => panic!("expected a wake-up with permission to write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_spent_caller_budget_sends_no_wakeup_request_at_all() {
+        let (api_tx, app) = fake_app(|_| panic!("no wake-up may be requested"));
+        let claim = crate::api::WakeupClaim::default();
+        let spent = wakeup_with_deadline(Some(std::time::Instant::now()));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &spent,
+            &claim,
+            &api_tx,
+        );
+        assert_nothing_written(&step);
+        drop(api_tx);
+        assert!(app.join().unwrap().is_empty(), "not even a screen read");
+    }
+
+    #[test]
+    fn diagnostics_that_use_up_the_last_budget_send_no_wakeup() {
+        // The screen read answers only after the caller's deadline has passed.
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let app = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while let Some(message) = api_rx.blocking_recv() {
+                seen.push(format!("{:?}", message.projection.is_some()));
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = message.respond_to.send(
+                    serde_json::json!({"id": "r", "result": {"read": {"text": "idle\n"}}})
+                        .to_string(),
+                );
+            }
+            seen
+        });
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(60),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        assert_nothing_written(&step);
+        drop(api_tx);
+        assert_eq!(
+            app.join().unwrap(),
+            vec!["false".to_string()],
+            "only the screen read was asked; no wake-up was requested"
+        );
+    }
+
+    #[test]
+    fn a_wakeup_handled_after_its_wait_lapsed_never_writes() {
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let (api_tx, app) = fake_app(move |message| {
+            let nudge = take_nudge(&message);
+            // The app reaches the request only after the prompt stopped waiting.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = written_tx.send(nudge.claim_at(std::time::Instant::now()));
+        });
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(80),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        // The prompt withdrew the request when its wait ended.
+        assert_nothing_written(&step);
+        assert!(
+            !written_rx.recv().unwrap(),
+            "the late request must not write"
+        );
+        drop(api_tx);
+        assert_eq!(app.join().unwrap(), vec!["agent.read", "wakeup"]);
+    }
+
+    fn assert_nothing_written(step: &WakeupStep) {
+        assert!(step.report.is_none(), "{step:?}");
+        assert_eq!(step.write, crate::api::WakeupWrite::None, "{step:?}");
+    }
+
+    /// The app's reply to a wake-up request, as `handle_agent_input_wakeup`
+    /// sends it.
+    fn reply_to_wakeup(message: crate::api::ApiRequestMessage, nudged: bool) {
+        let response = crate::api::AgentInputWakeupProjectionResponse {
+            id: message.request.id.clone(),
+            result: crate::api::AgentInputWakeup {
+                unread_input_bytes: Some(17),
+                focus_reporting: true,
+                nudged,
+            },
+        };
+        let _ = message
+            .respond_to
+            .send(serde_json::to_string(&response).unwrap());
+    }
+
+    /// Offers the wake-up against a fake app whose answer comes too late for a
+    /// caller deadline 80 ms away.
+    fn offer_with_late_answer(
+        on_wakeup: impl Fn(crate::api::ApiRequestMessage) + Send + 'static,
+    ) -> (WakeupStep, crate::api::WakeupClaim) {
+        let (api_tx, app) = fake_app(on_wakeup);
+        let claim = crate::api::WakeupClaim::default();
+        let wakeup = wakeup_with_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(80),
+        ));
+        let step = prompt_wakeup_report(
+            "req",
+            "main",
+            "term_1",
+            &test_agent(),
+            &wakeup,
+            &claim,
+            &api_tx,
+        );
+        drop(api_tx);
+        assert_eq!(app.join().unwrap(), vec!["agent.read", "wakeup"]);
+        (step, claim)
+    }
+
+    #[test]
+    fn a_wakeup_enqueued_before_the_wait_lapsed_is_reported_as_written() {
+        let (step, _claim) = offer_with_late_answer(|message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            nudge.claim.finish(true);
+            // Enqueued, but the answer comes too late for the prompt.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            reply_to_wakeup(message, true);
+        });
+        assert!(step.report.is_none(), "the answer was late");
+        assert_eq!(step.write, crate::api::WakeupWrite::Enqueued);
+    }
+
+    #[test]
+    fn a_failed_enqueue_with_a_late_reply_is_not_reported_as_written() {
+        let (step, _claim) = offer_with_late_answer(|message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            // The PTY input queue refused the report.
+            nudge.claim.finish(false);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            reply_to_wakeup(message, false);
+        });
+        assert_nothing_written(&step);
+        let detail = unread_input_detail(
+            &crate::api::AgentInputWakeup {
+                unread_input_bytes: Some(17),
+                focus_reporting: true,
+                nudged: false,
+            },
+            step.write,
+        )
+        .unwrap();
+        assert!(detail.contains("could not be written"), "{detail}");
+    }
+
+    #[test]
+    fn a_claim_without_a_published_enqueue_is_unconfirmed_not_written() {
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<crate::api::WakeupClaim>();
+        let (step, claim) = offer_with_late_answer(move |message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            // Still claimed, with no result published, when the prompt gives up.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = finish_tx.send(nudge.claim.clone());
+        });
+        assert!(step.report.is_none());
+        // Only `Enqueued` earns `released_after_wakeup`; a claim alone does not.
+        assert_eq!(step.write, crate::api::WakeupWrite::Unconfirmed);
+        let detail = wakeup_write_detail(step.write).unwrap();
+        assert!(detail.contains("not confirmed"), "{detail}");
+        assert!(!detail.contains("was written"), "{detail}");
+        // The wait upgrades the state once the app publishes the enqueue.
+        finish_rx.recv().unwrap().finish(true);
+        assert_eq!(claim.withdraw(), crate::api::WakeupWrite::Enqueued);
+    }
+
+    #[test]
+    fn a_prompt_that_returns_withdraws_its_queued_wakeup() {
+        let claim = crate::api::WakeupClaim::default();
+        let nudge = crate::api::WakeupNudge {
+            not_after: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            claim: claim.clone(),
+        };
+        drop(CancelWakeupOnExit(claim));
+        assert!(!nudge.claim_at(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn a_wakeup_stage_ends_at_the_caller_deadline_or_its_cap() {
+        let cap = std::time::Duration::from_secs(2);
+        let before = std::time::Instant::now();
+        let open = wakeup_with_deadline(None).stage_deadline(cap).unwrap();
+        assert!(open >= before + cap && open <= std::time::Instant::now() + cap);
+        assert_eq!(
+            wakeup_with_deadline(Some(std::time::Instant::now())).stage_deadline(cap),
+            None
+        );
+        let near = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        assert_eq!(
+            wakeup_with_deadline(Some(near)).stage_deadline(cap),
+            Some(near),
+            "the stage ends exactly at the caller deadline"
+        );
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(wakeup_with_deadline(Some(far)).stage_deadline(cap).unwrap() < far);
+    }
+
+    #[test]
+    fn a_delay_after_the_stage_is_planned_never_extends_the_write_permission() {
+        // Review round 2: a scheduling delay between planning the stage and
+        // building the permission once moved the expiry past the caller's
+        // deadline (late_claim=true).
+        let caller_deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let wakeup = wakeup_with_deadline(Some(caller_deadline));
+        let stage = wakeup.stage_deadline(APP_RESPONSE_TIMEOUT).unwrap();
+        assert_eq!(stage, caller_deadline);
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        let nudge = crate::api::WakeupNudge {
+            not_after: stage,
+            claim: crate::api::WakeupClaim::default(),
+        };
+        assert_eq!(time_left(stage), None, "no time is left to wait for");
+        assert!(
+            !nudge.claim_at(std::time::Instant::now()),
+            "the permission lapses at the caller deadline"
+        );
+        assert_eq!(nudge.claim.withdraw(), crate::api::WakeupWrite::None);
+    }
+
     #[test]
     fn stalled_timeout_says_input_was_written() {
         let response = agent_wait_timeout(
             "req".into(),
             AgentWaitTimeoutKind::PromptStalled { timeout_ms: 5000 },
             &test_agent(),
+            None,
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

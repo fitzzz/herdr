@@ -170,7 +170,13 @@ impl App {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
-                        Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                        Ok(Ok(())) => encode_success(
+                            id,
+                            ResponseResult::AgentPrompted {
+                                agent,
+                                evidence: None,
+                            },
+                        ),
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
                         }

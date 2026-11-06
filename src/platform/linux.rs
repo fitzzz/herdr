@@ -678,6 +678,29 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+/// Bytes written to a PTY that the program on its terminal side has not read.
+///
+/// Linux counts them only on the terminal (slave) side: FIONREAD and TIOCOUTQ
+/// on the master report 0. TIOCGPTPEER opens that side from the master without
+/// a path lookup, and O_NOCTTY keeps the server from acquiring it as a
+/// controlling terminal. Reading the count consumes nothing, and the extra
+/// descriptor is closed before returning.
+pub fn pty_unread_input_bytes(master_fd: RawFd) -> Option<usize> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let peer = unsafe { libc::ioctl(master_fd, libc::TIOCGPTPEER, flags) };
+    if peer < 0 {
+        return None;
+    }
+    let peer = unsafe { OwnedFd::from_raw_fd(peer) };
+    let mut queued: libc::c_int = 0;
+    let result = unsafe { libc::ioctl(peer.as_raw_fd(), libc::FIONREAD, &mut queued) };
+    (result == 0)
+        .then(|| usize::try_from(queued).ok())
+        .flatten()
+}
+
 fn process_pgrp_comm_and_state(pid: u32) -> Option<(i32, String, char)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_pgrp_comm_and_state_from_stat(&stat)
@@ -1243,6 +1266,61 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_unread_input_bytes_counts_what_the_terminal_side_has_not_read() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut master = 0;
+        let mut slave = 0;
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(
+            opened,
+            0,
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut raw: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut raw) }, 0);
+        unsafe { libc::cfmakeraw(&mut raw) };
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &raw) },
+            0
+        );
+
+        assert_eq!(pty_unread_input_bytes(master.as_raw_fd()), Some(0));
+        let prompt = b"review this\r";
+        let written =
+            unsafe { libc::write(master.as_raw_fd(), prompt.as_ptr().cast(), prompt.len()) };
+        assert_eq!(written, prompt.len() as isize);
+        // The line discipline receives master writes asynchronously.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pty_unread_input_bytes(master.as_raw_fd()) != Some(prompt.len())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            pty_unread_input_bytes(master.as_raw_fd()),
+            Some(prompt.len())
+        );
+        // Measuring consumed nothing: the terminal side still reads every byte.
+        let mut buffer = [0u8; 64];
+        let read =
+            unsafe { libc::read(slave.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert_eq!(&buffer[..read as usize], prompt);
+        assert_eq!(pty_unread_input_bytes(master.as_raw_fd()), Some(0));
+    }
     use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
 

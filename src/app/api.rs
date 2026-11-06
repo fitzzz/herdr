@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 mod agent_view;
+mod agent_wakeup;
 mod agents;
 mod env;
 mod integrations;
@@ -1278,6 +1279,10 @@ impl App {
                 self.sync_pending_terminal_titles();
                 self.handle_pane_agent_status_projection(request.id, target)
             }
+            (
+                crate::api::ApiRequestProjection::AgentInputWakeup { terminal_id, nudge },
+                crate::api::schema::Method::AgentGet(target),
+            ) => self.handle_agent_input_wakeup(request.id, target, &terminal_id, nudge.as_ref()),
             _ => responses::encode_error(
                 request.id,
                 "internal_error",
