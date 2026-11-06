@@ -11028,6 +11028,11 @@
               "description": "Whether this server supports explicit client-shell surface interest.",
               "type": "boolean"
             },
+            "terminal_attach_expected_launch_incarnation": {
+              "default": false,
+              "description": "`terminal attach`, `terminal session control` and `terminal session\nobserve` honor `--expect-launch`. Older servers ignore the guarded\nadmission and attach nothing, so the CLI refuses before asking them.",
+              "type": "boolean"
+            },
             "terminal_input_ack": {
               "default": false,
               "description": "Supports `terminal.input.open`, `terminal.input.write` and\n`terminal.input.reconcile`.",

@@ -50,6 +50,13 @@ impl std::fmt::Display for ClientError {
                             )?;
                         }
                     }
+                    // The server is running; only this stream ended.
+                    Some(reason)
+                        if reason
+                            .starts_with(protocol::terminal_launch_guard::LAUNCH_ENDED_CODE) =>
+                    {
+                        write!(f, "{reason}")?;
+                    }
                     _ => {
                         write!(f, "server shut down")?;
                         if let Some(reason) = reason {

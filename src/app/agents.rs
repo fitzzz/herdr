@@ -501,6 +501,31 @@ impl App {
             .then_some((token, process))
     }
 
+    /// The process of the launch occupying the terminal now if that launch is
+    /// `expected`, with the same proof `agent.send_keys` uses, or why not.
+    pub(crate) fn prove_launch(
+        &self,
+        terminal_id: &str,
+        expected: &str,
+    ) -> Result<crate::platform::ProcessInstance, crate::terminal::launch_incarnation::LaunchRefusal>
+    {
+        use crate::terminal::launch_incarnation::LaunchRefusal;
+
+        let Some(terminal) = self.state.terminals.get(terminal_id) else {
+            return Err(LaunchRefusal::TerminalGone);
+        };
+        if terminal.effective_known_agent().is_none() {
+            return Err(LaunchRefusal::NoOccupant);
+        }
+        match self.current_launch(terminal_id) {
+            Some((token, process)) if token == expected => Ok(process),
+            Some((token, _)) => Err(LaunchRefusal::OtherLaunch {
+                current: token.to_owned(),
+            }),
+            None => Err(LaunchRefusal::NotAttested),
+        }
+    }
+
     pub(super) fn agent_info_from_pane(
         &self,
         pane: &crate::api::schema::PaneInfo,

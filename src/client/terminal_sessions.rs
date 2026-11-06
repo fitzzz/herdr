@@ -6,6 +6,7 @@ use interprocess::TryClone as _;
 use tracing::info;
 
 use crate::ipc::LocalStream;
+use crate::protocol::terminal_launch_guard::{AdmissionAnswer, AdmissionMode, AdmissionRequest};
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientMouseButton,
     ClientMouseKind, ClientMousePosition, RenderEncoding, ServerMessage, TerminalFrame,
@@ -30,6 +31,16 @@ pub enum TerminalSessionOutput {
     Cells,
 }
 
+/// The server said this connection was not admitted, for example because
+/// another client owns the terminal. It carries the server's reason. An answer
+/// is queued ahead of anything sent later on the connection, so a close reason
+/// that arrives first means the server did not admit it.
+const ADMISSION_FAILED_CODE: &str = "terminal_attach_failed";
+/// No valid answer arrived, so the outcome is unknown: the server may have
+/// admitted the connection and taken ownership from another client before the
+/// answer was lost.
+const ADMISSION_UNANSWERED_CODE: &str = "terminal_admission_unanswered";
+
 const RECORD_CELLS: u8 = 1;
 const RECORD_CLOSED: u8 = 2;
 const RECORD_ANSI: u8 = 3;
@@ -40,12 +51,27 @@ pub fn run_terminal_session_observe(
     cols: u16,
     rows: u16,
     output: TerminalSessionOutput,
+    expected_launch: Option<String>,
 ) -> io::Result<()> {
     let mut stream =
         connect_terminal_session_stream(target.clone(), cols, rows, "observing terminal session")?;
     request_output(&mut stream, output)?;
-    write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
-    write_terminal_session_output(stream, output)
+    let early = match expected_launch {
+        Some(expected_launch_incarnation) => request_guarded_admission(
+            &mut stream,
+            &AdmissionRequest {
+                mode: AdmissionMode::Observe,
+                target,
+                takeover: false,
+                expected_launch_incarnation,
+            },
+        )?,
+        None => {
+            write_to_server(&mut stream, &ClientMessage::ObserveTerminal { target })?;
+            Vec::new()
+        }
+    };
+    write_terminal_session_output(stream, output, early)
 }
 
 /// Runs a writable terminal session controller.
@@ -55,6 +81,7 @@ pub fn run_terminal_session_control(
     cols: u16,
     rows: u16,
     output: TerminalSessionOutput,
+    expected_launch: Option<String>,
 ) -> io::Result<()> {
     let mut stream = connect_terminal_session_stream(
         target.clone(),
@@ -63,10 +90,24 @@ pub fn run_terminal_session_control(
         "controlling terminal session",
     )?;
     request_output(&mut stream, output)?;
-    write_to_server(
-        &mut stream,
-        &ClientMessage::ControlTerminal { target, takeover },
-    )?;
+    let early = match expected_launch {
+        Some(expected_launch_incarnation) => request_guarded_admission(
+            &mut stream,
+            &AdmissionRequest {
+                mode: AdmissionMode::Control,
+                target,
+                takeover,
+                expected_launch_incarnation,
+            },
+        )?,
+        None => {
+            write_to_server(
+                &mut stream,
+                &ClientMessage::ControlTerminal { target, takeover },
+            )?;
+            Vec::new()
+        }
+    };
 
     let mut write_stream = stream.try_clone()?;
     let _input_thread = std::thread::spawn(move || {
@@ -94,7 +135,106 @@ pub fn run_terminal_session_control(
         let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
     });
 
-    write_terminal_session_output(stream, output)
+    write_terminal_session_output(stream, output, early)
+}
+
+/// Sends a guarded admission and waits for its answer, before anything reads
+/// stdin, touches the terminal or writes the stream. Returns what arrived
+/// ahead of an accepted answer, in order. A refusal prints one JSON error to
+/// stderr and exits with status 1.
+pub(super) fn request_guarded_admission(
+    stream: &mut LocalStream,
+    request: &AdmissionRequest,
+) -> io::Result<Vec<ServerMessage>> {
+    let message =
+        protocol::terminal_launch_guard::request_message(request).map_err(io::Error::other)?;
+    write_to_server(stream, &message)?;
+    // An older server ignores the request, and attaches nothing, so the wait
+    // is bounded like the handshake that just succeeded on this connection.
+    super::handshake::set_handshake_recv_timeout(
+        stream,
+        Some(super::handshake::handshake_read_timeout()),
+        "guarded terminal admission read timeout unavailable",
+    )
+    .map_err(|err| io::Error::other(err.to_string()))?;
+    match read_guarded_admission_answer(stream) {
+        Ok(early) => {
+            super::handshake::set_handshake_recv_timeout(
+                stream,
+                None,
+                "failed to clear guarded terminal admission read timeout",
+            )
+            .map_err(|err| io::Error::other(err.to_string()))?;
+            Ok(early)
+        }
+        Err(error) => {
+            let response = crate::api::schema::ErrorResponse {
+                id: "cli:terminal:admission".into(),
+                error,
+            };
+            eprintln!(
+                "{}",
+                serde_json::to_string(&response).map_err(io::Error::other)?
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Reads up to the admission answer: what arrived ahead of an accepted one,
+/// or the typed error of a connection that was not shown to be admitted.
+fn read_guarded_admission_answer(
+    stream: &mut impl io::Read,
+) -> Result<Vec<ServerMessage>, crate::api::schema::ErrorBody> {
+    let unanswered = |what: String| crate::api::schema::ErrorBody {
+        code: ADMISSION_UNANSWERED_CODE.to_owned(),
+        message: format!("{what}; the admission and any takeover may have taken effect"),
+    };
+    let mut early = Vec::new();
+    loop {
+        match protocol::read_message(stream, MAX_GRAPHICS_FRAME_SIZE) {
+            Ok(ServerMessage::EndpointControl { kind, data })
+                if kind == protocol::terminal_launch_guard::ANSWER_KIND =>
+            {
+                let answer = serde_json::from_str::<AdmissionAnswer>(&data).map_err(|err| {
+                    unanswered(format!("the guarded admission answer was invalid: {err}"))
+                })?;
+                if answer.admitted {
+                    return Ok(early);
+                }
+                return Err(crate::api::schema::ErrorBody {
+                    code: answer
+                        .code
+                        .unwrap_or_else(|| ADMISSION_FAILED_CODE.to_owned()),
+                    message: answer.message.unwrap_or_default(),
+                });
+            }
+            Ok(ServerMessage::ServerShutdown {
+                reason: Some(reason),
+            }) => {
+                return Err(crate::api::schema::ErrorBody {
+                    code: ADMISSION_FAILED_CODE.to_owned(),
+                    message: reason,
+                });
+            }
+            Ok(ServerMessage::ServerShutdown { reason: None }) => {
+                return Err(unanswered(
+                    "the server closed the connection before answering".to_owned(),
+                ));
+            }
+            Ok(message) => early.push(message),
+            Err(protocol::FramingError::UnexpectedEof) => {
+                return Err(unanswered(
+                    "the connection closed before the server answered".to_owned(),
+                ));
+            }
+            Err(err) => {
+                return Err(unanswered(format!(
+                    "the server did not answer the guarded admission: {err}"
+                )));
+            }
+        }
+    }
 }
 
 /// Asks for terminal cells before attaching, so the welcome precedes every frame.
@@ -160,9 +300,15 @@ fn connect_terminal_session_stream(
 fn write_terminal_session_output(
     mut stream: LocalStream,
     output: TerminalSessionOutput,
+    early: Vec<ServerMessage>,
 ) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     let mut writer = TerminalOutputWriter::new(output);
+    for message in early {
+        if writer.write(&mut stdout, message)? == OutputFlow::Closed {
+            return Ok(());
+        }
+    }
     loop {
         match protocol::read_message(&mut stream, MAX_GRAPHICS_FRAME_SIZE) {
             Ok(message) => {

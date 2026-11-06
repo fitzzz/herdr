@@ -86,6 +86,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         agent_prompt_outcome: true,
         agent_send_keys_expected_session: true,
         agent_send_keys_expected_launch_incarnation: true,
+        terminal_attach_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()
             .filter(|agent| crate::agent_resume::carries_launch_options(*agent))
@@ -1538,6 +1539,7 @@ mod tests {
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
                 agent_send_keys_expected_launch_incarnation: false,
+                terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),
             None,

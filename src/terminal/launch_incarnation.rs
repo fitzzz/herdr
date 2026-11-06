@@ -233,11 +233,53 @@ pub(crate) fn leads_foreground(bound: ProcessInstance, leader: Option<ProcessIns
     leader.is_some_and(|leader| same_process(&bound, &leader))
 }
 
+/// Why a terminal does not hold the launch a direct attach expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchRefusal {
+    /// The expected value is not a launch token.
+    Malformed,
+    /// The terminal does not exist.
+    TerminalGone,
+    /// The terminal exists and no agent occupies it.
+    NoOccupant,
+    /// Another attested launch occupies the terminal.
+    OtherLaunch { current: String },
+    /// An agent occupies the terminal and no launch is proved for it now.
+    NotAttested,
+}
+
+impl LaunchRefusal {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Malformed => "invalid_launch_incarnation",
+            Self::TerminalGone => "terminal_not_found",
+            Self::NoOccupant => "terminal_no_occupant",
+            Self::OtherLaunch { .. } => "terminal_launch_mismatch",
+            Self::NotAttested => "terminal_launch_not_attested",
+        }
+    }
+
+    pub(crate) fn describe(&self, terminal: &str, expected: &str) -> String {
+        match self {
+            Self::Malformed => format!("{expected:?} is not a launch incarnation"),
+            Self::TerminalGone => format!("terminal {terminal} not found"),
+            Self::NoOccupant => {
+                format!("no agent occupies terminal {terminal}, not the expected launch {expected}")
+            }
+            Self::OtherLaunch { current } => format!(
+                "terminal {terminal} runs launch {current}, not the expected launch {expected}"
+            ),
+            Self::NotAttested => format!(
+                "terminal {terminal} runs no attested launch, not the expected launch {expected}"
+            ),
+        }
+    }
+}
+
 const TOKEN_HEX_LEN: usize = 32;
 
 /// Whether `token` has the form [`mint`] gives a launch token.
-#[cfg(any(unix, test))]
-fn is_canonical_token(token: &str) -> bool {
+pub(crate) fn is_canonical_token(token: &str) -> bool {
     token.strip_prefix("launch_").is_some_and(|hex| {
         hex.len() == TOKEN_HEX_LEN
             && hex
@@ -293,6 +335,32 @@ mod tests {
         assert!(launch.awaits(&nonce));
         launch.claim(bound, SHELL, Some(SHELL)).unwrap();
         launch
+    }
+
+    #[test]
+    fn the_token_parser_takes_only_what_mint_produces() {
+        assert!(is_canonical_token(
+            "launch_0123456789abcdef0123456789abcdef"
+        ));
+        for malformed in [
+            "",
+            "launch_",
+            "launch_0123456789abcdef0123456789abcde",
+            "launch_0123456789abcdef0123456789abcdef0",
+            "launch_0123456789ABCDEF0123456789ABCDEF",
+            "LAUNCH_0123456789abcdef0123456789abcdef",
+            "nonce_0123456789abcdef0123456789abcdef",
+            " launch_0123456789abcdef0123456789abcdef",
+            "launch_0123456789abcdef0123456789abcdef\n",
+            "launch_0123456789abcdef\t123456789abcdef",
+            "launch_0123456789abcdef\u{1}123456789abcdef",
+            "launch_0123456789abcdef\u{e9}23456789abcde",
+            "--takeover",
+            "--expect-launch",
+            "-h",
+        ] {
+            assert!(!is_canonical_token(malformed), "{malformed:?}");
+        }
     }
 
     #[test]

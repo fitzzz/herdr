@@ -561,6 +561,17 @@ fn client_error_display_server_shutdown() {
 }
 
 #[test]
+fn server_shutdown_display_for_an_ended_launch_does_not_say_the_server_stopped() {
+    let err = ClientError::ServerShutdown {
+        reason: Some("terminal_launch_ended: terminal t runs no attested launch".into()),
+    };
+    assert_eq!(
+        err.to_string(),
+        "terminal_launch_ended: terminal t runs no attested launch"
+    );
+}
+
+#[test]
 fn client_error_display_server_shutdown_no_reason() {
     let err = ClientError::ServerShutdown { reason: None };
     let msg = err.to_string();

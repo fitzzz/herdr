@@ -783,6 +783,7 @@ fn success_response_round_trips() {
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
                 agent_send_keys_expected_launch_incarnation: false,
+                terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),
         },

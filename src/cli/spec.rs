@@ -711,7 +711,10 @@ fn terminal_command() -> Command {
             Command::new("attach")
                 .about("Attach directly to a terminal stream")
                 .arg(required("terminal_id", "TERMINAL_ID"))
-                .arg(flag("takeover")),
+                .arg(flag("takeover"))
+                .arg(option("expect-launch", "INCARNATION").help(
+                    "Attach only if the terminal's agent still runs this launch (the launch_incarnation its agent start reply returned); the stream ends if that launch stops occupying the terminal",
+                )),
         )
         .subcommand(
             Command::new("session")
@@ -722,14 +725,20 @@ fn terminal_command() -> Command {
                         .arg(required("target", "TARGET"))
                         .arg(flag("takeover"))
                         .arg(option("cols", "N"))
-                        .arg(option("rows", "N")),
+                        .arg(option("rows", "N"))
+                        .arg(option("expect-launch", "INCARNATION").help(
+                    "Attach only if the terminal's agent still runs this launch (the launch_incarnation its agent start reply returned); the stream ends if that launch stops occupying the terminal",
+                )),
                 )
                 .subcommand(
                     Command::new("observe")
                         .about("Observe a terminal stream")
                         .arg(required("target", "TARGET"))
                         .arg(option("cols", "N"))
-                        .arg(option("rows", "N")),
+                        .arg(option("rows", "N"))
+                        .arg(option("expect-launch", "INCARNATION").help(
+                    "Attach only if the terminal's agent still runs this launch (the launch_incarnation its agent start reply returned); the stream ends if that launch stops occupying the terminal",
+                )),
                 ),
         )
         .subcommand(
@@ -1289,6 +1298,13 @@ mod tests {
             command_path(&cmd, &["agent", "send-keys"]),
             "expect-launch"
         ));
+        for path in [
+            &["terminal", "attach"][..],
+            &["terminal", "session", "control"][..],
+            &["terminal", "session", "observe"][..],
+        ] {
+            assert!(has_option(command_path(&cmd, path), "expect-launch"));
+        }
 
         let pane = command_path(&cmd, &["pane"]);
         assert!(pane

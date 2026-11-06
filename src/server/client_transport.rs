@@ -524,6 +524,12 @@ pub(crate) enum ServerEvent {
     ClientShellPresentationSync { client_id: u64, token: String },
     /// A direct terminal client asked for terminal cells instead of ANSI frames.
     TerminalCellsHello { client_id: u64, data: String },
+    /// A direct terminal admission guarded by an expected launch; `None` when
+    /// the request could not be read.
+    TerminalGuardedAdmission {
+        client_id: u64,
+        request: Option<crate::protocol::terminal_launch_guard::AdmissionRequest>,
+    },
     /// A client-owned shell invoked one endpoint operation through this connection.
     ClientShellEndpointRequest {
         client_id: u64,
@@ -990,6 +996,30 @@ fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
     true
 }
 
+/// Makes the shared socket safe for a read-only stream, which must not block
+/// the writer on a client that stopped reading.
+#[cfg_attr(windows, allow(unused_variables))] // Only Unix sockets need this.
+fn configure_observer_stream(
+    stream: &LocalStream,
+    client_id: u64,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // macOS Unix sockets can block even with per-send MSG_DONTWAIT.
+        // ClientStreamReader preserves blocking reads on the shared socket.
+        let configured = stream
+            .set_send_timeout(Some(OBSERVER_WRITE_TIMEOUT))
+            .and_then(|()| stream.set_nonblocking(true));
+        if let Err(err) = configured {
+            let _ = crate::platform::shutdown_client_stream(stream);
+            let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// The client read loop — reads messages from the client and forwards to the server event channel.
 #[cfg(test)]
 fn client_read_loop(
@@ -1072,20 +1102,7 @@ fn client_read_loop_with_endpoint_controls(
                 }
             }
             ClientMessage::ObserveTerminal { target } => {
-                #[cfg(unix)]
-                {
-                    // macOS Unix sockets can block even with per-send MSG_DONTWAIT.
-                    // ClientStreamReader preserves blocking reads on the shared socket.
-                    let configured = stream
-                        .set_send_timeout(Some(OBSERVER_WRITE_TIMEOUT))
-                        .and_then(|()| stream.set_nonblocking(true));
-                    if let Err(err) = configured {
-                        let _ = crate::platform::shutdown_client_stream(&stream);
-                        let _ = server_event_tx
-                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
-                        return Err(err);
-                    }
-                }
+                configure_observer_stream(&stream, client_id, server_event_tx)?;
                 ServerEvent::ClientObserveTerminal { client_id, target }
             }
             ClientMessage::ControlTerminal { target, takeover } => {
@@ -1352,6 +1369,19 @@ fn client_read_loop_with_endpoint_controls(
                 if kind == crate::protocol::terminal_cells::HELLO_KIND =>
             {
                 ServerEvent::TerminalCellsHello { client_id, data }
+            }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == crate::protocol::terminal_launch_guard::REQUEST_KIND =>
+            {
+                use crate::protocol::terminal_launch_guard::{AdmissionMode, AdmissionRequest};
+                let request = serde_json::from_str::<AdmissionRequest>(&data).ok();
+                if request
+                    .as_ref()
+                    .is_some_and(|request| request.mode == AdmissionMode::Observe)
+                {
+                    configure_observer_stream(&stream, client_id, server_event_tx)?;
+                }
+                ServerEvent::TerminalGuardedAdmission { client_id, request }
             }
             ClientMessage::EndpointControl { kind, data } => {
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)

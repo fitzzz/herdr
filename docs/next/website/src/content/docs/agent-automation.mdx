@@ -137,6 +137,12 @@ launch=$(herdr agent start reviewer --kind codex --pane "$pane" | jq -r '.result
 herdr agent send-keys reviewer esc --expect-session "$session" --expect-launch "$launch"
 ```
 
+Pin an attach the same way, so an operator never lands in an agent that replaced the one you read. With `--expect-launch`, `terminal attach`, `terminal session control` and `terminal session observe` refuse before attaching anything unless that launch occupies the terminal, and end the stream when it stops. See [Direct terminal attach](/docs/cli-reference/#direct-terminal-attach).
+
+```bash
+herdr terminal attach "$terminal_id" --expect-launch "$launch"
+```
+
 Run an ordinary process and wait for its output without treating it as an agent:
 
 ```bash
