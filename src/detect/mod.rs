@@ -549,19 +549,18 @@ pub fn submitted_evidence_supported(agent: Option<Agent>) -> bool {
     agent.is_some_and(manifest::submitted_evidence_supported)
 }
 
-pub fn composer_submitted_evidence(agent: Option<Agent>, screen: &str, needle: &str) -> usize {
-    let Some(agent) = agent else {
-        return 0;
+pub fn composer_submitted_evidence_since(
+    agent: Option<Agent>,
+    baseline: &str,
+    screen: &str,
+    needle: &str,
+) -> Option<usize> {
+    let input = |screen| manifest::DetectionInput {
+        screen,
+        osc_title: "",
+        osc_progress: "",
     };
-    manifest::composer_submitted_evidence(
-        agent,
-        manifest::DetectionInput {
-            screen,
-            osc_title: "",
-            osc_progress: "",
-        },
-        needle,
-    )
+    manifest::composer_submitted_evidence_since(agent?, input(baseline), input(screen), needle)
 }
 
 pub fn composer_queued_evidence(

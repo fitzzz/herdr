@@ -940,27 +940,69 @@ regex = ['(?m)^›(?: |$)']
         assert!(submitted_evidence_supported(Agent::Codex));
         assert!(!queued_evidence_supported(Agent::Codex));
 
-        let screen = "› Hello World\n• reply\n› hello\n  world\n› Hello World\n";
-        // The current prompt line is outside the region; the wrapped entry counts.
+        let baseline = "• start\n• TEST-STATUS\n› \n";
+        let screen =
+            "• start\n› Hello World\n• reply\n› hello\n  world\n• TEST-STATUS\n› Hello World\n";
+        // The current prompt line and the live status line above it are not
+        // history; the wrapped entry counts.
         assert_eq!(
-            composer_submitted_evidence(Agent::Codex, input(screen), "hello world"),
-            2
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(screen),
+                "hello world"
+            ),
+            Some(2)
         );
         assert!(composer_match(Agent::Codex, input(screen)).is_none());
 
         // Text outside a prompt-marker entry is not submitted evidence.
-        let output_only = "• Ran echo Hello World\n  Hello World\n› \n";
+        let output_only = "• start\n• Ran echo Hello World\n  Hello World\n› \n";
         assert_eq!(
-            composer_submitted_evidence(Agent::Codex, input(output_only), "hello world"),
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(output_only),
+                "hello world"
+            )
+            .unwrap_or(0),
             0
         );
         assert_eq!(
-            composer_submitted_evidence(Agent::Codex, input(screen), "missing"),
-            0
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(screen),
+                "missing"
+            ),
+            Some(0)
         );
         assert_eq!(
-            composer_submitted_evidence(Agent::Codex, input(screen), " "),
-            0
+            composer_submitted_evidence_since(Agent::Codex, input(baseline), input(screen), " "),
+            None
+        );
+
+        // Only entries after the last history both screens share are new.
+        let grown = "› Hello World\n• start\n• TEST-STATUS\n› \n";
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input(baseline),
+                input(grown),
+                "hello world"
+            ),
+            Some(0),
+            "an entry revealed above shared history is old"
+        );
+        assert_eq!(
+            composer_submitted_evidence_since(
+                Agent::Codex,
+                input("• other\n• TEST-STATUS\n› \n"),
+                input(screen),
+                "hello world"
+            ),
+            None,
+            "screens without shared history cannot be ordered"
         );
     });
 }

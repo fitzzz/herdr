@@ -221,16 +221,10 @@ pub(super) fn prompt_agent(
         .as_deref()
         .map(|screen| crate::detect::manifest::composer_text_occurrences(screen, &prompt_needle))
         .unwrap_or(0);
-    // Without a pre-submission screen, an older steered entry cannot be told
-    // apart from a new one, so steer evidence is unavailable.
-    let submitted_baseline = before_screen.as_deref().map(|screen| {
-        crate::detect::composer_submitted_evidence(expected_agent, screen, &prompt_needle)
-    });
     tracing::debug!(
         request_id = %request_id,
         baseline_read = before_screen.is_some(),
         text_baseline = baseline,
-        submitted_baseline = ?submitted_baseline,
         "agent prompt evidence baseline"
     );
 
@@ -288,7 +282,9 @@ pub(super) fn prompt_agent(
         expected_agent,
     };
     let acceptance_mode = if prompt_started_working {
-        Some(PromptAcceptanceMode::Working { submitted_baseline })
+        Some(PromptAcceptanceMode::Working {
+            baseline_screen: before_screen,
+        })
     } else if crate::detect::composer_evidence_supported(expected_agent) {
         Some(PromptAcceptanceMode::ComposerCleared)
     } else {
@@ -466,8 +462,8 @@ fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bo
     let text_occurrences =
         crate::detect::manifest::composer_text_occurrences(screen, &probe.needle);
     let new_text = text_occurrences > probe.baseline;
-    match probe.mode {
-        PromptAcceptanceMode::Working { submitted_baseline } => {
+    match &probe.mode {
+        PromptAcceptanceMode::Working { baseline_screen } => {
             let queued = new_text
                 && crate::detect::composer_queued_evidence(
                     probe.expected_agent,
@@ -476,26 +472,22 @@ fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bo
                     "",
                     &probe.needle,
                 );
-            // A steered prompt is a new submitted entry, carrying new prompt text,
-            // above an input box that no longer holds a draft, a command or a
-            // selection list. A detection window that grows can reveal the `›`
-            // marker of an older entry whose text was already counted, so every
-            // newly counted entry must be matched by newly visible prompt text;
-            // anything else is ambiguous and not evidence.
-            let new_entries = submitted_baseline.map(|baseline| {
-                crate::detect::composer_submitted_evidence(
+            // A steered prompt is a submitted entry after all the history this
+            // sample shares with the pre-submission screen, above an input box
+            // that no longer holds a draft, a command or a selection list. A
+            // window that grows reveals old entries above that history, which
+            // never count. Without a baseline, or when the two screens share no
+            // history, there is no evidence either way.
+            let new_entries = baseline_screen.as_deref().and_then(|baseline| {
+                crate::detect::composer_submitted_evidence_since(
                     probe.expected_agent,
+                    baseline,
                     screen,
                     &probe.needle,
                 )
-                .saturating_sub(baseline)
             });
             let holds_input = composer_holds_input(probe.expected_agent, screen);
-            let steered = new_entries.is_some_and(|new_entries| {
-                new_entries > 0
-                    && text_occurrences.saturating_sub(probe.baseline) >= new_entries
-                    && !holds_input
-            });
+            let steered = new_entries.is_some_and(|new_entries| new_entries > 0) && !holds_input;
             tracing::debug!(
                 text_occurrences,
                 text_baseline = probe.baseline,
@@ -611,12 +603,12 @@ struct PromptRejectionProbe {
     expected_agent: Option<crate::detect::Agent>,
 }
 
-#[derive(Clone, Copy)]
 enum PromptAcceptanceMode {
     /// The agent was already working: the prompt must appear as a queued
-    /// message or, when a pre-submission count exists, as a new steered entry.
+    /// message or, when the pre-submission screen was read, as a steered
+    /// entry after the history both screens share.
     Working {
-        submitted_baseline: Option<usize>,
+        baseline_screen: Option<String>,
     },
     ComposerCleared,
 }
@@ -1305,7 +1297,7 @@ mod tests {
     fn acceptance_evidence_requires_queued_message_or_cleared_composer() {
         let queued = PromptAcceptanceProbe {
             mode: PromptAcceptanceMode::Working {
-                submitted_baseline: Some(0),
+                baseline_screen: Some(String::new()),
             },
             needle: "hello".into(),
             baseline: 0,
@@ -1474,9 +1466,7 @@ not = [{ contains = ["TEST-EMPTY"] }]
     ) -> PromptAcceptanceProbe {
         PromptAcceptanceProbe {
             mode: PromptAcceptanceMode::Working {
-                submitted_baseline: before_screen.map(|screen| {
-                    crate::detect::composer_submitted_evidence(expected_agent, screen, STEER_NEEDLE)
-                }),
+                baseline_screen: before_screen.map(str::to_string),
             },
             needle: STEER_NEEDLE.into(),
             baseline: before_screen
@@ -1566,23 +1556,112 @@ not = [{ contains = ["TEST-EMPTY"] }]
         let before = working_screen(old_tail, &[], EMPTY_INPUT);
         // The window grows by one row and reveals that message's marker. No
         // text was submitted: the prompt text count stays 1 while the entry
-        // count rises from 0 to 1.
+        // count rises from 0 to 1. The revealed entry lies above the history
+        // both screens share, so it is not new.
         let revealed_head = format!("\u{203a} Old multiline request\n{old_tail}");
         let revealed = working_screen(&revealed_head, &[], EMPTY_INPUT);
         assert_eq!(
-            crate::detect::composer_submitted_evidence(codex, &revealed, STEER_NEEDLE),
-            1
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &revealed,
+                STEER_NEEDLE
+            ),
+            Some(0)
         );
         assert!(!prompt_acceptance_evidence(
             &revealed,
             &working_probe(Some(&before), codex)
         ));
 
-        // A reveal together with a real steer is ambiguous: two new entries but
-        // one new occurrence of the text. Stay conservative.
+        // A reveal together with a real steer: the steer follows the shared
+        // history, so the screens order it as new while the reveal stays old.
         let revealed_and_steered = working_screen(&revealed_head, &[STEER_ENTRY], EMPTY_INPUT);
-        assert!(!prompt_acceptance_evidence(
+        assert_eq!(
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &revealed_and_steered,
+                STEER_NEEDLE
+            ),
+            Some(1)
+        );
+        assert!(prompt_acceptance_evidence(
             &revealed_and_steered,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn revealing_an_old_entry_with_the_same_text_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // An old message repeats the prompt text on its continuation line. The
+        // window first shows only that continuation, then grows by one row and
+        // reveals the message's own first line: the text count goes 1 -> 2 and
+        // the entry count 0 -> 1 with nothing submitted.
+        let continuation = "  review the diff\n\u{2022} reply\n";
+        let before = working_screen(continuation, &[], EMPTY_INPUT);
+        let revealed = working_screen(
+            &format!("\u{203a} review the diff\n{continuation}"),
+            &[],
+            EMPTY_INPUT,
+        );
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn revealing_a_whole_old_entry_above_existing_history_is_not_a_new_steer() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let anchor = "\u{2022} reply\n";
+        let before = working_screen(anchor, &[], EMPTY_INPUT);
+        let revealed = working_screen(&format!("{STEER_ENTRY}{anchor}"), &[], EMPTY_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &revealed,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn screens_without_shared_history_are_not_steer_evidence() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_screen("\u{2022} older output\n", &[], EMPTY_INPUT);
+        let unrelated = working_screen("\u{2022} other output\n", &[STEER_ENTRY], EMPTY_INPUT);
+        assert_eq!(
+            crate::detect::composer_submitted_evidence_since(
+                codex,
+                &before,
+                &unrelated,
+                STEER_NEEDLE
+            ),
+            None,
+            "screens that share no history cannot be ordered"
+        );
+        assert!(!prompt_acceptance_evidence(
+            &unrelated,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steer_repeating_an_earlier_prompt_is_accepted() {
+        let _manifests = SyntheticManifests::install(&[("codex", SYNTHETIC_CODEX)]);
+        let codex = Some(crate::detect::Agent::Codex);
+        // The same text was submitted before and is still on screen; the new
+        // steer follows the history both screens share.
+        let before = working_screen(SCREEN_HEAD, &[STEER_ENTRY, "\u{2022} done\n"], EMPTY_INPUT);
+        let repeated = working_screen(
+            SCREEN_HEAD,
+            &[STEER_ENTRY, "\u{2022} done\n", STEER_ENTRY],
+            EMPTY_INPUT,
+        );
+        assert!(prompt_acceptance_evidence(
+            &repeated,
             &working_probe(Some(&before), codex)
         ));
     }
