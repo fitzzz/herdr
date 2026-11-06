@@ -64,9 +64,10 @@ impl App {
         let mut nudged = false;
         // The measurement can wait on the PTY actor, so the permission is
         // checked only now, immediately before the write.
-        if should_send_wakeup(unread_input_bytes, focus_reporting)
-            && nudge.is_some_and(|nudge| nudge.claim_at(std::time::Instant::now()))
-        {
+        if let Some(nudge) = nudge.filter(|nudge| {
+            should_send_wakeup(unread_input_bytes, focus_reporting)
+                && nudge.claim_at(std::time::Instant::now())
+        }) {
             match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(report) => match runtime.try_send_bytes(Bytes::from(report)) {
                     Ok(()) => nudged = true,
@@ -76,6 +77,9 @@ impl App {
                 },
                 Err(err) => tracing::warn!(err = %err, "failed to encode the Codex input wake-up"),
             }
+            // Published before the reply, so a prompt whose wait ends first
+            // still learns whether the report was enqueued.
+            nudge.claim.finish(nudged);
         }
         let response = AgentInputWakeupProjectionResponse {
             id: id.clone(),
@@ -93,7 +97,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::should_send_wakeup;
-    use crate::api::{WakeupClaim, WakeupNudge};
+    use crate::api::{WakeupClaim, WakeupNudge, WakeupWrite};
     use std::time::{Duration, Instant};
 
     fn nudge(not_after: Instant) -> WakeupNudge {
@@ -108,8 +112,9 @@ mod tests {
         let now = Instant::now();
         let expired = nudge(now - Duration::from_millis(1));
         assert!(!expired.claim_at(now), "a lapsed permission must not write");
-        assert!(
-            expired.claim.cancel(),
+        assert_eq!(
+            expired.claim.withdraw(),
+            WakeupWrite::None,
             "the waiting prompt learns that nothing was written"
         );
     }
@@ -118,7 +123,7 @@ mod tests {
     fn a_wakeup_withdrawn_by_the_prompt_never_writes() {
         let now = Instant::now();
         let withdrawn = nudge(now + Duration::from_secs(5));
-        assert!(withdrawn.claim.cancel());
+        assert_eq!(withdrawn.claim.withdraw(), WakeupWrite::None);
         assert!(!withdrawn.claim_at(now), "the prompt stopped waiting first");
     }
 
@@ -128,10 +133,22 @@ mod tests {
         let live = nudge(now + Duration::from_secs(5));
         assert!(live.claim_at(now));
         assert!(!live.claim_at(now), "one write per request");
-        assert!(
-            !live.claim.cancel(),
-            "a prompt that gave up learns the write happened"
+        assert_eq!(
+            live.claim.withdraw(),
+            WakeupWrite::Unconfirmed,
+            "a claim alone is not a completed write"
         );
+        live.claim.finish(true);
+        assert_eq!(live.claim.withdraw(), WakeupWrite::Enqueued);
+    }
+
+    #[test]
+    fn a_failed_enqueue_is_published_as_nothing_written() {
+        let now = Instant::now();
+        let failed = nudge(now + Duration::from_secs(5));
+        assert!(failed.claim_at(now));
+        failed.claim.finish(false);
+        assert_eq!(failed.claim.withdraw(), WakeupWrite::None);
     }
 
     #[test]

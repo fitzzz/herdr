@@ -131,9 +131,10 @@ pub(crate) struct PaneAgentStatusProjectionResponse {
     pub(crate) result: schema::PaneAgentStatusChangedEvent,
 }
 
-/// Permission for one wake-up write: it lapses at `not_after`, and the waiting
-/// prompt can withdraw it through `claim`. The app checks both immediately
-/// before it writes, after measuring, so a late request writes nothing.
+/// Permission for one wake-up write: it lapses at `not_after`, the exact
+/// stage deadline the prompt waits until, and the waiting prompt can withdraw
+/// it through `claim`. The app checks both immediately before it writes, after
+/// measuring, so a late request writes nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WakeupNudge {
     pub(crate) not_after: std::time::Instant,
@@ -142,52 +143,76 @@ pub(crate) struct WakeupNudge {
 
 impl WakeupNudge {
     /// Whether the app may write now. Claiming is final: once this returns
-    /// true the prompt can no longer cancel, and it never returns true after
-    /// the prompt cancelled or the permission lapsed.
+    /// true the prompt can no longer withdraw it, and it never returns true
+    /// after the prompt withdrew it or the permission lapsed. The app must
+    /// then publish the write's result with `WakeupClaim::finish`.
     pub(crate) fn claim_at(&self, now: std::time::Instant) -> bool {
         if now > self.not_after {
-            self.claim.cancel();
+            self.claim.withdraw();
             return false;
         }
         self.claim.claim()
     }
 }
 
+/// What a prompt that stopped waiting knows about its wake-up write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeupWrite {
+    /// Nothing was or will be written.
+    None,
+    /// The app enqueued the report for the PTY.
+    Enqueued,
+    /// The app claimed the write but had not published its result.
+    Unconfirmed,
+}
+
 /// One wake-up's single write right, shared by the waiting prompt and the app.
 /// Whichever side moves first wins: the app claims it immediately before it
-/// writes, and the prompt cancels it when it stops waiting for the answer or
-/// returns, so a request handled after that writes nothing, and a prompt that
-/// gave up knows whether the write happened.
+/// writes and publishes whether the report was enqueued before it replies;
+/// the prompt withdraws it when it stops waiting for the answer or returns.
+/// A request handled after that writes nothing, and a prompt that gave up
+/// learns what happened without treating a claim as a completed write.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WakeupClaim(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 impl WakeupClaim {
     const PENDING: u8 = 0;
     const CLAIMED: u8 = 1;
-    const CANCELLED: u8 = 2;
+    const ENQUEUED: u8 = 2;
+    const FAILED: u8 = 3;
+    const WITHDRAWN: u8 = 4;
 
-    fn claim(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::PENDING,
-                Self::CLAIMED,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    /// Withdraw the write right. True when no write happened or can happen;
-    /// false when the app already claimed it.
-    pub(crate) fn cancel(&self) -> bool {
-        match self.0.compare_exchange(
-            Self::PENDING,
-            Self::CANCELLED,
+    fn transition(&self, from: u8, to: u8) -> Result<u8, u8> {
+        self.0.compare_exchange(
+            from,
+            to,
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => true,
-            Err(state) => state == Self::CANCELLED,
+        )
+    }
+
+    fn claim(&self) -> bool {
+        self.transition(Self::PENDING, Self::CLAIMED).is_ok()
+    }
+
+    /// Publish the claimed write's result: whether the report was enqueued.
+    pub(crate) fn finish(&self, enqueued: bool) {
+        let result = if enqueued {
+            Self::ENQUEUED
+        } else {
+            Self::FAILED
+        };
+        let _ = self.transition(Self::CLAIMED, result);
+    }
+
+    /// Withdraw the write right if the app has not claimed it, and report what
+    /// is known about the write.
+    pub(crate) fn withdraw(&self) -> WakeupWrite {
+        match self.transition(Self::PENDING, Self::WITHDRAWN) {
+            Ok(_) => WakeupWrite::None,
+            Err(Self::ENQUEUED) => WakeupWrite::Enqueued,
+            Err(Self::CLAIMED) => WakeupWrite::Unconfirmed,
+            Err(_) => WakeupWrite::None,
         }
     }
 }

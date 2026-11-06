@@ -637,16 +637,24 @@ struct PromptWakeup {
 }
 
 impl PromptWakeup {
-    /// What remains of the caller's budget, capped at `cap`; `None` once spent.
-    fn budget(&self, cap: std::time::Duration) -> Option<std::time::Duration> {
-        let budget = match self.caller_deadline {
-            Some(deadline) => deadline
-                .checked_duration_since(std::time::Instant::now())?
-                .min(cap),
-            None => cap,
-        };
-        (!budget.is_zero()).then_some(budget)
+    /// The absolute end of a stage starting now and lasting at most `cap`,
+    /// never past the caller's deadline; `None` once that deadline has passed.
+    /// The stage keeps this instant: later waits derive their timeouts from
+    /// it, so a delay between steps never extends the stage.
+    fn stage_deadline(&self, cap: std::time::Duration) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        let end = self
+            .caller_deadline
+            .map_or(now + cap, |deadline| deadline.min(now + cap));
+        (end > now).then_some(end)
     }
+}
+
+/// The time left until `deadline`, measured now; `None` once it has passed.
+fn time_left(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
 }
 
 /// Withdraws a wake-up's write right when its prompt stops waiting, so a
@@ -655,19 +663,24 @@ struct CancelWakeupOnExit(crate::api::WakeupClaim);
 
 impl Drop for CancelWakeupOnExit {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.0.withdraw();
     }
 }
 
-/// The outcome of offering the wake-up at the stall decision.
-enum WakeupStep {
-    /// Nothing was written: not eligible, budget spent, or withdrawn in time.
-    NotWritten(Option<crate::api::AgentInputWakeup>),
-    /// The app answered; `nudged` says whether it wrote the report.
-    Answered(crate::api::AgentInputWakeup),
-    /// The answer did not arrive in time, but the app had already claimed the
-    /// write, so the report was (or is being) written.
-    WrittenUnanswered,
+/// The outcome of offering the wake-up at the stall decision: the app's
+/// measurement if it answered in time, and what the shared claim says about
+/// the write. Only the claim decides whether a report was enqueued.
+#[derive(Debug)]
+struct WakeupStep {
+    report: Option<crate::api::AgentInputWakeup>,
+    write: crate::api::WakeupWrite,
+}
+
+impl WakeupStep {
+    const NOT_OFFERED: Self = Self {
+        report: None,
+        write: crate::api::WakeupWrite::None,
+    };
 }
 
 struct PromptRejectionProbe {
@@ -738,7 +751,7 @@ fn wait_for_resolved_agent(
         .timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let expected_terminal_id = wait.initial.terminal_id.clone();
-    let mut wakeup_sent = false;
+    let mut wakeup_write = crate::api::WakeupWrite::None;
     let mut wakeup_report = None;
     let wakeup_claim = crate::api::WakeupClaim::default();
     let _cancel_wakeup = CancelWakeupOnExit(wakeup_claim.clone());
@@ -758,6 +771,11 @@ fn wait_for_resolved_agent(
     loop {
         if should_stop_connection(stream, running)? {
             return Ok(None);
+        }
+        // A wake-up the app claimed before the prompt stopped waiting for its
+        // answer counts as written only once the app publishes the enqueue.
+        if wakeup_write == crate::api::WakeupWrite::Unconfirmed {
+            wakeup_write = wakeup_claim.withdraw();
         }
 
         let mut should_probe = false;
@@ -780,7 +798,10 @@ fn wait_for_resolved_agent(
                             {
                                 let mut matched = wait.initial.clone();
                                 matched.agent_status = status;
-                                return Ok(Some(matched_outcome(matched, wakeup_sent)));
+                                return Ok(Some(matched_outcome(
+                                    matched,
+                                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                                )));
                             }
                         }
                         return agent_wait_not_running(request_id)
@@ -854,10 +875,16 @@ fn wait_for_resolved_agent(
                 if let Some(status) = matched_event_status {
                     let mut matched = current;
                     matched.agent_status = status;
-                    return Ok(Some(matched_outcome(matched, wakeup_sent)));
+                    return Ok(Some(matched_outcome(
+                        matched,
+                        wakeup_write == crate::api::WakeupWrite::Enqueued,
+                    )));
                 }
                 if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
-                    return Ok(Some(matched_outcome(current, wakeup_sent)));
+                    return Ok(Some(matched_outcome(
+                        current,
+                        wakeup_write == crate::api::WakeupWrite::Enqueued,
+                    )));
                 }
             }
         }
@@ -901,7 +928,10 @@ fn wait_for_resolved_agent(
                             if acceptance_streak >= probe.required_streak() {
                                 let current = agent_get(&request_id, &wait.target, api_tx)
                                     .unwrap_or_else(|_| wait.initial.clone());
-                                return Ok(Some(matched_outcome(current, wakeup_sent)));
+                                return Ok(Some(matched_outcome(
+                                    current,
+                                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                                )));
                             }
                         } else {
                             acceptance_streak = 0;
@@ -933,7 +963,10 @@ fn wait_for_resolved_agent(
             if wait.match_status
                 && agent_wait_matches(&current, &wait.until, wait.after_state_change_seq)
             {
-                return Ok(Some(matched_outcome(current, wakeup_sent)));
+                return Ok(Some(matched_outcome(
+                    current,
+                    wakeup_write == crate::api::WakeupWrite::Enqueued,
+                )));
             }
             if let Some(wakeup) = wait.wakeup.take() {
                 let step = prompt_wakeup_report(
@@ -945,21 +978,15 @@ fn wait_for_resolved_agent(
                     &wakeup_claim,
                     api_tx,
                 );
-                match step {
-                    WakeupStep::NotWritten(report) => wakeup_report = report,
-                    WakeupStep::Answered(report) => {
-                        wakeup_sent = report.nudged;
-                        wakeup_report = Some(report);
-                    }
-                    WakeupStep::WrittenUnanswered => wakeup_sent = true,
-                }
-                if wakeup_sent {
+                wakeup_report = step.report;
+                wakeup_write = step.write;
+                if wakeup_write != crate::api::WakeupWrite::None {
                     // The turn gets what remains of the caller's budget, up to
-                    // the window, measured from now rather than planned ahead.
-                    if let Some(window) =
-                        wakeup.budget(std::time::Duration::from_millis(PROMPT_WAKEUP_WINDOW_MS))
+                    // the window, from a stage that starts now.
+                    if let Some(window_end) = wakeup
+                        .stage_deadline(std::time::Duration::from_millis(PROMPT_WAKEUP_WINDOW_MS))
                     {
-                        deadline = Some(std::time::Instant::now() + window);
+                        deadline = Some(window_end);
                         pending_remeasure = Some(wakeup);
                         continue;
                     }
@@ -967,24 +994,28 @@ fn wait_for_resolved_agent(
             } else if let Some(wakeup) = pending_remeasure.take() {
                 // Report what is still queued now, not what the nudge saw, if
                 // the caller's budget leaves room to ask.
-                if let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) {
+                if let Some(timeout) = wakeup
+                    .stage_deadline(APP_RESPONSE_TIMEOUT)
+                    .and_then(time_left)
+                {
                     wakeup_report = input_wakeup(
                         &request_id,
                         &wait.target,
                         &expected_terminal_id,
                         None,
-                        budget,
+                        timeout,
                         api_tx,
                     )
                     .ok()
                     .or(wakeup_report);
                 }
             }
+            if wakeup_write == crate::api::WakeupWrite::Unconfirmed {
+                wakeup_write = wakeup_claim.withdraw();
+            }
             let unread_detail = match &wakeup_report {
-                Some(report) => unread_input_detail(report, wakeup_sent),
-                None => wakeup_sent.then(|| {
-                    "one focus-in wake-up was written, but no turn start was observed".to_string()
-                }),
+                Some(report) => unread_input_detail(report, wakeup_write),
+                None => wakeup_write_detail(wakeup_write),
             };
             return agent_wait_timeout(
                 request_id,
@@ -1017,40 +1048,47 @@ fn prompt_wakeup_report(
         current.agent_status,
         crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
     ) {
-        return WakeupStep::NotWritten(None);
+        return WakeupStep::NOT_OFFERED;
     }
-    let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) else {
-        return WakeupStep::NotWritten(None);
+    let Some(timeout) = wakeup
+        .stage_deadline(APP_RESPONSE_TIMEOUT)
+        .and_then(time_left)
+    else {
+        return WakeupStep::NOT_OFFERED;
     };
-    let Ok(screen) = read_agent_screen(request_id, target, api_tx, budget) else {
-        return WakeupStep::NotWritten(None);
+    let Ok(screen) = read_agent_screen(request_id, target, api_tx, timeout) else {
+        return WakeupStep::NOT_OFFERED;
     };
     if composer_holds_input(wakeup.expected_agent, &screen)
         || crate::detect::manifest::composer_text_occurrences(&screen, &wakeup.needle)
             > wakeup.baseline
     {
-        return WakeupStep::NotWritten(None);
+        return WakeupStep::NOT_OFFERED;
     }
-    let Some(budget) = wakeup.budget(APP_RESPONSE_TIMEOUT) else {
-        return WakeupStep::NotWritten(None);
+    let Some(not_after) = wakeup.stage_deadline(APP_RESPONSE_TIMEOUT) else {
+        return WakeupStep::NOT_OFFERED;
     };
     let nudge = crate::api::WakeupNudge {
-        not_after: std::time::Instant::now() + budget,
+        not_after,
         claim: claim.clone(),
     };
-    match input_wakeup(
+    let Some(timeout) = time_left(not_after) else {
+        return WakeupStep::NOT_OFFERED;
+    };
+    let report = input_wakeup(
         request_id,
         target,
         expected_terminal_id,
         Some(nudge),
-        budget,
+        timeout,
         api_tx,
-    ) {
-        Ok(report) => WakeupStep::Answered(report),
-        // The request may still be queued: withdraw it, unless the app has
-        // already claimed the write.
-        Err(()) if claim.cancel() => WakeupStep::NotWritten(None),
-        Err(()) => WakeupStep::WrittenUnanswered,
+    )
+    .ok();
+    // The app publishes the write's result before it replies; a request still
+    // queued is withdrawn here, so it can no longer write.
+    WakeupStep {
+        report,
+        write: claim.withdraw(),
     }
 }
 
@@ -1083,23 +1121,52 @@ fn input_wakeup(
 
 /// The stalled error's account of input the agent has not read, so a caller can
 /// tell queued input from lost input. `None` when there is nothing to add.
-fn unread_input_detail(report: &crate::api::AgentInputWakeup, wakeup_sent: bool) -> Option<String> {
-    let bytes = report.unread_input_bytes?;
+fn unread_input_detail(
+    report: &crate::api::AgentInputWakeup,
+    write: crate::api::WakeupWrite,
+) -> Option<String> {
+    use crate::api::WakeupWrite;
+    let Some(bytes) = report.unread_input_bytes else {
+        return wakeup_write_detail(write);
+    };
     if bytes == 0 {
-        return wakeup_sent.then(|| {
-            "the agent read its queued input after one focus-in wake-up, but no turn start was observed".to_string()
-        });
+        return match write {
+            WakeupWrite::Enqueued => Some(
+                "the agent read its queued input after one focus-in wake-up, but no turn start was observed".to_string(),
+            ),
+            WakeupWrite::Unconfirmed => Some(
+                "the agent read its queued input after a focus-in wake-up attempt whose write was not confirmed, but no turn start was observed".to_string(),
+            ),
+            WakeupWrite::None => None,
+        };
     }
     let queued = format!(
         "{bytes} input bytes are still unread in the agent's terminal input queue (queued, not lost)"
     );
-    Some(if wakeup_sent {
-        format!("{queued} after one focus-in wake-up")
-    } else if !report.focus_reporting {
-        format!("{queued}; focus reporting is off, so no wake-up was sent")
-    } else {
-        format!("{queued}; the wake-up could not be written")
+    Some(match write {
+        WakeupWrite::Enqueued => format!("{queued} after one focus-in wake-up"),
+        WakeupWrite::Unconfirmed => {
+            format!("{queued}; a focus-in wake-up was attempted, but its write was not confirmed")
+        }
+        WakeupWrite::None if !report.focus_reporting => {
+            format!("{queued}; focus reporting is off, so no wake-up was sent")
+        }
+        WakeupWrite::None => format!("{queued}; the wake-up could not be written"),
     })
+}
+
+/// The stalled error's account of the wake-up write when no measurement says
+/// more. `None` when nothing was written.
+fn wakeup_write_detail(write: crate::api::WakeupWrite) -> Option<String> {
+    match write {
+        crate::api::WakeupWrite::Enqueued => Some(
+            "one focus-in wake-up was written, but no turn start was observed".to_string(),
+        ),
+        crate::api::WakeupWrite::Unconfirmed => Some(
+            "a focus-in wake-up was attempted, but its write was not confirmed and no turn start was observed".to_string(),
+        ),
+        crate::api::WakeupWrite::None => None,
+    }
 }
 
 fn prompt_activity_statuses() -> Vec<crate::api::schema::AgentStatus> {
@@ -2016,7 +2083,7 @@ not = [{ contains = ["TEST-EMPTY"] }]
             &claim,
             &api_tx,
         );
-        assert!(matches!(step, WakeupStep::NotWritten(None)));
+        assert_nothing_written(&step);
         drop(api_tx);
         assert!(app.join().unwrap().is_empty(), "not even a screen read");
     }
@@ -2051,7 +2118,7 @@ not = [{ contains = ["TEST-EMPTY"] }]
             &claim,
             &api_tx,
         );
-        assert!(matches!(step, WakeupStep::NotWritten(None)));
+        assert_nothing_written(&step);
         drop(api_tx);
         assert_eq!(
             app.join().unwrap(),
@@ -2082,10 +2149,8 @@ not = [{ contains = ["TEST-EMPTY"] }]
             &claim,
             &api_tx,
         );
-        assert!(
-            matches!(step, WakeupStep::NotWritten(None)),
-            "the prompt withdrew the request when its wait ended"
-        );
+        // The prompt withdrew the request when its wait ended.
+        assert_nothing_written(&step);
         assert!(
             !written_rx.recv().unwrap(),
             "the late request must not write"
@@ -2094,14 +2159,33 @@ not = [{ contains = ["TEST-EMPTY"] }]
         assert_eq!(app.join().unwrap(), vec!["agent.read", "wakeup"]);
     }
 
-    #[test]
-    fn a_wakeup_claimed_before_the_wait_lapsed_is_reported_as_written() {
-        let (api_tx, app) = fake_app(|message| {
-            let nudge = take_nudge(&message);
-            assert!(nudge.claim_at(std::time::Instant::now()));
-            // Written, but the answer comes too late for the prompt.
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        });
+    fn assert_nothing_written(step: &WakeupStep) {
+        assert!(step.report.is_none(), "{step:?}");
+        assert_eq!(step.write, crate::api::WakeupWrite::None, "{step:?}");
+    }
+
+    /// The app's reply to a wake-up request, as `handle_agent_input_wakeup`
+    /// sends it.
+    fn reply_to_wakeup(message: crate::api::ApiRequestMessage, nudged: bool) {
+        let response = crate::api::AgentInputWakeupProjectionResponse {
+            id: message.request.id.clone(),
+            result: crate::api::AgentInputWakeup {
+                unread_input_bytes: Some(17),
+                focus_reporting: true,
+                nudged,
+            },
+        };
+        let _ = message
+            .respond_to
+            .send(serde_json::to_string(&response).unwrap());
+    }
+
+    /// Offers the wake-up against a fake app whose answer comes too late for a
+    /// caller deadline 80 ms away.
+    fn offer_with_late_answer(
+        on_wakeup: impl Fn(crate::api::ApiRequestMessage) + Send + 'static,
+    ) -> (WakeupStep, crate::api::WakeupClaim) {
+        let (api_tx, app) = fake_app(on_wakeup);
         let claim = crate::api::WakeupClaim::default();
         let wakeup = wakeup_with_deadline(Some(
             std::time::Instant::now() + std::time::Duration::from_millis(80),
@@ -2115,9 +2199,67 @@ not = [{ contains = ["TEST-EMPTY"] }]
             &claim,
             &api_tx,
         );
-        assert!(matches!(step, WakeupStep::WrittenUnanswered));
         drop(api_tx);
-        app.join().unwrap();
+        assert_eq!(app.join().unwrap(), vec!["agent.read", "wakeup"]);
+        (step, claim)
+    }
+
+    #[test]
+    fn a_wakeup_enqueued_before_the_wait_lapsed_is_reported_as_written() {
+        let (step, _claim) = offer_with_late_answer(|message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            nudge.claim.finish(true);
+            // Enqueued, but the answer comes too late for the prompt.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            reply_to_wakeup(message, true);
+        });
+        assert!(step.report.is_none(), "the answer was late");
+        assert_eq!(step.write, crate::api::WakeupWrite::Enqueued);
+    }
+
+    #[test]
+    fn a_failed_enqueue_with_a_late_reply_is_not_reported_as_written() {
+        let (step, _claim) = offer_with_late_answer(|message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            // The PTY input queue refused the report.
+            nudge.claim.finish(false);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            reply_to_wakeup(message, false);
+        });
+        assert_nothing_written(&step);
+        let detail = unread_input_detail(
+            &crate::api::AgentInputWakeup {
+                unread_input_bytes: Some(17),
+                focus_reporting: true,
+                nudged: false,
+            },
+            step.write,
+        )
+        .unwrap();
+        assert!(detail.contains("could not be written"), "{detail}");
+    }
+
+    #[test]
+    fn a_claim_without_a_published_enqueue_is_unconfirmed_not_written() {
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<crate::api::WakeupClaim>();
+        let (step, claim) = offer_with_late_answer(move |message| {
+            let nudge = take_nudge(&message);
+            assert!(nudge.claim_at(std::time::Instant::now()));
+            // Still claimed, with no result published, when the prompt gives up.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = finish_tx.send(nudge.claim.clone());
+        });
+        assert!(step.report.is_none());
+        // Only `Enqueued` earns `released_after_wakeup`; a claim alone does not.
+        assert_eq!(step.write, crate::api::WakeupWrite::Unconfirmed);
+        let detail = wakeup_write_detail(step.write).unwrap();
+        assert!(detail.contains("not confirmed"), "{detail}");
+        assert!(!detail.contains("was written"), "{detail}");
+        // The wait upgrades the state once the app publishes the enqueue.
+        finish_rx.recv().unwrap().finish(true);
+        assert_eq!(claim.withdraw(), crate::api::WakeupWrite::Enqueued);
     }
 
     #[test]
@@ -2132,23 +2274,45 @@ not = [{ contains = ["TEST-EMPTY"] }]
     }
 
     #[test]
-    fn the_wakeup_budget_is_what_remains_of_the_caller_deadline() {
+    fn a_wakeup_stage_ends_at_the_caller_deadline_or_its_cap() {
         let cap = std::time::Duration::from_secs(2);
-        assert_eq!(wakeup_with_deadline(None).budget(cap), Some(cap));
+        let before = std::time::Instant::now();
+        let open = wakeup_with_deadline(None).stage_deadline(cap).unwrap();
+        assert!(open >= before + cap && open <= std::time::Instant::now() + cap);
         assert_eq!(
-            wakeup_with_deadline(Some(std::time::Instant::now())).budget(cap),
+            wakeup_with_deadline(Some(std::time::Instant::now())).stage_deadline(cap),
             None
         );
-        let near = wakeup_with_deadline(Some(
-            std::time::Instant::now() + std::time::Duration::from_millis(500),
-        ))
-        .budget(cap)
-        .unwrap();
-        assert!(near <= std::time::Duration::from_millis(500));
-        let far = wakeup_with_deadline(Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-        ));
-        assert_eq!(far.budget(cap), Some(cap));
+        let near = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        assert_eq!(
+            wakeup_with_deadline(Some(near)).stage_deadline(cap),
+            Some(near),
+            "the stage ends exactly at the caller deadline"
+        );
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(wakeup_with_deadline(Some(far)).stage_deadline(cap).unwrap() < far);
+    }
+
+    #[test]
+    fn a_delay_after_the_stage_is_planned_never_extends_the_write_permission() {
+        // Review round 2: a scheduling delay between planning the stage and
+        // building the permission once moved the expiry past the caller's
+        // deadline (late_claim=true).
+        let caller_deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+        let wakeup = wakeup_with_deadline(Some(caller_deadline));
+        let stage = wakeup.stage_deadline(APP_RESPONSE_TIMEOUT).unwrap();
+        assert_eq!(stage, caller_deadline);
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        let nudge = crate::api::WakeupNudge {
+            not_after: stage,
+            claim: crate::api::WakeupClaim::default(),
+        };
+        assert_eq!(time_left(stage), None, "no time is left to wait for");
+        assert!(
+            !nudge.claim_at(std::time::Instant::now()),
+            "the permission lapses at the caller deadline"
+        );
+        assert_eq!(nudge.claim.withdraw(), crate::api::WakeupWrite::None);
     }
 
     #[test]
