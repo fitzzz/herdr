@@ -408,7 +408,8 @@ impl App {
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            if let Some(mut binding) = plan.launcher {
+            if let Some(binding) = plan.launcher {
+                let mut binding = binding.without_launch_evidence();
                 binding.observed = false;
                 binding.argv = binding.launcher.argv(native_args);
                 binding.argv_origin = crate::agent_launcher::LauncherArgvOrigin::CanonicalResume;
@@ -560,6 +561,7 @@ mod tests {
             .clone();
         let session = crate::agent_resume::AgentSessionRef::id("same-uuid").unwrap();
         let binding = crate::agent_launcher::BoundAgentLauncher {
+                session_launch_incarnation: None,
                 observed: false,
                 argv: Vec::new(), argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
             agent: "codex".into(), session: Some(session.clone()),
@@ -824,6 +826,7 @@ mod tests {
             argv: vec!["codex".into(), "resume".into(), "same-uuid".into()],
             dedupe_key: "fixture".into(),
             launcher: Some(crate::agent_launcher::BoundAgentLauncher {
+                session_launch_incarnation: None,
                 observed: false,
                 argv: Vec::new(),
                 argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
@@ -857,6 +860,7 @@ mod tests {
         app.state.default_shell = "dash".into();
         let id = app.state.terminals.keys().next().unwrap().clone();
         let binding = crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: Vec::new(),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,

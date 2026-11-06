@@ -1175,6 +1175,13 @@ impl App {
                     peer_ancestry.as_deref(),
                 );
             }
+            Method::AgentAttestLaunch(params) => {
+                return self.handle_agent_attest_launch(
+                    request.id,
+                    params,
+                    peer_ancestry.as_deref(),
+                );
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }

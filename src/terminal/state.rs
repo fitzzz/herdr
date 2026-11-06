@@ -669,6 +669,9 @@ pub struct TerminalState {
     pub restore_error: Option<String>,
     agent_launch: Option<ObservedAgentLaunch>,
     agent_launch_revision: u64,
+    /// The admitted `herdr agent start` launch and the process it is bound to
+    /// ([`crate::terminal::launch_incarnation`]).
+    launch_incarnation: Option<crate::terminal::launch_incarnation::LaunchIncarnation>,
     /// The conversations agent processes in this pane were shown to run.
     process_sessions: ProcessSessions,
     /// Whether the restore that started this terminal repeated the agent's
@@ -718,6 +721,7 @@ impl TerminalState {
             restore_error: None,
             agent_launch: None,
             agent_launch_revision: 0,
+            launch_incarnation: None,
             process_sessions: ProcessSessions::default(),
             agent_launch_restore: None,
         }
@@ -1302,6 +1306,11 @@ impl TerminalState {
             };
         }
         self.detected_agent = agent;
+        // An observed exit ends the launch for good, even when the
+        // observation later proves wrong: absence only refuses a key.
+        if process_exited {
+            self.launch_incarnation = None;
+        }
         if agent.is_some()
             && self
                 .agent_launch
@@ -2392,6 +2401,8 @@ impl TerminalState {
         evidence: &SessionReportEvidence,
     ) -> Option<TerminalStateMutation> {
         let reported = session_ref.clone();
+        let reported_source = source.clone();
+        let reported_agent = agent_label.clone();
         let mutation = self.set_agent_session_ref_for_session_start(
             source,
             agent_label,
@@ -2399,8 +2410,14 @@ impl TerminalState {
             seq,
             session_start_source,
         )?;
-        if reported.is_some_and(|session| self.session_ref_is_current(&session)) {
+        if let Some(session) = reported.filter(|session| self.session_ref_is_current(session)) {
             self.sync_agent_launch_session(evidence);
+            self.record_session_launch_incarnation(
+                &reported_source,
+                &reported_agent,
+                &session,
+                evidence,
+            );
         }
         Some(mutation)
     }
@@ -2796,6 +2813,7 @@ impl TerminalState {
             FullLifecycleHookSuppressionReason::HookClear,
         );
         if !process_owns_agent {
+            self.launch_incarnation = None;
             self.detected_agent = None;
             self.fallback_state = AgentState::Unknown;
             self.fallback_visible_blocker = false;
@@ -2846,6 +2864,7 @@ impl TerminalState {
         let previous_session = self.current_session_identity_for_persistence();
         self.hook_authority = None;
         self.set_reported_resume(None);
+        self.launch_incarnation = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -3106,6 +3125,149 @@ impl TerminalState {
         });
     }
 
+    /// Records a newly admitted `herdr agent start` launch, replacing any
+    /// earlier one; `None` admits a launch Herdr cannot attest, which still
+    /// ends the earlier one.
+    pub(crate) fn admit_launch_incarnation(
+        &mut self,
+        launch: Option<crate::terminal::launch_incarnation::LaunchIncarnation>,
+    ) {
+        self.launch_incarnation = launch;
+    }
+
+    /// The token of the admitted launch, only while the process that launch
+    /// started is the terminal's agent process.
+    pub fn launch_incarnation(&self) -> Option<&str> {
+        self.launch_incarnation
+            .as_ref()
+            .and_then(crate::terminal::launch_incarnation::LaunchIncarnation::attested_token)
+    }
+
+    /// The attested launch's token with its bound process. The token is
+    /// reported or acted on only while that process provably still leads
+    /// the terminal's foreground.
+    pub(crate) fn attested_launch(&self) -> Option<(&str, ProcessInstance)> {
+        self.launch_incarnation
+            .as_ref()
+            .and_then(crate::terminal::launch_incarnation::LaunchIncarnation::attested)
+    }
+
+    /// Whether this terminal's admitted launch waits for `nonce`.
+    pub(crate) fn launch_awaits_claim(&self, nonce: &str) -> bool {
+        self.launch_incarnation
+            .as_ref()
+            .is_some_and(|launch| launch.awaits(nonce))
+    }
+
+    /// The launch helper `process`, child of `parent`, claimed the admission;
+    /// `shell` is the pane's shell. A refused claim ends the launch, since its
+    /// one-use nonce is spent.
+    pub(crate) fn claim_launch_incarnation(
+        &mut self,
+        process: ProcessInstance,
+        parent: u32,
+        shell: Option<u32>,
+    ) -> Result<(), crate::terminal::launch_incarnation::ClaimRefusal> {
+        let Some(launch) = self.launch_incarnation.as_mut() else {
+            return Err(crate::terminal::launch_incarnation::ClaimRefusal::NotTheShellsChild);
+        };
+        let claimed = launch.claim(process, parent, shell);
+        if claimed.is_err() {
+            self.launch_incarnation = None;
+        }
+        claimed
+    }
+
+    /// Detection identified `process`, running `agent`, as this terminal's
+    /// agent process.
+    pub fn observe_agent_process(&mut self, agent: Agent, process: ProcessInstance) {
+        if self
+            .launch_incarnation
+            .as_mut()
+            .is_some_and(|launch| !launch.observe(agent, process))
+        {
+            self.launch_incarnation = None;
+        }
+    }
+
+    /// An agent of another kind now holds the terminal, so the admitted
+    /// launch's process no longer is its agent process.
+    fn reconcile_launch_incarnation(&mut self) {
+        let Some(launch) = self.launch_incarnation.as_ref() else {
+            return;
+        };
+        let admitted = launch.agent();
+        let other_detected = self.detected_agent.is_some_and(|agent| agent != admitted);
+        let other_reported = self
+            .effective_agent_label()
+            .is_some_and(|label| crate::detect::parse_agent_label(label) != Some(admitted));
+        if other_detected || other_reported {
+            self.launch_incarnation = None;
+        }
+    }
+
+    /// A conversation report this terminal took came from the launch's bound
+    /// process. The server placed that process in the pane as the one running
+    /// the reported agent, which attests the launch as detection does: an
+    /// agent under full lifecycle hooks is not probed again while its process
+    /// group stays the same, so its report can be the first to show it. The
+    /// binding of a launcher that launch ran for that same conversation
+    /// records the launch.
+    fn record_session_launch_incarnation(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session: &crate::agent_resume::AgentSessionRef,
+        evidence: &SessionReportEvidence,
+    ) {
+        let SessionReportEvidence::Reporter(reporter) = evidence else {
+            return;
+        };
+        let Some(launch) = self.launch_incarnation.as_mut() else {
+            return;
+        };
+        let Some(agent) = crate::detect::parse_agent_label(agent_label) else {
+            return;
+        };
+        if !crate::agent_resume::is_official_agent_source(source, agent_label)
+            || agent != launch.agent()
+            || !launch.reported_by(reporter)
+        {
+            return;
+        }
+        let Some(bound) = launch.process() else {
+            return;
+        };
+        if !launch.observe(agent, bound) {
+            self.launch_incarnation = None;
+            return;
+        }
+        let token = launch.token().to_string();
+        if let Some(binding) = self.agent_launcher.as_mut().filter(|binding| {
+            binding.agent == agent_label && binding.session.as_ref() == Some(session)
+        }) {
+            binding.session_launch_incarnation = Some(token);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn handoff_launch_incarnation(
+        &self,
+    ) -> Option<crate::terminal::launch_incarnation::HandoffLaunchIncarnation> {
+        self.launch_incarnation.as_ref()?.handoff()
+    }
+
+    /// The launch a live handoff carried, which detection attests again when
+    /// it identifies the same process.
+    #[cfg(unix)]
+    pub(crate) fn restore_handoff_launch_incarnation(
+        &mut self,
+        carried: crate::terminal::launch_incarnation::HandoffLaunchIncarnation,
+    ) {
+        self.launch_incarnation =
+            crate::terminal::launch_incarnation::LaunchIncarnation::from_handoff(carried);
+    }
+
     pub fn managed_agent_launch_pending(&self) -> bool {
         self.managed_agent.is_some_and(|managed| {
             matches!(
@@ -3167,6 +3329,7 @@ impl TerminalState {
                 && observed_expected
                 && known_agent.is_none();
         if clear {
+            self.launch_incarnation = None;
             self.clear_agent_name();
             return true;
         }
@@ -3200,6 +3363,10 @@ impl TerminalState {
                 return true;
             }
             if now >= deadline {
+                // A start that never showed its own process is not attested.
+                if self.launch_incarnation().is_none() {
+                    self.launch_incarnation = None;
+                }
                 self.clear_agent_name();
                 return true;
             }
@@ -3293,6 +3460,7 @@ impl TerminalState {
         self.set_agent_launch(None);
         self.process_sessions = ProcessSessions::default();
         self.agent_launch_restore = None;
+        self.launch_incarnation = None;
         self.clear_agent_name();
     }
 
@@ -3387,6 +3555,7 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
+        self.reconcile_launch_incarnation();
         let state = if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else {
@@ -3436,6 +3605,7 @@ mod tests {
         let mut terminal =
             TerminalState::new(TerminalId::alloc(), std::env::current_dir().unwrap());
         terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             observed: false,
             argv: Vec::new(),
             argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
@@ -3482,6 +3652,7 @@ mod tests {
             session_ref: original.clone(),
         });
         terminal.agent_launcher = Some(crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
             agent: "codex".into(),
             session: Some(original),
             launcher: crate::api::schema::AgentLauncher {

@@ -357,7 +357,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
     let pinned_terminal_id = pane_terminal_id(&pane_id)?;
     let mut retry_deadline = None;
-    let mut previous_busy_response = None;
+    let mut previous_busy_response: Option<serde_json::Value> = None;
     let mut response = loop {
         if let Some(previous_busy_response) = previous_busy_response.as_ref() {
             let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -365,7 +365,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 || pane_terminal_id(&pane_id)? != pinned_terminal_id
                 || !pane_shell_is_initializing(&pane_id)?
             {
-                return super::print_response(previous_busy_response);
+                return super::print_response(&not_admitted(previous_busy_response.clone()));
             }
         }
 
@@ -388,7 +388,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             || pane_terminal_id(&pane_id)? != pinned_terminal_id
             || !pane_shell_is_initializing(&pane_id)?
         {
-            return super::print_response(&response);
+            return super::print_response(&not_admitted(response));
         }
 
         let deadline = *retry_deadline
@@ -397,24 +397,30 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             if let Some(previous_busy_response) = previous_busy_response.as_ref() {
-                return super::print_response(previous_busy_response);
+                return super::print_response(&not_admitted(previous_busy_response.clone()));
             }
         }
         std::thread::sleep(AGENT_START_POLL_INTERVAL.min(remaining));
     };
 
     let Some(expected_terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
-        return super::print_response(&cli_agent_error(
-            "cli:agent:start",
-            "agent_start_failed",
-            "agent start response did not include terminal_id",
+        return super::print_response(&admitted_unresolved(
+            cli_agent_error(
+                "cli:agent:start",
+                "agent_start_failed",
+                "agent start response did not include terminal_id",
+            ),
+            &response,
         ));
     };
     if pinned_terminal_id
         .as_deref()
         .is_some_and(|pinned| pinned != expected_terminal_id)
     {
-        return super::print_response(&agent_name_lost_error("cli:agent:start", name));
+        return super::print_response(&admitted_unresolved(
+            agent_name_lost_error("cli:agent:start", name),
+            &response,
+        ));
     }
     let waited = wait_for_named_agent(
         name,
@@ -428,11 +434,40 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             response["result"]["agent"] = agent;
             super::print_response(&response)
         }
-        Ok(Err(error)) => super::print_response(&error),
+        Ok(Err(error)) => super::print_response(&admitted_unresolved(error, &response)),
         Err(err) => {
-            print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
+            match agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")? {
+                Some(error) => super::print_response(&admitted_unresolved(error, &response)),
+                None => Ok(1),
+            }
         }
     }
+}
+
+/// A start the server refused: nothing was typed and no launch is admitted.
+fn not_admitted(mut error: serde_json::Value) -> serde_json::Value {
+    error["error"]["admission"] = serde_json::json!({ "status": "not_admitted" });
+    error
+}
+
+/// A start the server admitted, with its readiness unresolved by `error`: the
+/// launch was typed and may still run, so the error keeps what the admission
+/// returned, its launch incarnation included, for a guarded recovery.
+fn admitted_unresolved(
+    mut error: serde_json::Value,
+    admitted: &serde_json::Value,
+) -> serde_json::Value {
+    let result = &admitted["result"];
+    let mut admission = serde_json::json!({
+        "status": "admitted_readiness_unresolved",
+        "agent": result["agent"],
+        "argv": result["argv"],
+    });
+    if let Some(token) = result.get("launch_incarnation") {
+        admission["launch_incarnation"] = token.clone();
+    }
+    error["error"]["admission"] = admission;
+    error
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -578,7 +613,9 @@ fn wait_for_named_agent(
         let poll_id = "cli:agent:start";
         let mut response = if first_poll {
             first_poll = false;
-            resolve_agent_target(name, poll_id)?
+            // The start's caller already holds the admission; a protocol
+            // mismatch is reported with it, not printed here.
+            super::send_request_deferring_protocol_mismatch(&agent_get_request(name, poll_id))?
         } else {
             resolve_agent_target_unchecked(name, poll_id)?
         };
@@ -701,22 +738,30 @@ fn agent_name_lost_error(request_id: &str, expected_name: &str) -> serde_json::V
     )
 }
 
-fn print_agent_transport_error(
+/// The error to print for a transport failure, or `None` when a protocol
+/// mismatch was already reported.
+fn agent_transport_error(
     err: std::io::Error,
     request_id: &str,
     code: &str,
-) -> std::io::Result<i32> {
+) -> std::io::Result<Option<serde_json::Value>> {
     if super::protocol_mismatch_was_reported(&err) {
-        return Ok(1);
+        return Ok(None);
+    }
+    if let Some(response) = super::protocol_mismatch_deferred_response(&err) {
+        return serde_json::to_value(response)
+            .map(Some)
+            .map_err(std::io::Error::other);
     }
     // A dead-server marker reaches here from `send_request` in the agent
     // startup path; surface its deferred response exactly once instead of
     // printing a second, generic transport-error line.
     if let Some(response) = super::server_not_running_reported_response(&err) {
-        let value = serde_json::to_value(response).map_err(std::io::Error::other)?;
-        return super::print_response(&value);
+        return serde_json::to_value(response)
+            .map(Some)
+            .map_err(std::io::Error::other);
     }
-    super::print_response(&cli_agent_error(request_id, code, err.to_string()))
+    Ok(Some(cli_agent_error(request_id, code, err.to_string())))
 }
 
 fn agent_wait_timeout() -> serde_json::Value {
@@ -851,23 +896,29 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
-    const USAGE: &str =
-        "usage: herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]";
+    const USAGE: &str = "usage: herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION] [--expect-launch INCARNATION]";
     let Some(target) = args.first() else {
         eprintln!("{USAGE}");
         return Ok(2);
     };
     let mut keys = Vec::new();
     let mut expected_session = None;
+    let mut expected_launch_incarnation = None;
     let mut index = 1;
     while index < args.len() {
-        if args[index] == "--expect-session" {
+        let guard = match args[index].as_str() {
+            "--expect-session" => Some(&mut expected_session),
+            "--expect-launch" => Some(&mut expected_launch_incarnation),
+            _ => None,
+        };
+        if let Some(guard) = guard {
+            let flag = &args[index];
             let Some(value) = args.get(index + 1) else {
-                eprintln!("missing value for --expect-session");
+                eprintln!("missing value for {flag}");
                 return Ok(2);
             };
-            if expected_session.replace(value.clone()).is_some() {
-                eprintln!("--expect-session given more than once");
+            if guard.replace(value.clone()).is_some() {
+                eprintln!("{flag} given more than once");
                 return Ok(2);
             }
             index += 2;
@@ -881,24 +932,33 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
-    let guarded = expected_session.is_some();
+    // An older server ignores a guard field and writes the keys anyway, so a
+    // guarded request goes only to a server that advertises every guard it uses.
+    let mut required: Vec<super::RequiredCapability> = Vec::new();
+    if expected_session.is_some() {
+        required.push(("agent_send_keys_expected_session", |capabilities| {
+            capabilities.agent_send_keys_expected_session
+        }));
+    }
+    if expected_launch_incarnation.is_some() {
+        required.push((
+            "agent_send_keys_expected_launch_incarnation",
+            |capabilities| capabilities.agent_send_keys_expected_launch_incarnation,
+        ));
+    }
     let request = Request {
         id: "cli:agent:send-keys".into(),
         method: Method::AgentSendKeys(AgentSendKeysParams {
             target: target.clone(),
             keys,
             expected_session,
+            expected_launch_incarnation,
         }),
     };
-    // An older server ignores expected_session and writes the keys anyway.
-    let response = if guarded {
-        super::send_request_requiring_capability(
-            &request,
-            "agent_send_keys_expected_session",
-            |capabilities| capabilities.agent_send_keys_expected_session,
-        )?
-    } else {
+    let response = if required.is_empty() {
         super::send_request(&request)?
+    } else {
+        super::send_request_requiring_capabilities(&request, &required)?
     };
     super::print_response(&response)
 }
@@ -972,7 +1032,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION]");
+    eprintln!("  herdr agent send-keys <target> <key> [key ...] [--expect-session SESSION] [--expect-launch INCARNATION]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
@@ -994,4 +1054,104 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+/// The helper an admitted agent start types: `__attest-launch <nonce>
+/// [--path <executable>] -- <argv...>`. It claims the admission from its own
+/// process, then execs `argv` in that process, which keeps its id and start
+/// time. With `--path` it execs that executable, the one the pane's shell
+/// resolved `argv[0]` to, keeping `argv[0]` as typed; without it `argv[0]` is
+/// looked up on `PATH`. The agent runs whether or not the claim succeeded;
+/// without it the launch is never attested, so keys guarded by its launch
+/// incarnation are refused. Returns only when the executable could not run.
+///
+/// `__attest-launch <nonce> --resolved-by-shell` is typed to run instead
+/// when the pane's shell resolves the agent's command itself (an alias, a
+/// function or a builtin): it ends the admission, and the shell then runs
+/// the command unattested.
+pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
+    if let [nonce, flag] = args {
+        if flag == RESOLVED_BY_SHELL_FLAG {
+            if let Err(reason) = attest_launch(nonce, true) {
+                eprintln!("herdr: could not end this agent start's attestation ({reason})");
+            }
+            return Ok(0);
+        }
+    }
+    let (nonce, executable, rest) = match args {
+        [nonce, flag, path, rest @ ..] if flag == EXEC_PATH_FLAG => (nonce, Some(path), rest),
+        [nonce, rest @ ..] => (nonce, None, rest),
+        [] => (&String::new(), None, &[][..]),
+    };
+    let argv = match rest {
+        [separator, argv @ ..] if separator == "--" && !argv.is_empty() && !nonce.is_empty() => {
+            argv
+        }
+        _ => {
+            eprintln!(
+                "usage: herdr {0} <nonce> [{EXEC_PATH_FLAG} <executable>] -- <command> [args...]\n       herdr {0} <nonce> {RESOLVED_BY_SHELL_FLAG}",
+                crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND
+            );
+            return Ok(2);
+        }
+    };
+    if let Err(reason) = attest_launch(nonce, false) {
+        eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
+    }
+    exec_launch(executable.map(String::as_str), argv)
+}
+
+/// The helper argument that ends an admission the pane's shell resolves.
+pub(crate) const RESOLVED_BY_SHELL_FLAG: &str = "--resolved-by-shell";
+
+/// The helper argument naming the executable the pane's shell resolved.
+pub(crate) const EXEC_PATH_FLAG: &str = "--path";
+
+fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
+    let socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR)
+        .ok_or_else(|| format!("{} is not set", crate::api::SOCKET_PATH_ENV_VAR))?;
+    let client = crate::api::client::ApiClient::for_target(
+        crate::api::client::ConnectionTarget::SocketPath(socket.into()),
+    );
+    let request = Request {
+        id: "launch:attest".into(),
+        method: Method::AgentAttestLaunch(crate::api::schema::AgentAttestLaunchParams {
+            nonce: nonce.to_string(),
+            resolved_by_shell,
+        }),
+    };
+    // A server that does not answer must not keep the agent from starting;
+    // a late claim still names this same process.
+    let response = client
+        .request_value_with_timeout(&request, Duration::from_secs(10))
+        .map_err(|err| err.to_string())?;
+    match response.get("error") {
+        None => Ok(()),
+        Some(error) => Err(error["message"]
+            .as_str()
+            .unwrap_or("the server refused the attestation")
+            .to_string()),
+    }
+}
+
+/// Execs `argv` as `executable` when given, else `argv[0]` found on `PATH`.
+#[cfg(unix)]
+fn exec_launch(executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
+    use std::os::unix::process::CommandExt as _;
+    let program = executable.unwrap_or(&argv[0]);
+    let err = std::process::Command::new(program)
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .exec();
+    eprintln!("herdr: could not run {program}: {err}");
+    Ok(127)
+}
+
+#[cfg(not(unix))]
+fn exec_launch(_executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
+    eprintln!(
+        "herdr: launch attestation is not supported on this platform; not running {}",
+        argv[0]
+    );
+    Ok(2)
 }

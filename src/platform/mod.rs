@@ -461,6 +461,51 @@ pub(crate) fn shell_restore_line(command: String) -> String {
     format!("{prefix}{command}")
 }
 
+/// The line that starts `argv` through the attesting helper `attest` only
+/// when the pane's shell itself resolves `argv[0]` to an executable file, and
+/// otherwise runs `resolved_by_shell` and then `argv` as the shell resolves it
+/// (an alias, a function or a builtin), so a start keeps the operator's own
+/// command. POSIX `command -v` writes an absolute path for exactly an
+/// executable file, the one the shell would run, its command hash included.
+/// The helper `attest` gets that path after `path_flag` and execs it with
+/// `argv` unchanged, `argv[0]` included, as the shell itself would. `None`
+/// for shells without POSIX `command -v` and `case`: a start there runs as
+/// typed and unattested.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn attested_interactive_shell_command(
+    attest: &[String],
+    path_flag: &str,
+    resolved_by_shell: &[String],
+    argv: &[String],
+    shell_name: &str,
+) -> Option<String> {
+    if !matches!(
+        normalized_process_name(shell_name).as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
+    ) {
+        return None;
+    }
+    let resolve = format!("command -v {} 2>/dev/null", quote_posix_arg(argv.first()?));
+    let helper = interactive_unix_shell_command(attest, shell_name)?;
+    let path_flag = quote_posix_arg(path_flag);
+    let declined = interactive_unix_shell_command(resolved_by_shell, shell_name)?;
+    let run = interactive_unix_shell_command(argv, shell_name)?;
+    Some(format!(
+        "case $({resolve}) in /*) {helper} {path_flag} \"$({resolve})\" -- {run} ;; *) {declined}; {run} ;; esac"
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn attested_interactive_shell_command(
+    _attest: &[String],
+    _path_flag: &str,
+    _resolved_by_shell: &[String],
+    _argv: &[String],
+    _shell_name: &str,
+) -> Option<String> {
+    None
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn interactive_unix_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
     let quote: fn(&str) -> String = match normalized_process_name(shell_name).as_str() {
@@ -921,6 +966,181 @@ mod tests {
                 "{shell}"
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn attested_line_parts() -> (Vec<String>, Vec<String>) {
+        let helper = vec![
+            "/opt/herdr dir/herdr".to_string(),
+            "__attest-launch".into(),
+            "nonce_1".into(),
+        ];
+        let mut declined = helper.clone();
+        declined.push("--resolved-by-shell".into());
+        (helper, declined)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_attested_start_lets_the_posix_shell_resolve_the_command_first() {
+        let (attest, declined) = attested_line_parts();
+        let argv = vec!["pi".to_string(), "two words".into()];
+        assert_eq!(
+            attested_interactive_shell_command(&attest, "--path", &declined, &argv, "/bin/bash")
+                .as_deref(),
+            Some(
+                "case $(command -v pi 2>/dev/null) in \
+                 /*) '/opt/herdr dir/herdr' __attest-launch nonce_1 \
+                 --path \"$(command -v pi 2>/dev/null)\" -- pi 'two words' ;; \
+                 *) '/opt/herdr dir/herdr' __attest-launch nonce_1 --resolved-by-shell; pi 'two words' ;; esac"
+            )
+        );
+        // Shells without POSIX `command -v` and `case` run the start as typed,
+        // unattested, rather than a line they could not parse.
+        for shell in [
+            "fish",
+            "nu",
+            "csh",
+            "tcsh",
+            "elvish",
+            "xonsh",
+            "pwsh",
+            "my-wrapper",
+        ] {
+            assert_eq!(
+                attested_interactive_shell_command(&attest, "--path", &declined, &argv, shell),
+                None,
+                "{shell}"
+            );
+        }
+    }
+
+    /// The typed line run by real shells: the executable file the shell
+    /// selects, from `PATH` or its command hash, goes through the helper,
+    /// which here records its arguments and execs that path as the real
+    /// helper does; a function or an alias of the same name runs as the shell
+    /// resolves it, after the helper ended the admission, and no file runs.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_attested_start_runs_what_the_shell_resolves() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-attested-line-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = dir.join("bin");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let script = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let helper = dir.join("herdr");
+        script(
+            &helper,
+            "for a; do printf '[%s]' \"$a\"; done >> \"$LOG\"; echo >> \"$LOG\"\n\
+             [ \"$3\" = --path ] && { path=$4; shift 6; exec \"$path\" \"$@\"; }\nexit 0\n",
+        );
+        let recorder = |name: &str| {
+            format!(
+                "printf '{name}' >> \"$OUT\"; for a; do printf '[%s]' \"$a\"; done >> \"$OUT\"\n"
+            )
+        };
+        script(&bin.join("pi"), &recorder("file"));
+        let hashed = other.join("native-pi");
+        script(&hashed, &recorder("hashed"));
+        let attest = vec![
+            helper.display().to_string(),
+            "__attest-launch".into(),
+            "nonce_1".into(),
+        ];
+        let mut declined = attest.clone();
+        declined.push("--resolved-by-shell".into());
+        let argv = vec!["pi".to_string(), "a".into(), "b c".into()];
+        let run = |shell: &str, options: &[&str], prelude: &str| -> (String, String) {
+            let log = dir.join("log");
+            let out = dir.join("out");
+            let _ = std::fs::remove_file(&log);
+            let _ = std::fs::remove_file(&out);
+            let line =
+                attested_interactive_shell_command(&attest, "--path", &declined, &argv, shell)
+                    .unwrap();
+            let status = std::process::Command::new(shell)
+                .args(options)
+                .arg("-c")
+                .arg(format!("{prelude}\n{line}\n"))
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("LOG", &log)
+                .env("OUT", &out)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{shell} {prelude}: {status:?}");
+            (
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(&out).unwrap_or_default(),
+            )
+        };
+        let through_helper = |path: &std::path::Path| {
+            format!(
+                "[__attest-launch][nonce_1][--path][{}][--][pi][a][b c]\n",
+                path.display()
+            )
+        };
+
+        for shell in ["/bin/sh", "/bin/bash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            assert_eq!(
+                run(shell, &[], ""),
+                (through_helper(&bin.join("pi")), "file[a][b c]".to_string()),
+                "{shell}: the executable file runs through the helper"
+            );
+            assert_eq!(
+                run(
+                    shell,
+                    &[],
+                    "pi() { printf 'function' >> \"$OUT\"; for a; do printf '[%s]' \"$a\"; done >> \"$OUT\"; }"
+                ),
+                (
+                    "[__attest-launch][nonce_1][--resolved-by-shell]\n".to_string(),
+                    "function[a][b c]".to_string()
+                ),
+                "{shell}: the function runs as the shell resolves it"
+            );
+        }
+        if std::path::Path::new("/bin/bash").exists() {
+            assert_eq!(
+                run(
+                    "/bin/bash",
+                    &["-O", "expand_aliases"],
+                    "alias pi='printf alias >> \"$OUT\"; printf \"[%s]\" >> \"$OUT\"'"
+                ),
+                (
+                    "[__attest-launch][nonce_1][--resolved-by-shell]\n".to_string(),
+                    "alias[a][b c]".to_string()
+                ),
+                "the alias runs as the shell resolves it"
+            );
+            // A command hash selects an executable a fresh PATH lookup would
+            // not find: the helper runs that same one.
+            assert_eq!(
+                run(
+                    "/bin/bash",
+                    &[],
+                    &format!("hash -p '{}' pi", hashed.display())
+                ),
+                (through_helper(&hashed), "hashed[a][b c]".to_string()),
+                "the hashed executable runs through the helper"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
