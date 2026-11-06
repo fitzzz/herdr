@@ -244,10 +244,12 @@ impl App {
             let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
             argv.extend(params.args);
             // The pane's shell resolves the agent's command as it always did;
-            // the helper runs only when that resolves to an executable file.
+            // the helper runs only when that resolves to an executable file,
+            // and execs the file the shell selected.
             let attested = attestation.as_ref().and_then(|attestation| {
                 crate::platform::attested_interactive_shell_command(
-                    &helper(attestation, &["--"]),
+                    &helper(attestation, &[]),
+                    crate::cli::EXEC_PATH_FLAG,
                     &helper(attestation, &[crate::cli::RESOLVED_BY_SHELL_FLAG]),
                     &argv,
                     &shell_name,

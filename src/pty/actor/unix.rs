@@ -1007,22 +1007,28 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
-            // A guarded write is checked immediately before its first byte:
-            // the process it was meant for must still lead the foreground.
-            if self.current_write_offset == 0 {
-                if let Some(guard) = write.guard.as_ref() {
-                    let leader = crate::platform::foreground_process_group_id_for_tty_fd(
-                        self.file.as_raw_fd(),
-                    )
-                    .and_then(crate::terminal::launch_incarnation::group_leader);
-                    if !crate::terminal::launch_incarnation::leads_foreground(guard.process, leader)
-                    {
-                        let refused = self.pending_writes.pop_front().unwrap();
-                        if let Some(guard) = refused.guard {
-                            let _ = guard.reply.send(super::GuardedWrite::Refused);
-                        }
-                        continue;
+            // A guarded write is checked before every write attempt, a
+            // continuation after a short write included: the process it was
+            // meant for must still lead the foreground. A failed check stops
+            // the rest; the reply says how much was already written.
+            if let Some(guard) = write.guard.as_ref() {
+                let leader =
+                    crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd())
+                        .and_then(crate::terminal::launch_incarnation::group_leader);
+                if !crate::terminal::launch_incarnation::leads_foreground(guard.process, leader) {
+                    let stopped = self.pending_writes.pop_front().unwrap();
+                    let written = std::mem::take(&mut self.current_write_offset);
+                    if let Some(guard) = stopped.guard {
+                        let _ = guard.reply.send(if written == 0 {
+                            super::GuardedWrite::Refused
+                        } else {
+                            super::GuardedWrite::Stopped {
+                                written,
+                                total: stopped.bytes.len(),
+                            }
+                        });
                     }
+                    continue;
                 }
             }
             let chunk = &write.bytes[self.current_write_offset..];
@@ -1305,6 +1311,67 @@ mod tests {
             Ok(super::super::GuardedWrite::Written)
         );
         assert!(runner.pending_writes.is_empty());
+
+        unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
+        shell.kill().ok();
+        shell.wait().ok();
+    }
+
+    /// A guarded write too large for the terminal's input queue is written
+    /// in parts. The process is proved before every part: once a
+    /// replacement leads the foreground, the rest is not sent, and the
+    /// answer says how much was written.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guarded_write_spanning_a_foreground_replacement_stops_at_the_replacement() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "set -m; sleep 1000; sleep 1000"]);
+        let mut shell = pair.slave.spawn_command(cmd).expect("shell");
+        let shell_pid = shell.process_id().expect("shell pid");
+        let master = pair.master.as_raw_fd().expect("master fd");
+        let owned = unsafe { OwnedFd::from_raw_fd(libc::dup(master)) };
+        fd::set_nonblocking(owned.as_raw_fd()).expect("nonblocking master");
+        let mut runner = actor_runner_for_fd(owned);
+        let fd = runner.file.as_raw_fd();
+        let first = foreground_leader_once(fd, |leader| leader.pid != shell_pid);
+
+        // No job reads the terminal, so its input queue fills part way.
+        let total = 256 * 1024;
+        let (reply, outcome) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::WriteGuarded {
+            bytes: Bytes::from(vec![b'\r'; total]),
+            process: first,
+            reply,
+        });
+        runner.flush_pending_writes_once().unwrap();
+        let written = runner.current_write_offset;
+        assert!(
+            written > 0 && written < total,
+            "the write is only partly done: {written} of {total}"
+        );
+        assert!(outcome.try_recv().is_err(), "no answer while writing");
+
+        unsafe { libc::kill(first.pid as libc::pid_t, libc::SIGKILL) };
+        let second = foreground_leader_once(fd, |leader| {
+            leader.pid != shell_pid && leader.pid != first.pid
+        });
+        runner.flush_pending_writes_once().unwrap();
+        assert_eq!(
+            outcome.try_recv(),
+            Ok(super::super::GuardedWrite::Stopped { written, total })
+        );
+        assert!(runner.pending_writes.is_empty(), "the rest is dropped");
+        assert_eq!(runner.current_write_offset, 0);
 
         unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
         shell.kill().ok();

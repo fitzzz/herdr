@@ -1850,3 +1850,36 @@ fn agent_start_runs_a_shell_function_through_the_shell_unattested() {
     ));
     cleanup_spawned_herdr(herdr, base);
 }
+
+/// The helper execs the executable the shell resolved, keeping `argv[0]` as
+/// typed, and still runs it when the server cannot be reached.
+#[cfg(target_os = "linux")]
+#[test]
+fn attest_launch_helper_execs_the_resolved_path_with_the_typed_argv0() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args([
+            "__attest-launch",
+            "nonce_unreachable",
+            "--path",
+            "/bin/sh",
+            "--",
+            "typed-name",
+            "-c",
+            "tr '\\0' ' ' < /proc/$$/cmdline",
+        ])
+        .env("HERDR_SOCKET_PATH", base.join("absent.sock"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("typed-name -c "),
+        "{output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("this agent launch is not attested"),
+        "{output:?}"
+    );
+    fs::remove_dir_all(base).unwrap();
+}

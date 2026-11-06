@@ -613,7 +613,9 @@ fn wait_for_named_agent(
         let poll_id = "cli:agent:start";
         let mut response = if first_poll {
             first_poll = false;
-            resolve_agent_target(name, poll_id)?
+            // The start's caller already holds the admission; a protocol
+            // mismatch is reported with it, not printed here.
+            super::send_request_deferring_protocol_mismatch(&agent_get_request(name, poll_id))?
         } else {
             resolve_agent_target_unchecked(name, poll_id)?
         };
@@ -745,6 +747,11 @@ fn agent_transport_error(
 ) -> std::io::Result<Option<serde_json::Value>> {
     if super::protocol_mismatch_was_reported(&err) {
         return Ok(None);
+    }
+    if let Some(response) = super::protocol_mismatch_deferred_response(&err) {
+        return serde_json::to_value(response)
+            .map(Some)
+            .map_err(std::io::Error::other);
     }
     // A dead-server marker reaches here from `send_request` in the agent
     // startup path; surface its deferred response exactly once instead of
@@ -1049,12 +1056,14 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
     })
 }
 
-/// The helper an admitted agent start types: `__attest-launch <nonce> --
-/// <argv...>`. It claims the admission from its own process, then execs
-/// `argv` in that process, which keeps its id and start time. The agent runs
-/// whether or not the claim succeeded; without it the launch is never
-/// attested, so keys guarded by its launch incarnation are refused. Returns
-/// only when `argv` could not be executed.
+/// The helper an admitted agent start types: `__attest-launch <nonce>
+/// [--path <executable>] -- <argv...>`. It claims the admission from its own
+/// process, then execs `argv` in that process, which keeps its id and start
+/// time. With `--path` it execs that executable, the one the pane's shell
+/// resolved `argv[0]` to, keeping `argv[0]` as typed; without it `argv[0]` is
+/// looked up on `PATH`. The agent runs whether or not the claim succeeded;
+/// without it the launch is never attested, so keys guarded by its launch
+/// incarnation are refused. Returns only when the executable could not run.
 ///
 /// `__attest-launch <nonce> --resolved-by-shell` is typed to run instead
 /// when the pane's shell resolves the agent's command itself (an alias, a
@@ -1069,25 +1078,34 @@ pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
             return Ok(0);
         }
     }
-    let (Some(nonce), Some("--"), Some(argv)) = (
-        args.first(),
-        args.get(1).map(String::as_str),
-        args.get(2..).filter(|argv| !argv.is_empty()),
-    ) else {
-        eprintln!(
-            "usage: herdr {0} <nonce> -- <command> [args...]\n       herdr {0} <nonce> {RESOLVED_BY_SHELL_FLAG}",
-            crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND
-        );
-        return Ok(2);
+    let (nonce, executable, rest) = match args {
+        [nonce, flag, path, rest @ ..] if flag == EXEC_PATH_FLAG => (nonce, Some(path), rest),
+        [nonce, rest @ ..] => (nonce, None, rest),
+        [] => (&String::new(), None, &[][..]),
+    };
+    let argv = match rest {
+        [separator, argv @ ..] if separator == "--" && !argv.is_empty() && !nonce.is_empty() => {
+            argv
+        }
+        _ => {
+            eprintln!(
+                "usage: herdr {0} <nonce> [{EXEC_PATH_FLAG} <executable>] -- <command> [args...]\n       herdr {0} <nonce> {RESOLVED_BY_SHELL_FLAG}",
+                crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND
+            );
+            return Ok(2);
+        }
     };
     if let Err(reason) = attest_launch(nonce, false) {
         eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
     }
-    exec_launch(argv)
+    exec_launch(executable.map(String::as_str), argv)
 }
 
 /// The helper argument that ends an admission the pane's shell resolves.
 pub(crate) const RESOLVED_BY_SHELL_FLAG: &str = "--resolved-by-shell";
+
+/// The helper argument naming the executable the pane's shell resolved.
+pub(crate) const EXEC_PATH_FLAG: &str = "--path";
 
 fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
     let socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR)
@@ -1116,16 +1134,21 @@ fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
     }
 }
 
+/// Execs `argv` as `executable` when given, else `argv[0]` found on `PATH`.
 #[cfg(unix)]
-fn exec_launch(argv: &[String]) -> std::io::Result<i32> {
+fn exec_launch(executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
     use std::os::unix::process::CommandExt as _;
-    let err = std::process::Command::new(&argv[0]).args(&argv[1..]).exec();
-    eprintln!("herdr: could not run {}: {err}", argv[0]);
+    let program = executable.unwrap_or(&argv[0]);
+    let err = std::process::Command::new(program)
+        .arg0(&argv[0])
+        .args(&argv[1..])
+        .exec();
+    eprintln!("herdr: could not run {program}: {err}");
     Ok(127)
 }
 
 #[cfg(not(unix))]
-fn exec_launch(argv: &[String]) -> std::io::Result<i32> {
+fn exec_launch(_executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
     eprintln!(
         "herdr: launch attestation is not supported on this platform; not running {}",
         argv[0]

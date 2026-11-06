@@ -13,6 +13,31 @@ impl fmt::Display for ProtocolMismatchReported {
 
 impl std::error::Error for ProtocolMismatchReported {}
 
+/// A protocol mismatch not printed yet: the caller prints `response` with
+/// what it already holds, exactly once.
+#[derive(Debug)]
+pub(super) struct ProtocolMismatchDeferred {
+    response: ErrorResponse,
+}
+
+impl fmt::Display for ProtocolMismatchDeferred {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.response.error.message)
+    }
+}
+
+impl std::error::Error for ProtocolMismatchDeferred {}
+
+pub(super) fn deferred_error(response: ErrorResponse) -> std::io::Error {
+    std::io::Error::other(ProtocolMismatchDeferred { response })
+}
+
+pub(super) fn deferred_response(err: &std::io::Error) -> Option<&ErrorResponse> {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<ProtocolMismatchDeferred>())
+        .map(|deferred| &deferred.response)
+}
+
 pub(super) fn mismatch_response(
     request_id: &str,
     server_protocol: u32,

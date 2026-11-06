@@ -685,6 +685,14 @@ impl GuardedKeysResponse {
             Some(crate::pty::actor::GuardedWrite::Refused) => {
                 agent_launch_mismatch(self.id, &self.target, &self.expected, None)
             }
+            Some(crate::pty::actor::GuardedWrite::Stopped { written, total }) => encode_error(
+                self.id,
+                "agent_send_keys_interrupted",
+                format!(
+                    "agent {} stopped running the expected launch {} while its keys were written; {written} of {total} bytes were written and the rest were not sent",
+                    self.target, self.expected
+                ),
+            ),
             None => encode_error(
                 self.id,
                 "agent_send_keys_failed",

@@ -648,3 +648,91 @@ fn send_keys_expect_launch_refuses_a_server_without_the_launch_guard_before_send
         );
     }
 }
+
+/// A server that changes protocol after admitting a start: the protocol
+/// refusal still carries the admission the CLI already received.
+#[test]
+fn agent_start_keeps_its_admission_when_the_protocol_changes_during_readiness() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let token = format!("launch_{}", "1".repeat(32));
+    let receipt = serde_json::json!({
+        "type": "agent_started",
+        "agent": { "pane_id": "w1:p1", "terminal_id": "term_1", "name": "worker" },
+        "argv": ["codex"],
+        "launch_incarnation": token,
+    });
+
+    let server = {
+        let receipt = receipt.clone();
+        thread::spawn(move || {
+            let (mut pane_stream, pane_line) = accept_fake_cli_operation(&listener);
+            let pane: serde_json::Value = serde_json::from_str(&pane_line).unwrap();
+            assert_eq!(pane["method"], "pane.get");
+            writeln!(
+                pane_stream,
+                "{}",
+                serde_json::json!({
+                    "id": pane["id"],
+                    "result": { "type": "pane_info", "pane": { "terminal_id": "term_1" } }
+                })
+            )
+            .unwrap();
+            let (mut start_stream, start_line) = accept_fake_cli_operation(&listener);
+            let start: serde_json::Value = serde_json::from_str(&start_line).unwrap();
+            assert_eq!(start["method"], "agent.start");
+            writeln!(
+                start_stream,
+                "{}",
+                serde_json::json!({ "id": start["id"], "result": receipt })
+            )
+            .unwrap();
+            // The readiness lookup first checks the protocol, which changed.
+            let (mut ping_stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(ping_stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let ping: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(ping["method"], "ping");
+            write_fake_pong_advertising(
+                &mut ping_stream,
+                &ping,
+                "newer-build",
+                CURRENT_PROTOCOL + 1,
+                &[],
+            );
+        })
+    };
+
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "codex",
+            "--pane",
+            "w1:p1",
+            "--timeout",
+            "5000",
+        ],
+    );
+    assert_eq!(started.status.code(), Some(1));
+    assert!(started.stdout.is_empty());
+    let stderr = String::from_utf8(started.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "reported exactly once: {stderr}");
+    let error: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(error["error"]["code"], "protocol_mismatch", "{error}");
+    let admission = &error["error"]["admission"];
+    assert_eq!(admission["status"], "admitted_readiness_unresolved");
+    assert_eq!(admission["launch_incarnation"], token.as_str());
+    assert_eq!(admission["agent"], receipt["agent"]);
+    assert_eq!(admission["argv"], receipt["argv"]);
+
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}

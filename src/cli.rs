@@ -94,7 +94,7 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
-pub(crate) use agent::RESOLVED_BY_SHELL_FLAG;
+pub(crate) use agent::{EXEC_PATH_FLAG, RESOLVED_BY_SHELL_FLAG};
 
 /// The attesting launch helper an admitted agent start types; see
 /// [`agent::run_attested_launch`].
@@ -845,19 +845,48 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
-fn ensure_server_protocol_compatible(
+/// Like [`send_request`], but a protocol mismatch is not printed: the error
+/// carries it, for a caller that reports it together with what it already
+/// holds ([`protocol_mismatch_deferred_response`]).
+pub(super) fn send_request_deferring_protocol_mismatch(
+    request: &Request,
+) -> std::io::Result<serde_json::Value> {
+    let client = target::api_client()?;
+    server_protocol_status(&client, &request.id)?.map_err(protocol_guard::deferred_error)?;
+    client
+        .request_value(request)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
+/// The server's status, or the mismatch response when its protocol differs.
+fn server_protocol_status(
     client: &ApiClient,
     request_id: &str,
-) -> std::io::Result<crate::api::RuntimeStatus> {
+) -> std::io::Result<Result<crate::api::RuntimeStatus, ErrorResponse>> {
     let status = target::server_status(client)
         .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
-    let Some(response) =
-        protocol_guard::mismatch_response(request_id, server_protocol, &target::restart_guidance())
-    else {
-        return Ok(status);
+    Ok(
+        match protocol_guard::mismatch_response(
+            request_id,
+            server_protocol,
+            &target::restart_guidance(),
+        ) {
+            None => Ok(status),
+            Some(response) => Err(response),
+        },
+    )
+}
+
+fn ensure_server_protocol_compatible(
+    client: &ApiClient,
+    request_id: &str,
+) -> std::io::Result<crate::api::RuntimeStatus> {
+    let response = match server_protocol_status(client, request_id)? {
+        Ok(status) => return Ok(status),
+        Err(response) => response,
     };
 
     eprintln!(
@@ -865,6 +894,13 @@ fn ensure_server_protocol_compatible(
         serde_json::to_string(&response).map_err(std::io::Error::other)?
     );
     Err(protocol_guard::reported_error())
+}
+
+/// The protocol mismatch a deferring request returned unprinted, if any.
+pub(crate) fn protocol_mismatch_deferred_response(
+    err: &std::io::Error,
+) -> Option<&crate::api::schema::ErrorResponse> {
+    protocol_guard::deferred_response(err)
 }
 
 pub(crate) fn protocol_mismatch_was_reported(err: &std::io::Error) -> bool {

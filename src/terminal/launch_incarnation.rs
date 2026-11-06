@@ -26,7 +26,7 @@
 //! replacement, so the token is reported, and keys guarded by it are queued,
 //! only while the process table read at that moment shows the bound process
 //! leading the terminal's foreground process group ([`leads_foreground`]),
-//! and the terminal writer checks that again just before it writes.
+//! and the terminal writer checks that again before each write it makes.
 //! An observation of any other process, an observed exit, a respawn, a new
 //! admission, a failed managed start or an agent of another kind ends it for
 //! good: a token is never attested again once it was revoked, and a restore
