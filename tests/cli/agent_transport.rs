@@ -662,3 +662,217 @@ fn prompt_steered_into_a_working_codex_turn_is_prompted() {
 
     cleanup_spawned_herdr(herdr, base);
 }
+
+/// A Codex stand-in whose input reader can miss wake-ups the way Codex's
+/// edge-triggered epoll reader does. Modes:
+/// - `lost-wakeup`: ignores every readiness edge until the whole submission is
+///   queued, then reads only on a later write, as live Codex did;
+/// - `never`: never reads its input;
+/// - `no-focus`: like `lost-wakeup`, but never enables focus reporting;
+/// - `discard`: reads input at once but never starts a turn.
+///
+/// Every byte it reads is appended to `<log>`; each submitted line to
+/// `<log>.submissions`.
+fn write_fake_wakeup_codex(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(bin).unwrap();
+    let fake_codex = bin.join("codex");
+    fs::write(
+        &fake_codex,
+        r#"#!/usr/bin/python3 -I
+import fcntl, os, select, struct, sys, termios, tty
+
+mode, submit_len, log = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+tty.setraw(0)
+
+def draw(title, body):
+    os.write(1, ("\x1b]0;%s\x07\x1b[H\x1b[2J\x1b[3J  >_ OpenAI Codex (fake)\n\n%s"
+                 "› Ask Codex to do anything\n\n  ? for shortcuts" % (title, body)).encode())
+
+def queued():
+    return struct.unpack("i", fcntl.ioctl(0, termios.FIONREAD, b"\0\0\0\0"))[0]
+
+if mode != "no-focus":
+    os.write(1, b"\x1b[?1004h")
+draw("fake-codex", "")
+poller = select.epoll()
+poller.register(0, select.EPOLLIN | select.EPOLLET)
+armed = False
+while True:
+    poller.poll()
+    if mode == "never":
+        continue
+    if mode in ("lost-wakeup", "no-focus") and not armed:
+        armed = queued() >= submit_len
+        continue
+    data = os.read(0, 65536)
+    with open(log, "ab") as out:
+        out.write(data)
+    text = data.replace(b"\x1b[I", b"").replace(b"\x1b[O", b"")
+    if mode == "discard" or b"\r" not in text:
+        continue
+    line = text.split(b"\r")[0].decode()
+    with open(log + ".submissions", "a") as out:
+        out.write(line + "\n")
+    draw("⠋ fake-codex", "› %s\n\n• Working (1s • esc to interrupt)\n\n" % line)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+struct WakeupRun {
+    response: serde_json::Value,
+    read: Vec<u8>,
+    submissions: String,
+}
+
+/// Prompt an idle fake Codex in `mode` once, without `--wait`, and collect what
+/// it read once the prompt answered.
+fn prompt_fake_wakeup_codex(mode: &str, prompt: &str) -> WakeupRun {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let log = base.join("codex-input");
+    write_fake_wakeup_codex(&bin);
+    let path = PathBuf::from(format!("{}:/usr/bin:/bin", bin.display()));
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&path));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Without bracketed paste the submission is the text plus one Enter byte.
+    let submit_len = (prompt.len() + 1).to_string();
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "main",
+            "--kind",
+            "codex",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+            "--",
+            mode,
+            &submit_len,
+            log.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        started["result"]["agent"]["agent_status"], "idle",
+        "{started}"
+    );
+
+    let output = run_cli(&socket_path, &["agent", "prompt", "main", prompt]);
+    let body = if output.status.success() {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let response = serde_json::from_slice::<serde_json::Value>(body).unwrap();
+    // Let a late read land before inspecting what the agent saw.
+    thread::sleep(Duration::from_millis(300));
+    let run = WakeupRun {
+        response,
+        read: fs::read(&log).unwrap_or_default(),
+        submissions: fs::read_to_string(base.join("codex-input.submissions")).unwrap_or_default(),
+    };
+    cleanup_spawned_herdr(herdr, base);
+    run
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_unread_by_an_idle_codex_is_released_by_one_focus_wakeup() {
+    let run = prompt_fake_wakeup_codex("lost-wakeup", "review the diff");
+    assert_eq!(
+        run.response["result"]["type"], "agent_prompted",
+        "{}",
+        run.response
+    );
+    assert_eq!(run.response["result"]["evidence"], "released_after_wakeup");
+    assert_eq!(
+        run.submissions, "review the diff\n",
+        "exactly one submission"
+    );
+    assert_eq!(
+        run.read, b"review the diff\r\x1b[I",
+        "the agent saw the prompt once and one focus-in report"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_never_read_still_stalls_after_only_the_inert_wakeup() {
+    let prompt = "never read this";
+    let run = prompt_fake_wakeup_codex("never", prompt);
+    assert_eq!(
+        run.response["error"]["code"], "agent_prompt_stalled",
+        "{}",
+        run.response
+    );
+    let message = run.response["error"]["message"].as_str().unwrap();
+    // The text, Enter and the three-byte focus-in report: nothing else was written.
+    let queued = prompt.len() + 1 + 3;
+    assert!(
+        message.contains(&format!(
+            "{queued} input bytes are still unread in the agent's terminal input queue (queued, not lost) after one focus-in wake-up"
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("no observed working or blocked state"),
+        "{message}"
+    );
+    assert!(run.read.is_empty() && run.submissions.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_unread_without_focus_reporting_gets_no_wakeup() {
+    let prompt = "no focus reports";
+    let run = prompt_fake_wakeup_codex("no-focus", prompt);
+    assert_eq!(
+        run.response["error"]["code"], "agent_prompt_stalled",
+        "{}",
+        run.response
+    );
+    let message = run.response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!(
+            "{} input bytes are still unread in the agent's terminal input queue (queued, not lost); focus reporting is off, so no wake-up was sent",
+            prompt.len() + 1
+        )),
+        "{message}"
+    );
+    assert!(run.read.is_empty() && run.submissions.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prompt_read_but_not_started_gets_no_wakeup() {
+    let run = prompt_fake_wakeup_codex("discard", "read and dropped");
+    assert_eq!(
+        run.response["error"]["code"], "agent_prompt_stalled",
+        "{}",
+        run.response
+    );
+    let message = run.response["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("input bytes"), "{message}");
+    assert!(!message.contains("wake-up"), "{message}");
+    assert_eq!(
+        run.read, b"read and dropped\r",
+        "no focus-in report was written"
+    );
+}

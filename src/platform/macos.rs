@@ -545,6 +545,11 @@ pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     (pgid > 0).then_some(pgid as u32)
 }
 
+/// Unread PTY input is not measured on macOS yet, so callers never act on it.
+pub fn pty_unread_input_bytes(_master_fd: RawFd) -> Option<usize> {
+    None
+}
+
 /// Get the effective process name from `argv[0]` via `sysctl(KERN_PROCARGS2)`.
 ///
 /// This is the macOS equivalent of reading `/proc/{pid}/cmdline` on Linux.

@@ -7039,6 +7039,16 @@
           ],
           "type": "object"
         },
+        "AgentPromptEvidence": {
+          "description": "How `agent.prompt` observed acceptance when the submission alone did not show it.",
+          "oneOf": [
+            {
+              "const": "released_after_wakeup",
+              "description": "The prompt sat unread in the agent's terminal input queue until Herdr\nwrote one focus-in report; the agent then read it and started its turn.",
+              "type": "string"
+            }
+          ]
+        },
         "AgentSessionInfo": {
           "properties": {
             "agent": {
@@ -9898,6 +9908,17 @@
               "properties": {
                 "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "evidence": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentPromptEvidence"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Present only when acceptance needed more than the submission itself."
                 },
                 "type": {
                   "const": "agent_prompted",

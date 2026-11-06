@@ -94,15 +94,25 @@ pub struct ApiRequestMessage {
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApiRequestProjection {
     PaneAgentStatus,
+    /// agent.prompt's check for input its idle Codex never read. Valid only
+    /// with agent.get, and only for the terminal the prompt was written to.
+    /// With `nudge`, it may write one focus-in report (see
+    /// `App::handle_agent_input_wakeup`); without it, it only measures.
+    AgentInputWakeup {
+        terminal_id: String,
+        nudge: bool,
+    },
 }
 
 impl ApiRequestMessage {
     pub(crate) fn validate_projection(&self) -> Result<(), schema::ErrorResponse> {
-        match (self.projection, &self.request.method) {
-            (None, _) | (Some(ApiRequestProjection::PaneAgentStatus), Method::PaneGet(_)) => Ok(()),
+        match (&self.projection, &self.request.method) {
+            (None, _)
+            | (Some(ApiRequestProjection::PaneAgentStatus), Method::PaneGet(_))
+            | (Some(ApiRequestProjection::AgentInputWakeup { .. }), Method::AgentGet(_)) => Ok(()),
             _ => Err(schema::ErrorResponse {
                 id: self.request.id.clone(),
                 error: schema::ErrorBody {
@@ -119,6 +129,21 @@ impl ApiRequestMessage {
 pub(crate) struct PaneAgentStatusProjectionResponse {
     pub(crate) id: String,
     pub(crate) result: schema::PaneAgentStatusChangedEvent,
+}
+
+/// What the lost-wakeup check measured, and whether it wrote the one nudge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AgentInputWakeup {
+    /// `None` when the platform cannot measure unread PTY input.
+    pub(crate) unread_input_bytes: Option<usize>,
+    pub(crate) focus_reporting: bool,
+    pub(crate) nudged: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AgentInputWakeupProjectionResponse {
+    pub(crate) id: String,
+    pub(crate) result: AgentInputWakeup,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

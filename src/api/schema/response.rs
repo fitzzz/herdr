@@ -39,6 +39,15 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// How `agent.prompt` observed acceptance when the submission alone did not show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptEvidence {
+    /// The prompt sat unread in the agent's terminal input queue until Herdr
+    /// wrote one focus-in report; the agent then read it and started its turn.
+    ReleasedAfterWakeup,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
@@ -113,6 +122,9 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+        /// Present only when acceptance needed more than the submission itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<AgentPromptEvidence>,
     },
     AgentList {
         agents: Vec<AgentInfo>,

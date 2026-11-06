@@ -9,8 +9,9 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_caller_timeout, dispatch_to_app_with_timeout, should_stop_connection,
-    APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
+    dispatch_projection_to_app_with_timeout, dispatch_to_app_with_caller_timeout,
+    dispatch_to_app_with_timeout, should_stop_connection, APP_RESPONSE_TIMEOUT,
+    CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
@@ -20,6 +21,9 @@ use crate::ipc::LocalStream;
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
 const NOT_SUBMITTED_SETTLE_MS: u64 = 500;
 const NOT_SUBMITTED_STREAK: u32 = 2;
+/// How long a prompt released by the one focus-in wake-up has to start its turn.
+/// Codex starts a turn within tens of milliseconds of reading queued input.
+const PROMPT_WAKEUP_WINDOW_MS: u64 = 2_000;
 
 pub(super) fn wait_for_output(
     request_id: String,
@@ -167,13 +171,16 @@ pub(super) fn wait_for_agent(
             rejection_probe: None,
             acceptance_probe: None,
             match_status: true,
+            wakeup: None,
         },
         stream,
         api_tx,
         event_hub,
         running,
     )? {
-        Some(AgentWaitOutcome::Matched(agent)) => agent_wait_success(request_id, *agent).map(Some),
+        Some(AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent)) => {
+            agent_wait_success(request_id, *agent).map(Some)
+        }
         Some(AgentWaitOutcome::Response(response)) => Ok(Some(response)),
         None => Ok(None),
     }
@@ -297,6 +304,21 @@ pub(super) fn prompt_agent(
         earliest,
         expected_agent,
     });
+    // Only Codex is known to miss the read wake-up for its PTY input, and only
+    // the gate's own stall decision (not the caller's deadline) may nudge it.
+    let wakeup_window_ms = remaining
+        .map(|remaining| remaining.saturating_sub(effect_timeout_ms))
+        .unwrap_or(PROMPT_WAKEUP_WINDOW_MS)
+        .min(PROMPT_WAKEUP_WINDOW_MS);
+    let wakeup = (expected_agent == Some(crate::detect::Agent::Codex)
+        && matches!(timeout_kind, AgentWaitTimeoutKind::PromptStalled { .. })
+        && wakeup_window_ms > 0)
+        .then(|| PromptWakeup {
+            needle: prompt_needle.clone(),
+            baseline,
+            expected_agent,
+            window_ms: wakeup_window_ms,
+        });
     let Some(outcome) = wait_for_resolved_agent(
         request_id.clone(),
         ResolvedAgentWait {
@@ -311,6 +333,7 @@ pub(super) fn prompt_agent(
             rejection_probe: Some(rejection_probe),
             acceptance_probe,
             match_status: !prompt_started_working,
+            wakeup,
         },
         stream,
         api_tx,
@@ -320,17 +343,19 @@ pub(super) fn prompt_agent(
     else {
         return Ok(None);
     };
+    let evidence = matches!(outcome, AgentWaitOutcome::MatchedAfterWakeup(_))
+        .then_some(crate::api::schema::AgentPromptEvidence::ReleasedAfterWakeup);
     initial = match outcome {
-        AgentWaitOutcome::Matched(agent) => *agent,
+        AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
 
     let Some(wait) = wait else {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, evidence).map(Some);
     };
     let until = agent_wait_statuses(wait.until);
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, evidence).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -349,6 +374,7 @@ pub(super) fn prompt_agent(
             rejection_probe: None,
             acceptance_probe: None,
             match_status: true,
+            wakeup: None,
         },
         stream,
         api_tx,
@@ -359,10 +385,10 @@ pub(super) fn prompt_agent(
         return Ok(None);
     };
     let agent = match outcome {
-        AgentWaitOutcome::Matched(agent) => *agent,
+        AgentWaitOutcome::Matched(agent) | AgentWaitOutcome::MatchedAfterWakeup(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    agent_prompt_success(request_id, agent, evidence).map(Some)
 }
 
 /// First non-empty line of the submitted text, bounded so a long paste does not
@@ -410,10 +436,11 @@ fn prompt_effect_timeout(
 fn agent_prompt_success(
     request_id: String,
     agent: crate::api::schema::AgentInfo,
+    evidence: Option<crate::api::schema::AgentPromptEvidence>,
 ) -> std::io::Result<String> {
     serde_json::to_string(&SuccessResponse {
         id: request_id,
-        result: ResponseResult::AgentPrompted { agent },
+        result: ResponseResult::AgentPrompted { agent, evidence },
     })
     .map_err(std::io::Error::other)
 }
@@ -594,6 +621,19 @@ struct ResolvedAgentWait {
     rejection_probe: Option<PromptRejectionProbe>,
     acceptance_probe: Option<PromptAcceptanceProbe>,
     match_status: bool,
+    wakeup: Option<PromptWakeup>,
+}
+
+/// The one-shot release for a prompt an idle Codex never read. At the stall
+/// decision, with the input box empty and the prompt not shown anywhere new,
+/// the app measures the PTY's unread input and writes at most one focus-in
+/// report (`App::handle_agent_input_wakeup`). The prompt then has `window_ms`
+/// to start its turn.
+struct PromptWakeup {
+    needle: String,
+    baseline: usize,
+    expected_agent: Option<crate::detect::Agent>,
+    window_ms: u64,
 }
 
 struct PromptRejectionProbe {
@@ -639,21 +679,33 @@ enum AgentWaitTimeoutKind {
 
 enum AgentWaitOutcome {
     Matched(Box<crate::api::schema::AgentInfo>),
+    /// Matched only after the one wake-up released unread input.
+    MatchedAfterWakeup(Box<crate::api::schema::AgentInfo>),
     Response(String),
+}
+
+fn matched_outcome(agent: crate::api::schema::AgentInfo, after_wakeup: bool) -> AgentWaitOutcome {
+    if after_wakeup {
+        AgentWaitOutcome::MatchedAfterWakeup(Box::new(agent))
+    } else {
+        AgentWaitOutcome::Matched(Box::new(agent))
+    }
 }
 
 fn wait_for_resolved_agent(
     request_id: String,
-    wait: ResolvedAgentWait,
+    mut wait: ResolvedAgentWait,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<AgentWaitOutcome>> {
-    let deadline = wait
+    let mut deadline = wait
         .timeout_ms
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
     let expected_terminal_id = wait.initial.terminal_id.clone();
+    let mut wakeup_sent = false;
+    let mut wakeup_report = None;
     let expected_name = wait
         .initial
         .name
@@ -691,7 +743,7 @@ fn wait_for_resolved_agent(
                             {
                                 let mut matched = wait.initial.clone();
                                 matched.agent_status = status;
-                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                                return Ok(Some(matched_outcome(matched, wakeup_sent)));
                             }
                         }
                         return agent_wait_not_running(request_id)
@@ -765,10 +817,10 @@ fn wait_for_resolved_agent(
                 if let Some(status) = matched_event_status {
                     let mut matched = current;
                     matched.agent_status = status;
-                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(matched))));
+                    return Ok(Some(matched_outcome(matched, wakeup_sent)));
                 }
                 if agent_wait_matches(&current, &wait.until, wait.after_state_change_seq) {
-                    return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                    return Ok(Some(matched_outcome(current, wakeup_sent)));
                 }
             }
         }
@@ -812,7 +864,7 @@ fn wait_for_resolved_agent(
                             if acceptance_streak >= probe.required_streak() {
                                 let current = agent_get(&request_id, &wait.target, api_tx)
                                     .unwrap_or_else(|_| wait.initial.clone());
-                                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                                return Ok(Some(matched_outcome(current, wakeup_sent)));
                             }
                         } else {
                             acceptance_streak = 0;
@@ -844,14 +896,128 @@ fn wait_for_resolved_agent(
             if wait.match_status
                 && agent_wait_matches(&current, &wait.until, wait.after_state_change_seq)
             {
-                return Ok(Some(AgentWaitOutcome::Matched(Box::new(current))));
+                return Ok(Some(matched_outcome(current, wakeup_sent)));
             }
-            return agent_wait_timeout(request_id, wait.timeout_kind, &current)
-                .map(AgentWaitOutcome::Response)
-                .map(Some);
+            if let Some(wakeup) = wait.wakeup.take() {
+                if let Some(report) = prompt_wakeup_report(
+                    &request_id,
+                    &wait.target,
+                    &expected_terminal_id,
+                    &current,
+                    &wakeup,
+                    api_tx,
+                ) {
+                    if report.nudged {
+                        wakeup_sent = true;
+                        deadline = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_millis(wakeup.window_ms),
+                        );
+                    }
+                    wakeup_report = Some(report);
+                    if wakeup_sent {
+                        continue;
+                    }
+                }
+            } else if wakeup_sent {
+                // Report what is still queued now, not what the nudge saw.
+                wakeup_report = input_wakeup(
+                    &request_id,
+                    &wait.target,
+                    &expected_terminal_id,
+                    false,
+                    api_tx,
+                )
+                .or(wakeup_report);
+            }
+            let unread_detail = wakeup_report
+                .as_ref()
+                .and_then(|report| unread_input_detail(report, wakeup_sent));
+            return agent_wait_timeout(
+                request_id,
+                wait.timeout_kind,
+                &current,
+                unread_detail.as_deref(),
+            )
+            .map(AgentWaitOutcome::Response)
+            .map(Some);
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
     }
+}
+
+/// At the stall decision for an idle or done Codex: when its input box is empty
+/// and the prompt is not shown anywhere new, ask the app to measure unread PTY
+/// input and send the one wake-up it allows. `None` means nothing was asked.
+fn prompt_wakeup_report(
+    request_id: &str,
+    target: &str,
+    expected_terminal_id: &str,
+    current: &crate::api::schema::AgentInfo,
+    wakeup: &PromptWakeup,
+    api_tx: &ApiRequestSender,
+) -> Option<crate::api::AgentInputWakeup> {
+    if !matches!(
+        current.agent_status,
+        crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+    ) {
+        return None;
+    }
+    let screen = read_agent_screen(request_id, target, api_tx).ok()?;
+    if composer_holds_input(wakeup.expected_agent, &screen)
+        || crate::detect::manifest::composer_text_occurrences(&screen, &wakeup.needle)
+            > wakeup.baseline
+    {
+        return None;
+    }
+    input_wakeup(request_id, target, expected_terminal_id, true, api_tx)
+}
+
+fn input_wakeup(
+    request_id: &str,
+    target: &str,
+    expected_terminal_id: &str,
+    nudge: bool,
+    api_tx: &ApiRequestSender,
+) -> Option<crate::api::AgentInputWakeup> {
+    let response = dispatch_projection_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:wakeup"),
+            method: Method::AgentGet(crate::api::schema::AgentTarget {
+                target: target.to_string(),
+            }),
+        },
+        crate::api::ApiRequestProjection::AgentInputWakeup {
+            terminal_id: expected_terminal_id.to_string(),
+            nudge,
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    serde_json::from_str::<crate::api::AgentInputWakeupProjectionResponse>(&response)
+        .ok()
+        .map(|response| response.result)
+}
+
+/// The stalled error's account of input the agent has not read, so a caller can
+/// tell queued input from lost input. `None` when there is nothing to add.
+fn unread_input_detail(report: &crate::api::AgentInputWakeup, wakeup_sent: bool) -> Option<String> {
+    let bytes = report.unread_input_bytes?;
+    if bytes == 0 {
+        return wakeup_sent.then(|| {
+            "the agent read its queued input after one focus-in wake-up, but no turn start was observed".to_string()
+        });
+    }
+    let queued = format!(
+        "{bytes} input bytes are still unread in the agent's terminal input queue (queued, not lost)"
+    );
+    Some(if wakeup_sent {
+        format!("{queued} after one focus-in wake-up")
+    } else if !report.focus_reporting {
+        format!("{queued}; focus reporting is off, so no wake-up was sent")
+    } else {
+        format!("{queued}; the wake-up could not be written")
+    })
 }
 
 fn prompt_activity_statuses() -> Vec<crate::api::schema::AgentStatus> {
@@ -992,6 +1158,7 @@ fn agent_wait_timeout(
     request_id: String,
     kind: AgentWaitTimeoutKind,
     current: &crate::api::schema::AgentInfo,
+    unread_detail: Option<&str>,
 ) -> std::io::Result<String> {
     let (code, message) = match kind {
         AgentWaitTimeoutKind::Status => {
@@ -1002,7 +1169,10 @@ fn agent_wait_timeout(
             (
                 "agent_prompt_stalled",
                 format!(
-                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; input was written and may still be in the agent's input box, so check the agent before resending (current status is {status})"
+                    "agent prompt produced no observed working or blocked state within {timeout_ms} ms; input was written and may still be in the agent's input box, so check the agent before resending (current status is {status}){}",
+                    unread_detail
+                        .map(|detail| format!("; {detail}"))
+                        .unwrap_or_default()
                 ),
             )
         }
@@ -1217,7 +1387,7 @@ mod tests {
 
     #[test]
     fn prompt_success_has_no_outcome_fields() {
-        let response = agent_prompt_success("req".into(), test_agent()).unwrap();
+        let response = agent_prompt_success("req".into(), test_agent(), None).unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["type"], "agent_prompted");
         assert!(response["result"].get("outcome").is_none());
@@ -1705,6 +1875,7 @@ not = [{ contains = ["TEST-EMPTY"] }]
             "req".into(),
             AgentWaitTimeoutKind::PromptStalled { timeout_ms: 5000 },
             &test_agent(),
+            None,
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

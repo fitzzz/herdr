@@ -1587,6 +1587,15 @@ impl PaneRuntimeIo {
     }
 
     #[cfg(unix)]
+    fn unread_input_bytes(&self) -> Option<usize> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.unread_input_bytes(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => None,
+        }
+    }
+
+    #[cfg(unix)]
     fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
@@ -3793,6 +3802,19 @@ impl PaneRuntime {
             text
         };
         Bytes::from(payload)
+    }
+
+    /// Bytes written to this pane's PTY that its program has not read yet, or
+    /// `None` when the platform cannot measure them.
+    pub fn unread_input_bytes(&self) -> Option<usize> {
+        #[cfg(unix)]
+        {
+            self.io.unread_input_bytes()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     pub fn try_send_focus_event(&self, event: crate::ghostty::FocusEvent) -> bool {
