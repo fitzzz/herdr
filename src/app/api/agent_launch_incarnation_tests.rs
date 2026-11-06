@@ -101,6 +101,16 @@ fn start(
         )),
         "the helper runs the agent's own argv: {typed}"
     );
+    assert!(
+        typed.starts_with(&format!(
+            "case $(command -v {} 2>/dev/null) in /*) ",
+            crate::detect::interactive_agent_executable(
+                crate::detect::parse_agent_label(kind).unwrap()
+            )
+        )),
+        "the shell resolves the command first: {typed}"
+    );
+    assert!(typed.contains(" --resolved-by-shell; "), "{typed}");
     let nonce = typed_nonce(&typed);
     assert!(!typed.contains(&token), "the public token is not typed");
     (
@@ -152,8 +162,19 @@ fn claim(
     serde_json::from_str(&response).unwrap()
 }
 
-/// Detection identified `process` running `agent` in the launch's pane.
+/// Makes `process` the one the process table shows leading the pane's
+/// foreground process group now, whether or not detection has seen it.
+fn foreground(app: &App, launch: &Launch, process: Option<ProcessInstance>) {
+    app.terminal_runtimes
+        .get(&launch.terminal_id)
+        .unwrap()
+        .test_set_foreground_leader(process);
+}
+
+/// Detection identified `process` running `agent` in the launch's pane,
+/// where it leads the foreground.
 fn observe(app: &mut App, launch: &Launch, agent: Agent, process: ProcessInstance) {
+    foreground(app, launch, Some(process));
     app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
         pane_id: launch.pane,
         agent,
@@ -211,15 +232,26 @@ fn held(app: &App, launch: &Launch) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Sends Esc as the server dispatches it: a send guarded by a launch is
+/// answered once the terminal writer has checked the launch's process.
 fn send_esc(app: &mut App, launch: &Launch, guards: serde_json::Value) -> serde_json::Value {
     let mut params = serde_json::json!({"target": launch.public_pane, "keys": ["esc"]});
     for (key, value) in guards.as_object().unwrap() {
         params[key] = value.clone();
     }
-    request(
-        app,
-        serde_json::json!({"id": "esc", "method": "agent.send_keys", "params": params}),
-    )
+    let json = serde_json::json!({"id": "esc", "method": "agent.send_keys", "params": params});
+    let request: Request = serde_json::from_str(&json.to_string()).expect("a valid request");
+    let guarded = matches!(
+        &request.method,
+        crate::api::schema::Method::AgentSendKeys(params)
+            if params.expected_launch_incarnation.is_some()
+    );
+    if !guarded {
+        return serde_json::from_str(&app.handle_api_request(request)).unwrap();
+    }
+    let (respond_to, response) = std::sync::mpsc::channel();
+    app.handle_deferred_agent_send_keys(request, respond_to);
+    serde_json::from_str(&response.recv().expect("the writer answers")).unwrap()
 }
 
 fn assert_written(response: &serde_json::Value, rx: &mut tokio::sync::mpsc::Receiver<Bytes>) {
@@ -517,7 +549,17 @@ async fn send_keys_checks_the_launch_with_the_session_in_the_writing_step() {
     );
     assert_refused(&wrong_session, "agent_session_mismatch", &mut rx);
 
-    // Replaced between the caller's read and its send.
+    // The synchronous dispatcher never writes a launch-guarded send itself.
+    let sync = request(
+        &mut app,
+        serde_json::json!({"id": "esc", "method": "agent.send_keys", "params": {
+            "target": launch.public_pane, "keys": ["esc"], "expected_launch_incarnation": launch.token
+        }}),
+    );
+    assert_eq!(sync["error"]["code"], "invalid_request", "{sync}");
+    assert!(rx.try_recv().is_err());
+
+    // Replaced between the caller's read and its send, once detection saw it.
     let read = current(&mut app, &launch).unwrap();
     observe(&mut app, &launch, Agent::Codex, process(4243, 8));
     let replaced = send_esc(
@@ -761,6 +803,23 @@ async fn a_launcher_binding_is_confirmed_only_for_the_launch_whose_process_repor
     assert_eq!(lookup["agent"]["launch_incarnation"], launch.token.as_str());
     assert_eq!(lookup["confirmed"], true, "{lookup}");
 
+    // A replacement leads the foreground before detection saw it: the
+    // binding is not confirmed and no launch is reported meanwhile.
+    foreground(&app, &launch, Some(process(4243, 8)));
+    let lookup = confirmed(&mut app, &launch);
+    assert_eq!(lookup["confirmed"], false, "{lookup}");
+    assert!(
+        lookup["agent"].get("launch_incarnation").is_none(),
+        "{lookup}"
+    );
+    // An unreadable foreground proves nothing either.
+    foreground(&app, &launch, None);
+    assert_eq!(confirmed(&mut app, &launch)["confirmed"], false);
+    // The launch's own process leads again, as when a foreground job of its
+    // own ended.
+    foreground(&app, &launch, Some(process(4242, 7)));
+    assert_eq!(confirmed(&mut app, &launch)["confirmed"], true);
+
     // Once another process holds the terminal the binding is not confirmed,
     // though it keeps the session and its record of the launch.
     observe(&mut app, &launch, Agent::Codex, process(4243, 8));
@@ -837,6 +896,8 @@ async fn an_official_report_from_the_claimed_process_attests_it_without_a_probe(
         Some((process(4242, 7), SHELL)),
     );
     assert_eq!(claimed["result"]["type"], "ok");
+    // The claimed process leads the foreground, though no probe saw it.
+    foreground(&app, &launch, Some(process(4242, 7)));
     app.state
         .terminals
         .get_mut(&launch.terminal_id)
@@ -851,4 +912,84 @@ async fn an_official_report_from_the_claimed_process_attests_it_without_a_probe(
 
     report_session(&mut app, &launch, "ses_a", Some(process(4242, 7)));
     assert_eq!(current(&mut app, &launch), Some(launch.token.clone()));
+}
+
+/// The independent review's reproducer (review/stale-codex-both-guards-probe.py)
+/// as a deterministic test: Codex A started, reported its session and was
+/// replaced in the pane by Codex B, a process of the same kind, before
+/// detection or any report saw B. A send guarded by A's launch and session
+/// must not reach B.
+#[tokio::test]
+async fn a_replacement_detection_has_not_seen_gets_no_keys_guarded_for_the_old_launch() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Codex);
+    report_session(&mut app, &launch, "same-session", Some(process(4242, 7)));
+    let read = current(&mut app, &launch).expect("the caller reads A's launch");
+
+    // B leads the foreground; nothing the server recorded changed.
+    foreground(&app, &launch, Some(process(4243, 8)));
+    assert_eq!(held(&app, &launch), Some(launch.token.clone()));
+    assert_eq!(current(&mut app, &launch), None, "not reported for B");
+
+    let both = serde_json::json!({
+        "expected_session": "same-session", "expected_launch_incarnation": read
+    });
+    let response = send_esc(&mut app, &launch, both.clone());
+    assert_refused(&response, "agent_launch_mismatch", &mut rx);
+
+    // A reused process id: A's id, another start time.
+    foreground(&app, &launch, Some(process(4242, 99)));
+    assert_refused(
+        &send_esc(&mut app, &launch, both.clone()),
+        "agent_launch_mismatch",
+        &mut rx,
+    );
+    // No foreground could be read.
+    foreground(&app, &launch, None);
+    assert_refused(
+        &send_esc(&mut app, &launch, both.clone()),
+        "agent_launch_mismatch",
+        &mut rx,
+    );
+
+    // Only A itself leading the foreground receives the guarded keys.
+    foreground(&app, &launch, Some(process(4242, 7)));
+    assert_written(&send_esc(&mut app, &launch, both), &mut rx);
+}
+
+/// The typed line's other branch: the pane's shell resolved the command
+/// itself, through a function or an alias, so the helper ends the admission
+/// and the shell runs the command. Nothing of that start is ever attested.
+#[tokio::test]
+async fn a_start_the_shell_resolves_itself_stays_unattested() {
+    let mut app = app();
+    let (launch, mut rx) = start(&mut app, "worker", "codex", &[]);
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "attest", "method": "agent.attest_launch",
+        "params": {"nonce": launch.nonce, "resolved_by_shell": true}
+    }))
+    .unwrap();
+    let ended: serde_json::Value =
+        serde_json::from_str(&app.handle_api_request_after_internal_events_drained(request, None))
+            .unwrap();
+    assert_eq!(ended["result"]["type"], "ok", "{ended}");
+
+    // The nonce is spent, and the agent the shell runs is not attested.
+    let late = claim(
+        &mut app,
+        &launch,
+        &launch.nonce,
+        Some((process(4242, 7), SHELL)),
+    );
+    assert_eq!(late["error"]["code"], "launch_attestation_refused");
+    observe(&mut app, &launch, Agent::Codex, process(4242, 7));
+    assert_eq!(current(&mut app, &launch), None);
+    assert_eq!(held(&app, &launch), None);
+    let guarded = send_esc(
+        &mut app,
+        &launch,
+        serde_json::json!({"expected_launch_incarnation": launch.token}),
+    );
+    assert_refused(&guarded, "agent_launch_mismatch", &mut rx);
+    assert_written(&send_esc(&mut app, &launch, serde_json::json!({})), &mut rx);
 }

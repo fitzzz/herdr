@@ -13,11 +13,20 @@
 //! its birth identity. The nonce is spent by its first use, whether that use
 //! binds or not, so a line repeated from shell history cannot claim it.
 //!
-//! The launch is attested, and its token public, once the server sees that
-//! same process (same id and same known start time) running the agent:
-//! detection identifies it as the terminal's agent process, or an official
-//! native report the server placed in the pane names it as the reporting
-//! agent process. It stays attested while no other process is seen there.
+//! For `agent start` the typed line lets the pane's shell resolve the
+//! command first and runs the helper only for an executable file; an alias,
+//! a function or a builtin makes the line end the admission instead, and the
+//! shell runs the command unattested. The shell itself is never bound.
+//!
+//! The launch is attested once the server sees that same process (same id
+//! and same known start time) running the agent: detection identifies it as
+//! the terminal's agent process, or an official native report the server
+//! placed in the pane names it as the reporting agent process. It stays
+//! attested while no other process is seen there. Detection can lag a
+//! replacement, so the token is reported, and keys guarded by it are queued,
+//! only while the process table read at that moment shows the bound process
+//! leading the terminal's foreground process group ([`leads_foreground`]),
+//! and the terminal writer checks that again just before it writes.
 //! An observation of any other process, an observed exit, a respawn, a new
 //! admission, a failed managed start or an agent of another kind ends it for
 //! good: a token is never attested again once it was revoked, and a restore
@@ -84,7 +93,17 @@ impl LaunchIncarnation {
 
     /// The token, only while the bound process is the terminal's agent process.
     pub(crate) fn attested_token(&self) -> Option<&str> {
-        matches!(self.phase, Phase::Attested(_)).then_some(self.token.as_str())
+        self.attested().map(|(token, _)| token)
+    }
+
+    /// The token with the process it is bound to, once attested. Whoever
+    /// reports or acts on the token proves first that the process still
+    /// leads the terminal's foreground, with [`leads_foreground`].
+    pub(crate) fn attested(&self) -> Option<(&str, ProcessInstance)> {
+        match self.phase {
+            Phase::Attested(process) => Some((self.token.as_str(), process)),
+            Phase::Admitted { .. } | Phase::Claimed(_) => None,
+        }
     }
 
     /// Whether this admission waits for `nonce`.
@@ -194,6 +213,24 @@ pub(crate) struct HandoffLaunchIncarnation {
 /// process id alone can be reused by a later process.
 fn same_process(bound: &ProcessInstance, other: &ProcessInstance) -> bool {
     bound.pid == other.pid && bound.started.is_some() && bound.started == other.started
+}
+
+/// The process leading the foreground process group `pgid` of a terminal,
+/// with its start time read now. That group is the one a key written to the
+/// terminal reaches; a replacement the shell started leads another group,
+/// and a reused process id has another start time.
+pub(crate) fn group_leader(pgid: u32) -> Option<ProcessInstance> {
+    crate::platform::process_and_parent(pgid).map(|now| ProcessInstance {
+        pid: now.process.pid,
+        started: now.process.started,
+    })
+}
+
+/// Whether the foreground `leader`, read now, is provably the `bound` launch
+/// process: the same id and the same known start time. An unreadable leader
+/// proves nothing.
+pub(crate) fn leads_foreground(bound: ProcessInstance, leader: Option<ProcessInstance>) -> bool {
+    leader.is_some_and(|leader| same_process(&bound, &leader))
 }
 
 const TOKEN_HEX_LEN: usize = 32;

@@ -94,6 +94,8 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
+pub(crate) use agent::RESOLVED_BY_SHELL_FLAG;
+
 /// The attesting launch helper an admitted agent start types; see
 /// [`agent::run_attested_launch`].
 pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {

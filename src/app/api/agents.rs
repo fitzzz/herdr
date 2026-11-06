@@ -113,7 +113,8 @@ impl App {
     /// its own process, read from the connection as `peer_ancestry` (the
     /// sender first). The nonce is spent by this first use whatever the
     /// outcome; only the pane shell's direct child with a readable start time
-    /// binds the launch.
+    /// binds the launch. A helper the typed line runs because the shell
+    /// resolved the command itself ends the admission instead.
     pub(super) fn handle_agent_attest_launch(
         &mut self,
         id: String,
@@ -144,6 +145,12 @@ impl App {
                 "the admitted agent start's terminal is gone",
             );
         };
+        if params.resolved_by_shell {
+            // The shell runs the command itself, so no process of this
+            // admission can be bound: the launch stays unattested.
+            terminal.admit_launch_incarnation(None);
+            return encode_success(id, ResponseResult::Ok {});
+        }
         let claimed = match peer_ancestry.and_then(<[_]>::first) {
             Some(sender) => terminal.claim_launch_incarnation(
                 crate::platform::ProcessInstance {
@@ -512,9 +519,51 @@ impl App {
         id: String,
         params: AgentSendKeysParams,
     ) -> String {
+        if params.expected_launch_incarnation.is_some() {
+            return encode_error(
+                id,
+                "invalid_request",
+                "agent.send_keys with expected_launch_incarnation is handled asynchronously by the app runtime",
+            );
+        }
+        match self.queue_agent_send_keys(id, params) {
+            QueuedKeys::Answered(response) => response,
+            QueuedKeys::Guarded { response, outcome } => response.answer(outcome.recv().ok()),
+        }
+    }
+
+    /// Sends keys guarded by an expected launch. The writer checks the
+    /// launch's process again just before writing, and the reply waits for
+    /// that answer off the app loop.
+    pub(crate) fn handle_deferred_agent_send_keys(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let crate::api::schema::Method::AgentSendKeys(params) = request.method else {
+            return;
+        };
+        match self.queue_agent_send_keys(request.id, params) {
+            QueuedKeys::Answered(response) => {
+                let _ = respond_to.send(response);
+            }
+            QueuedKeys::Guarded { response, outcome } => {
+                std::thread::spawn(move || {
+                    let _ = respond_to.send(response.answer(outcome.recv().ok()));
+                });
+            }
+        }
+    }
+
+    fn queue_agent_send_keys(&mut self, id: String, params: AgentSendKeysParams) -> QueuedKeys {
         let resolved = match self.resolve_agent_target(&params.target) {
             Ok(resolved) => resolved,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+            Err(err) => {
+                return QueuedKeys::Answered(encode_error_body(
+                    id,
+                    self.agent_target_error_body(err),
+                ))
+            }
         };
         let Some(terminal_id) = self
             .state
@@ -522,7 +571,7 @@ impl App {
             .get(resolved.ws_idx)
             .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
         else {
-            return agent_not_found(id, &params.target);
+            return QueuedKeys::Answered(agent_not_found(id, &params.target));
         };
         let Some(expected_agent) = self
             .state
@@ -530,45 +579,118 @@ impl App {
             .get(terminal_id)
             .and_then(|terminal| terminal.effective_known_agent())
         else {
-            return agent_not_ready(id, &params.target);
+            return QueuedKeys::Answered(agent_not_ready(id, &params.target));
         };
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
+            return QueuedKeys::Answered(agent_not_found(id, &params.target));
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return agent_not_ready(id, &params.target);
+            return QueuedKeys::Answered(agent_not_ready(id, &params.target));
         }
         let encoded = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
             Ok(encoded) => encoded,
             Err(key) => {
-                return encode_error(id, "invalid_key", format!("unsupported key {key}"));
+                return QueuedKeys::Answered(encode_error(
+                    id,
+                    "invalid_key",
+                    format!("unsupported key {key}"),
+                ));
             }
         };
         let bytes: Vec<u8> = encoded.into_iter().flatten().collect();
-        // Both guards are checked in the same step that enqueues the bytes: a
-        // replacement native session or launch can only be recorded by another
-        // app-loop step, so it cannot land between these comparisons and the
-        // write.
+        // Both guards are checked in the same app-loop step that enqueues the
+        // bytes, so no recorded session or launch can change in between. The
+        // launch guard also proves, from the process table read now, that the
+        // launch's own process leads the terminal's foreground, and the
+        // writer proves it again just before writing: a replacement the
+        // shell started may not have been observed yet.
         let terminal = self.state.terminals.get(terminal_id);
         if let Some(expected) = params.expected_session.as_deref() {
             let current = terminal
                 .and_then(super::super::creation::terminal_agent_session_info)
                 .map(|session| session.value);
             if current.as_deref() != Some(expected) {
-                return agent_session_mismatch(id, &params.target, expected, current.as_deref());
+                return QueuedKeys::Answered(agent_session_mismatch(
+                    id,
+                    &params.target,
+                    expected,
+                    current.as_deref(),
+                ));
             }
         }
-        if let Some(expected) = params.expected_launch_incarnation.as_deref() {
-            let current = terminal.and_then(crate::terminal::TerminalState::launch_incarnation);
-            if current != Some(expected) {
-                return agent_launch_mismatch(id, &params.target, expected, current);
-            }
+        if let Some(expected) = params.expected_launch_incarnation {
+            let current = self.current_launch(terminal_id.as_str());
+            let Some((_, process)) = current.filter(|(token, _)| *token == expected) else {
+                let current = current.map(|(token, _)| token);
+                return QueuedKeys::Answered(agent_launch_mismatch(
+                    id,
+                    &params.target,
+                    &expected,
+                    current,
+                ));
+            };
+            return match runtime.queue_guarded_user_input(Bytes::from(bytes), process) {
+                Ok(outcome) => QueuedKeys::Guarded {
+                    response: GuardedKeysResponse {
+                        id,
+                        target: params.target,
+                        expected,
+                    },
+                    outcome,
+                },
+                Err(err) => QueuedKeys::Answered(encode_error(
+                    id,
+                    "agent_send_keys_failed",
+                    err.to_string(),
+                )),
+            };
         }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            return encode_error(id, "agent_send_keys_failed", err.to_string());
+            return QueuedKeys::Answered(encode_error(
+                id,
+                "agent_send_keys_failed",
+                err.to_string(),
+            ));
         }
 
-        encode_success(id, ResponseResult::Ok {})
+        QueuedKeys::Answered(encode_success(id, ResponseResult::Ok {}))
+    }
+}
+
+/// What queueing keys produced: an answer now, or a guarded write whose
+/// answer comes from the writer.
+enum QueuedKeys {
+    Answered(String),
+    Guarded {
+        response: GuardedKeysResponse,
+        outcome: std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>,
+    },
+}
+
+/// The reply owed for a guarded write once the writer answers.
+struct GuardedKeysResponse {
+    id: String,
+    target: String,
+    expected: String,
+}
+
+impl GuardedKeysResponse {
+    /// `None` means the writer closed without answering, so whether any of
+    /// the keys reached the terminal is unknown.
+    fn answer(self, outcome: Option<crate::pty::actor::GuardedWrite>) -> String {
+        match outcome {
+            Some(crate::pty::actor::GuardedWrite::Written) => {
+                encode_success(self.id, ResponseResult::Ok {})
+            }
+            Some(crate::pty::actor::GuardedWrite::Refused) => {
+                agent_launch_mismatch(self.id, &self.target, &self.expected, None)
+            }
+            None => encode_error(
+                self.id,
+                "agent_send_keys_failed",
+                "the terminal writer stopped before confirming the write; some keys may have been sent",
+            ),
+        }
     }
 }
 

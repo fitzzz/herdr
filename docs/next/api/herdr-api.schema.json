@@ -1233,6 +1233,10 @@
           "properties": {
             "nonce": {
               "type": "string"
+            },
+            "resolved_by_shell": {
+              "description": "Sent instead of a claim when the pane's shell resolved the started\ncommand itself, through an alias, a function or a builtin: the start\nruns unattested and the nonce is spent.",
+              "type": "boolean"
             }
           },
           "required": [

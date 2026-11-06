@@ -204,28 +204,36 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        // The shell runs the attesting helper, which claims this admission
-        // from its own process and then execs `argv` in it.
-        let attestation = attestable_launch(kind);
-        let typed = |argv: &[String]| match &attestation {
-            Some((helper, _, nonce)) => [
-                helper.clone(),
+        // Where the start can be attested, the shell runs the attesting
+        // helper, which claims this admission from its own process and then
+        // execs `argv` in it.
+        let mut attestation = attestable_launch(kind);
+        let helper = |attestation: &(String, _, String), tail: &[&str]| -> Vec<String> {
+            [
+                attestation.0.clone(),
                 crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND.to_string(),
-                nonce.clone(),
-                "--".to_string(),
+                attestation.2.clone(),
             ]
             .into_iter()
-            .chain(argv.iter().cloned())
-            .collect(),
-            None => argv.to_vec(),
+            .chain(tail.iter().map(|part| part.to_string()))
+            .collect()
         };
         let (argv, command) = if let Some(launcher) = &launcher {
             launcher
                 .validate()
                 .map_err(AgentStartError::InvalidLauncher)?;
             let argv = launcher.argv(&params.args);
+            // The launcher is an executable the caller named, so the helper
+            // execs it directly.
+            let typed = match &attestation {
+                Some(attestation) => helper(attestation, &["--"])
+                    .into_iter()
+                    .chain(argv.iter().cloned())
+                    .collect(),
+                None => argv.clone(),
+            };
             let command =
-                crate::platform::agent_launcher_command(&typed(&argv), &launcher.env, &shell_name)
+                crate::platform::agent_launcher_command(&typed, &launcher.env, &shell_name)
                     .ok_or_else(|| {
                         AgentStartError::InvalidLauncher(
                             "launcher cannot be encoded for the target shell".into(),
@@ -235,8 +243,24 @@ impl App {
         } else {
             let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
             argv.extend(params.args);
-            let command = crate::platform::interactive_shell_command(&typed(&argv), &shell_name)
-                .ok_or(AgentStartError::InvalidArgument)?;
+            // The pane's shell resolves the agent's command as it always did;
+            // the helper runs only when that resolves to an executable file.
+            let attested = attestation.as_ref().and_then(|attestation| {
+                crate::platform::attested_interactive_shell_command(
+                    &helper(attestation, &["--"]),
+                    &helper(attestation, &[crate::cli::RESOLVED_BY_SHELL_FLAG]),
+                    &argv,
+                    &shell_name,
+                )
+            });
+            let command = match attested {
+                Some(command) => command,
+                None => {
+                    attestation = None;
+                    crate::platform::interactive_shell_command(&argv, &shell_name)
+                        .ok_or(AgentStartError::InvalidArgument)?
+                }
+            };
             (argv, command)
         };
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
@@ -460,6 +484,21 @@ impl App {
         self.agent_info_from_pane(&pane)
     }
 
+    /// The terminal's attested launch with its bound process, only while
+    /// that process, read from the process table now by id and start time,
+    /// still leads the terminal's foreground process group. Detection may not
+    /// have seen a replacement yet; this proof does not depend on it.
+    pub(super) fn current_launch(
+        &self,
+        terminal_id: &str,
+    ) -> Option<(&str, crate::platform::ProcessInstance)> {
+        let (id, terminal) = self.state.terminals.get_key_value(terminal_id)?;
+        let (token, process) = terminal.attested_launch()?;
+        let runtime = self.terminal_runtimes.get(id)?;
+        crate::terminal::launch_incarnation::leads_foreground(process, runtime.foreground_leader())
+            .then_some((token, process))
+    }
+
     pub(super) fn agent_info_from_pane(
         &self,
         pane: &crate::api::schema::PaneInfo,
@@ -468,6 +507,9 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
+        let launch_incarnation = self
+            .current_launch(pane.terminal_id.as_str())
+            .map(|(token, _)| token.to_string());
         let pane = pane.clone();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
@@ -482,7 +524,7 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
-            launch_incarnation: terminal.launch_incarnation().map(str::to_string),
+            launch_incarnation,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,

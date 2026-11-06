@@ -130,7 +130,7 @@ session=$(herdr agent get reviewer | jq -r '.result.agent.agent_session.value')
 herdr agent send-keys reviewer esc --expect-session "$session"
 ```
 
-A new launch can resume the same conversation under the same name, so also pin the key to the launch you started. Record `launch_incarnation` from the `agent start` reply; Herdr returns `agent_launch_mismatch` and writes nothing once that launch's process is gone:
+A new launch can resume the same conversation under the same name, so also pin the key to the launch you started. Record `launch_incarnation` from the `agent start` reply; Herdr returns `agent_launch_mismatch` and writes nothing once that launch's process no longer leads the pane, even before Herdr has detected what replaced it. If the start fails after it was admitted, the token is in `error.admission.launch_incarnation`. A start your shell resolves to an alias or function is not attested, so guarded keys to it are refused:
 
 ```bash
 launch=$(herdr agent start reviewer --kind codex --pane "$pane" | jq -r '.result.launch_incarnation')

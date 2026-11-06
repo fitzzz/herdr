@@ -357,7 +357,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
     let pinned_terminal_id = pane_terminal_id(&pane_id)?;
     let mut retry_deadline = None;
-    let mut previous_busy_response = None;
+    let mut previous_busy_response: Option<serde_json::Value> = None;
     let mut response = loop {
         if let Some(previous_busy_response) = previous_busy_response.as_ref() {
             let retry_expired = retry_deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -365,7 +365,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 || pane_terminal_id(&pane_id)? != pinned_terminal_id
                 || !pane_shell_is_initializing(&pane_id)?
             {
-                return super::print_response(previous_busy_response);
+                return super::print_response(&not_admitted(previous_busy_response.clone()));
             }
         }
 
@@ -388,7 +388,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             || pane_terminal_id(&pane_id)? != pinned_terminal_id
             || !pane_shell_is_initializing(&pane_id)?
         {
-            return super::print_response(&response);
+            return super::print_response(&not_admitted(response));
         }
 
         let deadline = *retry_deadline
@@ -397,24 +397,30 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             if let Some(previous_busy_response) = previous_busy_response.as_ref() {
-                return super::print_response(previous_busy_response);
+                return super::print_response(&not_admitted(previous_busy_response.clone()));
             }
         }
         std::thread::sleep(AGENT_START_POLL_INTERVAL.min(remaining));
     };
 
     let Some(expected_terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
-        return super::print_response(&cli_agent_error(
-            "cli:agent:start",
-            "agent_start_failed",
-            "agent start response did not include terminal_id",
+        return super::print_response(&admitted_unresolved(
+            cli_agent_error(
+                "cli:agent:start",
+                "agent_start_failed",
+                "agent start response did not include terminal_id",
+            ),
+            &response,
         ));
     };
     if pinned_terminal_id
         .as_deref()
         .is_some_and(|pinned| pinned != expected_terminal_id)
     {
-        return super::print_response(&agent_name_lost_error("cli:agent:start", name));
+        return super::print_response(&admitted_unresolved(
+            agent_name_lost_error("cli:agent:start", name),
+            &response,
+        ));
     }
     let waited = wait_for_named_agent(
         name,
@@ -428,11 +434,40 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             response["result"]["agent"] = agent;
             super::print_response(&response)
         }
-        Ok(Err(error)) => super::print_response(&error),
+        Ok(Err(error)) => super::print_response(&admitted_unresolved(error, &response)),
         Err(err) => {
-            print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
+            match agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")? {
+                Some(error) => super::print_response(&admitted_unresolved(error, &response)),
+                None => Ok(1),
+            }
         }
     }
+}
+
+/// A start the server refused: nothing was typed and no launch is admitted.
+fn not_admitted(mut error: serde_json::Value) -> serde_json::Value {
+    error["error"]["admission"] = serde_json::json!({ "status": "not_admitted" });
+    error
+}
+
+/// A start the server admitted, with its readiness unresolved by `error`: the
+/// launch was typed and may still run, so the error keeps what the admission
+/// returned, its launch incarnation included, for a guarded recovery.
+fn admitted_unresolved(
+    mut error: serde_json::Value,
+    admitted: &serde_json::Value,
+) -> serde_json::Value {
+    let result = &admitted["result"];
+    let mut admission = serde_json::json!({
+        "status": "admitted_readiness_unresolved",
+        "agent": result["agent"],
+        "argv": result["argv"],
+    });
+    if let Some(token) = result.get("launch_incarnation") {
+        admission["launch_incarnation"] = token.clone();
+    }
+    error["error"]["admission"] = admission;
+    error
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -701,22 +736,25 @@ fn agent_name_lost_error(request_id: &str, expected_name: &str) -> serde_json::V
     )
 }
 
-fn print_agent_transport_error(
+/// The error to print for a transport failure, or `None` when a protocol
+/// mismatch was already reported.
+fn agent_transport_error(
     err: std::io::Error,
     request_id: &str,
     code: &str,
-) -> std::io::Result<i32> {
+) -> std::io::Result<Option<serde_json::Value>> {
     if super::protocol_mismatch_was_reported(&err) {
-        return Ok(1);
+        return Ok(None);
     }
     // A dead-server marker reaches here from `send_request` in the agent
     // startup path; surface its deferred response exactly once instead of
     // printing a second, generic transport-error line.
     if let Some(response) = super::server_not_running_reported_response(&err) {
-        let value = serde_json::to_value(response).map_err(std::io::Error::other)?;
-        return super::print_response(&value);
+        return serde_json::to_value(response)
+            .map(Some)
+            .map_err(std::io::Error::other);
     }
-    super::print_response(&cli_agent_error(request_id, code, err.to_string()))
+    Ok(Some(cli_agent_error(request_id, code, err.to_string())))
 }
 
 fn agent_wait_timeout() -> serde_json::Value {
@@ -1017,25 +1055,41 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
 /// whether or not the claim succeeded; without it the launch is never
 /// attested, so keys guarded by its launch incarnation are refused. Returns
 /// only when `argv` could not be executed.
+///
+/// `__attest-launch <nonce> --resolved-by-shell` is typed to run instead
+/// when the pane's shell resolves the agent's command itself (an alias, a
+/// function or a builtin): it ends the admission, and the shell then runs
+/// the command unattested.
 pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
+    if let [nonce, flag] = args {
+        if flag == RESOLVED_BY_SHELL_FLAG {
+            if let Err(reason) = attest_launch(nonce, true) {
+                eprintln!("herdr: could not end this agent start's attestation ({reason})");
+            }
+            return Ok(0);
+        }
+    }
     let (Some(nonce), Some("--"), Some(argv)) = (
         args.first(),
         args.get(1).map(String::as_str),
         args.get(2..).filter(|argv| !argv.is_empty()),
     ) else {
         eprintln!(
-            "usage: herdr {} <nonce> -- <command> [args...]",
+            "usage: herdr {0} <nonce> -- <command> [args...]\n       herdr {0} <nonce> {RESOLVED_BY_SHELL_FLAG}",
             crate::terminal::launch_incarnation::ATTEST_LAUNCH_COMMAND
         );
         return Ok(2);
     };
-    if let Err(reason) = attest_launch(nonce) {
+    if let Err(reason) = attest_launch(nonce, false) {
         eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
     }
     exec_launch(argv)
 }
 
-fn attest_launch(nonce: &str) -> Result<(), String> {
+/// The helper argument that ends an admission the pane's shell resolves.
+pub(crate) const RESOLVED_BY_SHELL_FLAG: &str = "--resolved-by-shell";
+
+fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
     let socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR)
         .ok_or_else(|| format!("{} is not set", crate::api::SOCKET_PATH_ENV_VAR))?;
     let client = crate::api::client::ApiClient::for_target(
@@ -1045,6 +1099,7 @@ fn attest_launch(nonce: &str) -> Result<(), String> {
         id: "launch:attest".into(),
         method: Method::AgentAttestLaunch(crate::api::schema::AgentAttestLaunchParams {
             nonce: nonce.to_string(),
+            resolved_by_shell,
         }),
     };
     // A server that does not answer must not keep the agent from starting;

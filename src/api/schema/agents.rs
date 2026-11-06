@@ -48,6 +48,11 @@ pub struct AgentSendKeysParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentAttestLaunchParams {
     pub nonce: String,
+    /// Sent instead of a claim when the pane's shell resolved the started
+    /// command itself, through an alias, a function or a builtin: the start
+    /// runs unattested and the nonce is spent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolved_by_shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

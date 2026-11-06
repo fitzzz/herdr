@@ -2976,6 +2976,11 @@ mod tests {
             .claim_launch_incarnation(provider, 10, Some(10))
             .unwrap();
         terminal.observe_agent_process(crate::detect::Agent::Codex, provider);
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_set_foreground_leader(Some(provider));
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.apply_agent_session_report(
             "herdr:codex".into(),
             "codex".into(),

@@ -607,6 +607,21 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// The process leading the terminal's foreground process group now.
+    pub(crate) fn foreground_leader(&self) -> Option<crate::platform::ProcessInstance> {
+        self.0.foreground_leader()
+    }
+
+    /// Queues `bytes` to be written only while `process` leads the
+    /// terminal's foreground process group when the writer reaches them.
+    pub(crate) fn queue_guarded_user_input(
+        &self,
+        bytes: bytes::Bytes,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<crate::pty::actor::GuardedWrite>> {
+        self.0.queue_guarded_user_input(bytes, process)
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -661,6 +676,13 @@ impl TerminalRuntime {
 
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.0.test_set_child_pid(pid);
+    }
+
+    pub(crate) fn test_set_foreground_leader(
+        &self,
+        process: Option<crate::platform::ProcessInstance>,
+    ) {
+        self.0.test_set_foreground_leader(process);
     }
 
     pub(crate) fn test_with_scrollback_bytes(

@@ -1,3 +1,11 @@
+/// The outcome of a write guarded by the process it may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedWrite {
+    Written,
+    /// Nothing was written: the process no longer led the foreground.
+    Refused,
+}
+
 #[cfg(unix)]
 mod unix;
 

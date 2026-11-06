@@ -3143,6 +3143,15 @@ impl TerminalState {
             .and_then(crate::terminal::launch_incarnation::LaunchIncarnation::attested_token)
     }
 
+    /// The attested launch's token with its bound process. The token is
+    /// reported or acted on only while that process provably still leads
+    /// the terminal's foreground.
+    pub(crate) fn attested_launch(&self) -> Option<(&str, ProcessInstance)> {
+        self.launch_incarnation
+            .as_ref()
+            .and_then(crate::terminal::launch_incarnation::LaunchIncarnation::attested)
+    }
+
     /// Whether this terminal's admitted launch waits for `nonce`.
     pub(crate) fn launch_awaits_claim(&self, nonce: &str) -> bool {
         self.launch_incarnation
