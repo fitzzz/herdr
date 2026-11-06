@@ -126,6 +126,7 @@ pub enum ComposerState {
     PartialCommand,
     Draft,
     QueuedEvidence,
+    SubmittedEvidence,
 }
 
 impl ComposerState {
@@ -135,7 +136,7 @@ impl ComposerState {
             Self::SelectionList => Some("a selection list is open"),
             Self::PartialCommand => Some("a slash command is already in the input box"),
             Self::Draft => Some("unsent typed text is present in the agent's input box"),
-            Self::QueuedEvidence => None,
+            Self::QueuedEvidence | Self::SubmittedEvidence => None,
         }
     }
 }
@@ -188,7 +189,7 @@ struct ManifestComposerRule {
     priority: i32,
     #[serde(default = "default_region")]
     region: String,
-    /// Only valid with state = "queued_evidence".
+    /// Only valid with state = "queued_evidence" or "submitted_evidence".
     #[serde(default)]
     requires_submitted_text: bool,
     #[serde(default)]
@@ -212,6 +213,15 @@ enum ManifestComposerState {
     PartialCommand,
     Draft,
     QueuedEvidence,
+    /// The submitted text appears as a prompt-marker entry in the region.
+    SubmittedEvidence,
+}
+
+impl ManifestComposerState {
+    /// Evidence states describe what a submission left behind, not the input box.
+    fn is_submission_evidence(self) -> bool {
+        matches!(self, Self::QueuedEvidence | Self::SubmittedEvidence)
+    }
 }
 
 impl From<ManifestComposerState> for ComposerState {
@@ -221,6 +231,7 @@ impl From<ManifestComposerState> for ComposerState {
             ManifestComposerState::PartialCommand => Self::PartialCommand,
             ManifestComposerState::Draft => Self::Draft,
             ManifestComposerState::QueuedEvidence => Self::QueuedEvidence,
+            ManifestComposerState::SubmittedEvidence => Self::SubmittedEvidence,
         }
     }
 }
@@ -500,7 +511,7 @@ pub fn composer_match(agent: Agent, input: DetectionInput<'_>) -> Option<Compose
         .iter()
         .zip(loaded.compiled_composer.iter())
     {
-        if rule.state == ManifestComposerState::QueuedEvidence {
+        if rule.state.is_submission_evidence() {
             continue;
         }
         let region_text = region(input, &rule.region);
@@ -523,12 +534,20 @@ pub fn composer_evidence_supported(agent: Agent) -> bool {
 }
 
 pub fn queued_evidence_supported(agent: Agent) -> bool {
+    composer_state_supported(agent, ManifestComposerState::QueuedEvidence)
+}
+
+pub fn submitted_evidence_supported(agent: Agent) -> bool {
+    composer_state_supported(agent, ManifestComposerState::SubmittedEvidence)
+}
+
+fn composer_state_supported(agent: Agent, state: ManifestComposerState) -> bool {
     load_manifest(agent).is_some_and(|loaded| {
         loaded
             .manifest
             .composer
             .iter()
-            .any(|rule| rule.state == ManifestComposerState::QueuedEvidence)
+            .any(|rule| rule.state == state)
     })
 }
 
@@ -555,6 +574,38 @@ pub fn composer_queued_evidence(agent: Agent, input: DetectionInput<'_>, needle:
             }
             compiled_rule_matches(compiled_rule, region_text)
         })
+}
+
+/// Count the prompt-marker entries (a `›` line and its indented continuation
+/// lines) that contain `needle` inside a matching `submitted_evidence` region.
+/// Callers compare the count with one taken before the submission, so an entry
+/// that was already on screen is never new evidence.
+pub fn composer_submitted_evidence(agent: Agent, input: DetectionInput<'_>, needle: &str) -> usize {
+    let Some(loaded) = load_manifest(agent) else {
+        return 0;
+    };
+    let normalized_needle = normalize_composer_text(needle);
+    if normalized_needle.is_empty() {
+        return 0;
+    }
+    loaded
+        .manifest
+        .composer
+        .iter()
+        .zip(loaded.compiled_composer.iter())
+        .filter(|(rule, _)| rule.state == ManifestComposerState::SubmittedEvidence)
+        .map(|(rule, compiled_rule)| {
+            let region_text = region(input, &rule.region);
+            if !compiled_rule_matches(compiled_rule, region_text) {
+                return 0;
+            }
+            prompt_marker_entries(region_text)
+                .into_iter()
+                .filter(|entry| normalize_composer_text(entry).contains(&normalized_needle))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn normalize_composer_text(text: &str) -> String {
@@ -1160,9 +1211,9 @@ fn validate_composer_rule(
     }
     validate_region_name(&rule.region)
         .map_err(|err| format!("composer rule {} uses invalid region: {err}", rule.id))?;
-    if rule.requires_submitted_text && rule.state != ManifestComposerState::QueuedEvidence {
+    if rule.requires_submitted_text && !rule.state.is_submission_evidence() {
         return Err(format!(
-            "composer rule {} uses requires_submitted_text without state = \"queued_evidence\"",
+            "composer rule {} uses requires_submitted_text without state = \"queued_evidence\" or \"submitted_evidence\"",
             rule.id
         ));
     }
@@ -1686,6 +1737,31 @@ fn queued_input_block(content: &str) -> &str {
         return "";
     };
     slice_from_line_index(content, &lines, index)
+}
+
+/// Each prompt-marker line with the indented lines a wrapped message continues on.
+fn prompt_marker_entries(content: &str) -> Vec<&str> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !codex_prompt_line(lines[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < lines.len()
+            && lines[index].starts_with(' ')
+            && !lines[index].trim().is_empty()
+        {
+            index += 1;
+        }
+        let start_offset = line_start_offset(content, &lines, start);
+        let end_offset = line_start_offset(content, &lines, index);
+        entries.push(&content[start_offset..end_offset]);
+    }
+    entries
 }
 
 fn codex_block_marker_line(line: &str) -> bool {

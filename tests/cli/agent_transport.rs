@@ -491,3 +491,116 @@ fn send_keys_expect_session_refuses_an_unsupported_server_before_sending_keys() 
             .contains("agent_send_keys_expected_session"));
     }
 }
+
+/// A Codex 0.163+ stand-in: once working, a submitted prompt is steered into the
+/// running turn and drawn as a `›` history entry above the empty input line,
+/// with no queued-input block.
+fn write_fake_steering_codex(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(bin).unwrap();
+    let fake_codex = bin.join("codex");
+    fs::write(
+        &fake_codex,
+        r#"#!/bin/sh
+stty -echo
+title='fake-codex'
+status=''
+transcript=''
+draw() {
+  printf '\033]0;%s\007\033[H\033[2J\033[3J' "$title"
+  printf '  >_ OpenAI Codex (fake)\n\n%b' "$transcript"
+  [ -n "$status" ] && printf '%s\n\n' "$status"
+  printf '\342\200\272 Ask Codex to do anything\n\n  ? for shortcuts'
+}
+draw
+while IFS= read -r prompt; do
+  case "$prompt" in
+    "begin turn")
+      title='⠋ fake-codex'
+      status='• Working (5s • esc to interrupt)'
+      transcript="$transcript› $prompt\n\n"
+      ;;
+    "ignore while working") ;;
+    *) transcript="$transcript› $prompt\n" ;;
+  esac
+  draw
+done
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn prompt_steered_into_a_working_codex_turn_is_prompted() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    write_fake_steering_codex(&bin);
+    let path = PathBuf::from(format!("{}:/usr/bin:/bin", bin.display()));
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&path));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "main",
+            "--kind",
+            "codex",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+        ],
+    );
+    assert_eq!(started["result"]["agent"]["agent"], "codex");
+
+    let prompt = |text: &str| {
+        let output = run_cli(&socket_path, &["agent", "prompt", "main", text]);
+        let body = if output.status.success() {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        serde_json::from_slice::<serde_json::Value>(body).unwrap()
+    };
+
+    let begun = prompt("begin turn");
+    assert_eq!(begun["result"]["type"], "agent_prompted", "{begun}");
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || run_cli_json(&socket_path, &["agent", "get", "main"])["result"]["agent"]["agent_status"]
+            == "working"
+    ));
+
+    let steered = prompt("Steer probe: after the sleep finishes, also say STEERED.");
+    assert_eq!(steered["result"]["type"], "agent_prompted", "{steered}");
+    assert_eq!(steered["result"]["agent"]["agent_status"], "working");
+
+    // Without a new steered entry or queued message, a working Codex prompt
+    // still has no acceptance evidence.
+    let ignored = prompt("ignore while working");
+    assert_eq!(
+        ignored["error"]["code"], "agent_prompt_stalled",
+        "{ignored}"
+    );
+    assert!(ignored["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("no acceptance evidence was observed")));
+
+    cleanup_spawned_herdr(herdr, base);
+}

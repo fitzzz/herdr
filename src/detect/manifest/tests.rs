@@ -919,6 +919,74 @@ contains = ["Queued follow-up inputs"]
 }
 
 #[test]
+fn submitted_evidence_counts_prompt_marker_entries_with_the_needle() {
+    with_manifest_dirs("composer-submitted", || {
+        write_local_codex(&composer_manifest(
+            r#"
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
+"#,
+        ));
+        let input = |screen| DetectionInput {
+            screen,
+            osc_title: "",
+            osc_progress: "",
+        };
+        assert!(submitted_evidence_supported(Agent::Codex));
+        assert!(!queued_evidence_supported(Agent::Codex));
+
+        let screen = "› Hello World\n• reply\n› hello\n  world\n› Hello World\n";
+        // The current prompt line is outside the region; the wrapped entry counts.
+        assert_eq!(
+            composer_submitted_evidence(Agent::Codex, input(screen), "hello world"),
+            2
+        );
+        assert!(composer_match(Agent::Codex, input(screen)).is_none());
+
+        // Text outside a prompt-marker entry is not submitted evidence.
+        let output_only = "• Ran echo Hello World\n  Hello World\n› \n";
+        assert_eq!(
+            composer_submitted_evidence(Agent::Codex, input(output_only), "hello world"),
+            0
+        );
+        assert_eq!(
+            composer_submitted_evidence(Agent::Codex, input(screen), "missing"),
+            0
+        );
+        assert_eq!(
+            composer_submitted_evidence(Agent::Codex, input(screen), " "),
+            0
+        );
+    });
+}
+
+#[test]
+fn composer_validation_accepts_requires_submitted_text_on_submitted_state() {
+    let manifest = r#"
+id = "codex"
+version = "1"
+min_engine_version = 4
+
+[[rules]]
+id = "base"
+state = "idle"
+contains = ["ready"]
+
+[[composer]]
+id = "submitted"
+state = "submitted_evidence"
+requires_submitted_text = true
+contains = ["›"]
+"#;
+    assert!(parse_manifest(manifest).is_ok());
+}
+
+#[test]
 fn current_prompt_line_region_returns_last_prompt_line() {
     let screen = "› first\nsome text\n› second\n";
     assert_eq!(

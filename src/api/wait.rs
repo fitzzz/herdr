@@ -209,7 +209,8 @@ pub(super) fn prompt_agent(
         .agent
         .as_deref()
         .and_then(crate::detect::parse_agent_label);
-    let queued_evidence_supported = crate::detect::queued_evidence_supported(expected_agent);
+    let working_evidence_supported = crate::detect::queued_evidence_supported(expected_agent)
+        || crate::detect::submitted_evidence_supported(expected_agent);
     let prompt_needle = prompt_evidence_needle(&params.text);
     let target = params.target.clone();
 
@@ -220,6 +221,11 @@ pub(super) fn prompt_agent(
         .as_deref()
         .map(|screen| crate::detect::manifest::composer_text_occurrences(screen, &prompt_needle))
         .unwrap_or(0);
+    // Without a pre-submission screen, an older steered entry cannot be told
+    // apart from a new one, so steer evidence is unavailable.
+    let submitted_baseline = before_screen.as_deref().map(|screen| {
+        crate::detect::composer_submitted_evidence(expected_agent, screen, &prompt_needle)
+    });
 
     if let Some(prompt_wait) = params.wait.as_mut() {
         prompt_wait.submission_deadline = total_timeout_ms
@@ -254,7 +260,7 @@ pub(super) fn prompt_agent(
     let mut initial = prompted;
     let prompt_started_working = initial.agent_status == crate::api::schema::AgentStatus::Working;
 
-    if prompt_started_working && !queued_evidence_supported {
+    if prompt_started_working && !working_evidence_supported {
         return agent_prompt_stalled(
             &request_id,
             &initial,
@@ -275,7 +281,7 @@ pub(super) fn prompt_agent(
         expected_agent,
     };
     let acceptance_mode = if prompt_started_working {
-        Some(PromptAcceptanceMode::QueuedEvidence)
+        Some(PromptAcceptanceMode::Working { submitted_baseline })
     } else if crate::detect::composer_evidence_supported(expected_agent) {
         Some(PromptAcceptanceMode::ComposerCleared)
     } else {
@@ -450,30 +456,45 @@ fn agent_prompt_stalled(
 }
 
 fn prompt_acceptance_evidence(screen: &str, probe: &PromptAcceptanceProbe) -> bool {
-    if crate::detect::manifest::composer_text_occurrences(screen, &probe.needle) <= probe.baseline {
-        return false;
-    }
+    let new_text =
+        crate::detect::manifest::composer_text_occurrences(screen, &probe.needle) > probe.baseline;
     match probe.mode {
-        PromptAcceptanceMode::QueuedEvidence => crate::detect::composer_queued_evidence(
-            probe.expected_agent,
-            screen,
-            "",
-            "",
-            &probe.needle,
-        ),
+        PromptAcceptanceMode::Working { submitted_baseline } => {
+            let queued = new_text
+                && crate::detect::composer_queued_evidence(
+                    probe.expected_agent,
+                    screen,
+                    "",
+                    "",
+                    &probe.needle,
+                );
+            // A steered prompt is a new submitted entry above an input box that
+            // no longer holds a draft, a command or a selection list.
+            let steered = submitted_baseline.is_some_and(|baseline| {
+                crate::detect::composer_submitted_evidence(
+                    probe.expected_agent,
+                    screen,
+                    &probe.needle,
+                ) > baseline
+                    && !composer_holds_input(probe.expected_agent, screen)
+            });
+            queued || steered
+        }
         PromptAcceptanceMode::ComposerCleared => {
-            !crate::detect::composer_match(probe.expected_agent, screen, "", "").is_some_and(
-                |composer| {
-                    matches!(
-                        composer.state,
-                        crate::detect::ComposerState::SelectionList
-                            | crate::detect::ComposerState::PartialCommand
-                            | crate::detect::ComposerState::Draft
-                    )
-                },
-            )
+            new_text && !composer_holds_input(probe.expected_agent, screen)
         }
     }
+}
+
+fn composer_holds_input(agent: Option<crate::detect::Agent>, screen: &str) -> bool {
+    crate::detect::composer_match(agent, screen, "", "").is_some_and(|composer| {
+        matches!(
+            composer.state,
+            crate::detect::ComposerState::SelectionList
+                | crate::detect::ComposerState::PartialCommand
+                | crate::detect::ComposerState::Draft
+        )
+    })
 }
 
 fn prompt_not_submitted_evidence(
@@ -565,7 +586,11 @@ struct PromptRejectionProbe {
 
 #[derive(Clone, Copy)]
 enum PromptAcceptanceMode {
-    QueuedEvidence,
+    /// The agent was already working: the prompt must appear as a queued
+    /// message or, when a pre-submission count exists, as a new steered entry.
+    Working {
+        submitted_baseline: Option<usize>,
+    },
     ComposerCleared,
 }
 
@@ -580,7 +605,7 @@ struct PromptAcceptanceProbe {
 impl PromptAcceptanceProbe {
     fn required_streak(&self) -> u32 {
         match self.mode {
-            PromptAcceptanceMode::QueuedEvidence => 1,
+            PromptAcceptanceMode::Working { .. } => 1,
             PromptAcceptanceMode::ComposerCleared => NOT_SUBMITTED_STREAK,
         }
     }
@@ -1244,7 +1269,9 @@ mod tests {
     #[test]
     fn acceptance_evidence_requires_queued_message_or_cleared_composer() {
         let queued = PromptAcceptanceProbe {
-            mode: PromptAcceptanceMode::QueuedEvidence,
+            mode: PromptAcceptanceMode::Working {
+                submitted_baseline: Some(0),
+            },
             needle: "hello".into(),
             baseline: 0,
             earliest: std::time::Instant::now(),
@@ -1268,6 +1295,122 @@ mod tests {
             &cleared
         ));
         assert!(!prompt_acceptance_evidence("\u{203a} hello\n", &cleared));
+    }
+
+    // Shape captured from codex-cli 0.166.0 while a turn was running (see the
+    // steer reproduction): a steered prompt becomes a `›` history entry above
+    // the working status, and the input line shows its placeholder again.
+    const STEER_NEEDLE: &str = "Steer probe: after the sleep finishes, also say STEERED.";
+    const STEER_TRANSCRIPT_HEAD: &str = "  >_ OpenAI Codex (v0.166.0)\n\
+        \u{203a} Use your shell tool to run: sleep 25 ; echo finished. Then reply with SLEPT.\n\
+        \u{2022} I\u{2019}ll run the command now.\n";
+    const STEER_ENTRY: &str = "\u{203a} Steer probe: after the sleep finishes, also say STEERED.\n";
+    const STEER_TRANSCRIPT_TAIL: &str = "\u{2022} Ran codex-job start --label sleep-probe\n\
+        \u{2022} Working (20s \u{2022} esc to interrupt)\n\n";
+    const EMPTY_CODEX_INPUT: &str = "\u{203a} Ask Codex to do anything\n\
+        \x20 GPT-6.1-Sol low \u{b7} ~/cwd\n\
+        \x20 ? for shortcuts\n";
+
+    fn working_codex_screen(entries: &[&str], input: &str) -> String {
+        let mut screen = STEER_TRANSCRIPT_HEAD.to_string();
+        for entry in entries {
+            screen.push_str(entry);
+        }
+        screen.push_str(STEER_TRANSCRIPT_TAIL);
+        screen.push_str(input);
+        screen
+    }
+
+    fn working_probe(
+        before_screen: Option<&str>,
+        expected_agent: Option<crate::detect::Agent>,
+    ) -> PromptAcceptanceProbe {
+        PromptAcceptanceProbe {
+            mode: PromptAcceptanceMode::Working {
+                submitted_baseline: before_screen.map(|screen| {
+                    crate::detect::composer_submitted_evidence(expected_agent, screen, STEER_NEEDLE)
+                }),
+            },
+            needle: STEER_NEEDLE.into(),
+            baseline: before_screen
+                .map(|screen| {
+                    crate::detect::manifest::composer_text_occurrences(screen, STEER_NEEDLE)
+                })
+                .unwrap_or(0),
+            earliest: std::time::Instant::now(),
+            expected_agent,
+        }
+    }
+
+    #[test]
+    fn a_prompt_steered_into_a_working_codex_turn_is_accepted() {
+        let codex = Some(crate::detect::Agent::Codex);
+        assert!(crate::detect::submitted_evidence_supported(codex));
+        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
+        let steered = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        assert!(prompt_acceptance_evidence(
+            &steered,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A steer whose first line wrapped onto Codex's indented continuation
+        // line is still the same entry.
+        let wrapped = working_codex_screen(
+            &["\u{203a} Steer probe: after the sleep\n  finishes, also say STEERED.\n"],
+            EMPTY_CODEX_INPUT,
+        );
+        assert!(prompt_acceptance_evidence(
+            &wrapped,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steer_still_in_the_input_line_is_not_accepted() {
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
+        let draft_input = format!("{STEER_ENTRY}  ? for shortcuts\n");
+        let still_typed = working_codex_screen(&[], &draft_input);
+        assert!(!prompt_acceptance_evidence(
+            &still_typed,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // A matching history entry does not count while the input box holds a draft.
+        let steered_with_draft = working_codex_screen(&[STEER_ENTRY], &draft_input);
+        assert!(!prompt_acceptance_evidence(
+            &steered_with_draft,
+            &working_probe(Some(&before), codex)
+        ));
+    }
+
+    #[test]
+    fn a_steered_entry_already_in_the_baseline_is_not_accepted() {
+        let codex = Some(crate::detect::Agent::Codex);
+        let before = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        assert!(!prompt_acceptance_evidence(
+            &before,
+            &working_probe(Some(&before), codex)
+        ));
+
+        // Without a pre-submission screen there is no baseline to rise above.
+        assert!(!prompt_acceptance_evidence(
+            &before,
+            &working_probe(None, codex)
+        ));
+    }
+
+    #[test]
+    fn a_steered_entry_is_not_evidence_for_other_agent_kinds() {
+        let before = working_codex_screen(&[], EMPTY_CODEX_INPUT);
+        let steered = working_codex_screen(&[STEER_ENTRY], EMPTY_CODEX_INPUT);
+        for agent in [Some(crate::detect::Agent::Claude), None] {
+            assert!(!crate::detect::submitted_evidence_supported(agent));
+            assert!(!prompt_acceptance_evidence(
+                &steered,
+                &working_probe(Some(&before), agent)
+            ));
+        }
     }
 
     #[test]

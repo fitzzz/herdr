@@ -48,7 +48,7 @@ COMPOSER_KEYS = {
 }
 GATE_KEYS = {"all", "any", "not", "contains", "regex", "line_regex"}
 STATES = {"idle", "working", "blocked", "unknown"}
-COMPOSER_STATES = {"selection_list", "partial_command", "draft", "queued_evidence"}
+COMPOSER_STATES = {"selection_list", "partial_command", "draft", "queued_evidence", "submitted_evidence"}
 REGION_RE = re.compile(
     r"^(whole_recent|whole_recent_without_current_prompt_marker|after_last_prompt_marker|"
     r"before_current_prompt_marker|current_prompt_block_marker|after_current_prompt_block_marker|"
@@ -84,7 +84,7 @@ STAGED_PUBLISHED_MANIFESTS = {
     # Codex's engine-4 composer rules stay bundled until a released client
     # carries engine 4. Published clients keep the engine-3 catalog manifest.
     "codex": (
-        "2026.10.29.1",
+        "2026.11.06.1",
         "2026.10.11.1",
         "d25cfddb5434259303fb0ac27b5b0e6d0558408e6901ee112bcd53de02bcda13",
     ),
@@ -228,9 +228,10 @@ def validate_composer(path: Path, index: int, rule: object, complexity: dict[str
     requires_submitted_text = rule.get("requires_submitted_text", False)
     if not isinstance(requires_submitted_text, bool):
         raise CheckError(f"{path}: composer rule {rule_id} requires_submitted_text must be a boolean")
-    if requires_submitted_text and state != "queued_evidence":
+    if requires_submitted_text and state not in {"queued_evidence", "submitted_evidence"}:
         raise CheckError(
-            f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state queued_evidence"
+            f"{path}: composer rule {rule_id} requires_submitted_text only allowed with state "
+            "queued_evidence or submitted_evidence"
         )
     validate_gate(
         path,

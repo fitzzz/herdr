@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.10.29.1"
+version = "2026.11.06.1"
 min_engine_version = 4
-updated_at = "2026-10-29T21:00:00Z"
+updated_at = "2026-11-06T12:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -183,3 +183,15 @@ any = [
   { contains = ["Messages to be submitted after next tool call"] },
   { contains = ["Messages to be submitted at end of turn"] },
 ]
+
+# Codex 0.163+ steers a prompt sent during a running turn into that turn and
+# draws it as a `› text` history entry above the input line, with no queued
+# block. Captured from codex-cli 0.166.0. Only entries above the current input
+# line count, so a draft still in the input box is never steer evidence.
+[[composer]]
+id = "steered_message"
+state = "submitted_evidence"
+priority = 100
+region = "before_current_prompt_marker"
+requires_submitted_text = true
+regex = ['(?m)^›(?: |$)']
