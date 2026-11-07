@@ -1053,6 +1053,7 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
+            let total = write.bytes.len();
             // So is each write of a guarded submission: a failed check ends
             // the submission, so its Enter never follows text meant for
             // another process.
@@ -1066,7 +1067,7 @@ impl PtyIoActorRunner {
                     crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd())
                         .and_then(crate::terminal::launch_incarnation::group_leader);
                 if !crate::terminal::launch_incarnation::leads_foreground(process, leader) {
-                    let stopped = self.pending_writes.pop_front().unwrap();
+                    self.pending_writes.pop_front();
                     let written = std::mem::take(&mut self.current_write_offset);
                     let stop = match boundary {
                         SubmissionBoundary::Enter => super::GuardedSubmissionStop::EnterNotSent,
@@ -1074,10 +1075,7 @@ impl PtyIoActorRunner {
                             super::GuardedSubmissionStop::NothingWritten
                         }
                         SubmissionBoundary::Text => {
-                            super::GuardedSubmissionStop::TextPartlyWritten {
-                                written,
-                                total: stopped.bytes.len(),
-                            }
+                            super::GuardedSubmissionStop::TextPartlyWritten { written, total }
                         }
                     };
                     self.fail_active_submission(std::io::Error::other(stop));
