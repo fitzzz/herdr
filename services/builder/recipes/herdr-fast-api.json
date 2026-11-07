@@ -73,7 +73,7 @@
     "build": [
       "bash",
       "-c",
-      "set -eu\njobs=$1\nbuild=/w/build\nmkdir -p \"$build\"\ncargo fetch --locked\ncargo nextest run --locked --no-run --build-jobs \"$jobs\"\ncat > \"$build/CTestTestfile.cmake.new\" <<CTEST\n# Written by the build step of services/builder/recipes/herdr-fast-api.json: the fork's\n# Linux \\`just check\\` (lint, ci-tests, docs-contract-test; windows-lint is not here) as\n# CTest tests run from the source, plus ghostty-scalar, the scalar libghostty check the\n# fork's Linux CI job runs (.github/workflows/ci.yml), in its own target folder.\nadd_test(lint just lint)\nset_tests_properties(lint PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo-target ENVIRONMENT CARGO_BUILD_JOBS=$jobs LABELS check)\nadd_test(ci-tests just ci-tests)\nset_tests_properties(ci-tests PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo-target ENVIRONMENT CARGO_BUILD_JOBS=$jobs LABELS check)\nadd_test(docs-contract-test just docs-contract-test)\nset_tests_properties(docs-contract-test PROPERTIES WORKING_DIRECTORY /w/src LABELS check)\nadd_test(ghostty-scalar cargo nextest run --locked -E \"package(ghostty-vt) | test(ghostty)\" --status-level fail --final-status-level fail --failure-output final --success-output never)\nset_tests_properties(ghostty-scalar PROPERTIES WORKING_DIRECTORY /w/src ENVIRONMENT \"LIBGHOSTTY_VT_SIMD=false;LIBGHOSTTY_VT_OPTIMIZE=ReleaseSafe;CARGO_TARGET_DIR=/w/build/target-scalar;CARGO_BUILD_JOBS=$jobs\" LABELS ci)\nCTEST\nmv -f \"$build/CTestTestfile.cmake.new\" \"$build/CTestTestfile.cmake\"\n",
+      "set -eu\njobs=$1\nbuild=/w/build\nmkdir -p \"$build\"\ncargo fetch --locked\ncargo nextest run --locked --no-run --build-jobs \"$jobs\"\ncat > \"$build/compile-jobs.sh\" <<'JOBS'\n# Runs a check with CARGO_BUILD_JOBS sized for the machine running it, which may be smaller than the\n# machine that wrote this file: its vCPUs, at most its memory at 2 GiB a job (the recipe's build_job_memory_gib).\nset -eu\ncpus=$(nproc)\nread -r _ kib _ < /proc/meminfo\nbytes=$((kib * 1024))\nif [ -r /sys/fs/cgroup/memory.max ]; then\n  read -r cap < /sys/fs/cgroup/memory.max\n  if [ \"$cap\" != max ] && [ \"$cap\" -lt \"$bytes\" ]; then bytes=$cap; fi\nfi\njobs=$((bytes / 2147483648))\nif [ \"$jobs\" -gt \"$cpus\" ]; then jobs=$cpus; fi\nif [ \"$jobs\" -lt 1 ]; then jobs=1; fi\nexport CARGO_BUILD_JOBS=$jobs\nexec \"$@\"\nJOBS\ncat > \"$build/CTestTestfile.cmake.new\" <<'CTEST'\n# Written by the build step of services/builder/recipes/herdr-fast-api.json. See herdr-fast-api-notes.md there.\n# The Linux CI gate, not all of `just check`: lint, ci-tests and docs-contract-test from it, windows-lint not\n# here, plus ghostty-scalar, the scalar libghostty check of the fork's Linux CI job, in its own target folder.\n# RESOURCE_LOCK cargo: one check compiles at a time, so one machine's compile allowance is not spent twice.\n# TIMEOUT 0: no time limit on a test.\nadd_test(lint bash /w/build/compile-jobs.sh just lint)\nset_tests_properties(lint PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo TIMEOUT 0 LABELS check)\nadd_test(ci-tests bash /w/build/compile-jobs.sh just ci-tests)\nset_tests_properties(ci-tests PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo TIMEOUT 0 LABELS check)\nadd_test(docs-contract-test just docs-contract-test)\nset_tests_properties(docs-contract-test PROPERTIES WORKING_DIRECTORY /w/src TIMEOUT 0 LABELS check)\nadd_test(ghostty-scalar bash /w/build/compile-jobs.sh cargo nextest run --locked -E \"package(ghostty-vt) | test(ghostty)\" --status-level fail --final-status-level fail --failure-output final --success-output never)\nset_tests_properties(ghostty-scalar PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo TIMEOUT 0 ENVIRONMENT \"LIBGHOSTTY_VT_SIMD=false;LIBGHOSTTY_VT_OPTIMIZE=ReleaseSafe;CARGO_TARGET_DIR=/w/build/target-scalar\" LABELS ci)\nCTEST\nmv -f \"$build/CTestTestfile.cmake.new\" \"$build/CTestTestfile.cmake\"\n",
       "build",
       "{buildJobs}"
     ]
@@ -103,14 +103,13 @@
       }
     },
     "test-full": {
-      "label": "just check (Linux)",
+      "label": "Linux CI gate (not windows-lint)",
       "requires_build": true,
       "group": true
     }
   },
   "tests": {
     "exclude_labels": "",
-    "timeout_s": 1800,
     "serial": [],
     "intermediates": [
       "target/debug/incremental/**",
