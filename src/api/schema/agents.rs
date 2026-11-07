@@ -261,7 +261,8 @@ pub struct AgentLaunchStatusParams {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLaunchState {
     /// Its process is proved now: the terminal's agent process, leading the
-    /// foreground. The reply's `agent` carries the token.
+    /// foreground, read once for the reply's `agent`, which carries the token.
+    /// A terminal no pane shows is `held`.
     Attested,
     /// A terminal keeps the launch and it is not proved now: not yet claimed
     /// or detected, carried by a live handoff the next server has not attested

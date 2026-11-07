@@ -7038,7 +7038,7 @@
           "oneOf": [
             {
               "const": "attested",
-              "description": "Its process is proved now: the terminal's agent process, leading the\nforeground. The reply's `agent` carries the token.",
+              "description": "Its process is proved now: the terminal's agent process, leading the\nforeground, read once for the reply's `agent`, which carries the token.\nA terminal no pane shows is `held`.",
               "type": "string"
             },
             {

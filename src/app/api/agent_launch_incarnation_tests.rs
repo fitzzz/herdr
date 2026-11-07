@@ -1175,6 +1175,36 @@ async fn launch_status_follows_the_launch_when_its_name_goes() {
     assert_eq!(reply["result"]["agent"]["name"], "elsewhere");
 }
 
+/// One reply, one observation: when the launch's process stops or starts
+/// leading the foreground while the reply is built, its state and the token
+/// its agent carries still agree.
+#[tokio::test]
+async fn launch_status_never_contradicts_its_own_attestation_across_a_foreground_transition() {
+    for leaves in [true, false] {
+        let mut app = app();
+        let (launch, _rx) = attested(&mut app, Agent::Claude);
+        let (before, after) = if leaves {
+            (process(4242, 7), process(4300, 9))
+        } else {
+            (process(4300, 9), process(4242, 7))
+        };
+        foreground(&app, &launch, Some(before));
+        crate::pane::PaneRuntime::test_change_foreground_after_reads(1, Some(after));
+
+        let reply = launch_status(&mut app, &launch.token);
+        crate::pane::PaneRuntime::test_change_foreground_after_reads(0, None);
+
+        let result = &reply["result"];
+        let carries_token = result["agent"]["launch_incarnation"] == launch.token.as_str();
+        assert_eq!(
+            result["state"] == "attested",
+            carries_token,
+            "leaving the foreground: {leaves}; {reply}"
+        );
+        assert_ne!(result["state"], "none", "{reply}");
+    }
+}
+
 #[tokio::test]
 async fn launch_status_says_held_while_a_terminal_keeps_a_launch_it_cannot_attest_now() {
     let mut app = app();

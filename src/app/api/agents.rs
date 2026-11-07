@@ -144,14 +144,6 @@ impl App {
                 },
             );
         };
-        let state = if self
-            .current_launch(terminal_id.as_str())
-            .is_some_and(|(current, _)| current == token)
-        {
-            AgentLaunchState::Attested
-        } else {
-            AgentLaunchState::Held
-        };
         let shown = self
             .terminal_targets()
             .into_iter()
@@ -160,6 +152,18 @@ impl App {
             .as_ref()
             .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id));
         let agent = shown.and_then(|target| self.agent_info(target.ws_idx, target.pane_id));
+        // One observation: the state is what the returned agent shows, so the
+        // foreground changing while the reply is built cannot make them
+        // disagree. A terminal no pane shows has no agent to prove it by.
+        let state = if agent
+            .as_ref()
+            .and_then(|agent| agent.launch_incarnation.as_deref())
+            == Some(token.as_str())
+        {
+            AgentLaunchState::Attested
+        } else {
+            AgentLaunchState::Held
+        };
         encode_success(
             id,
             ResponseResult::AgentLaunchStatus {

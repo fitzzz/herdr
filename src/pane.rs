@@ -1543,6 +1543,14 @@ thread_local! {
     static FOREGROUND_ACTOR_REQUESTS: Cell<u64> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's scripted foreground transition: after this many more reads of a
+    /// test channel's leader, that channel's leader becomes the given process.
+    static FOREGROUND_CHANGE_AFTER_READS: std::cell::RefCell<Option<(usize, Option<crate::platform::ProcessInstance>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
@@ -3886,9 +3894,21 @@ impl PaneRuntime {
     pub(crate) fn foreground_leader(&self) -> Option<crate::platform::ProcessInstance> {
         #[cfg(test)]
         if let PaneRuntimeIo::TestChannel { foreground, .. } = &self.io {
-            return *foreground
+            let mut current = foreground
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let leader = *current;
+            FOREGROUND_CHANGE_AFTER_READS.with(|change| {
+                let mut change = change.borrow_mut();
+                if let Some((reads, next)) = change.as_mut() {
+                    *reads = reads.saturating_sub(1);
+                    if *reads == 0 {
+                        *current = *next;
+                        *change = None;
+                    }
+                }
+            });
+            return leader;
         }
         #[cfg(unix)]
         {
@@ -4185,6 +4205,16 @@ impl PaneRuntime {
 
     pub(crate) fn test_set_child_pid(&self, pid: u32) {
         self.child_pid.store(pid, Ordering::Release);
+    }
+
+    /// After `reads` more reads of a test channel's foreground leader, the
+    /// channel read last reports `process` instead: a transition in the middle
+    /// of a request.
+    pub(crate) fn test_change_foreground_after_reads(
+        reads: usize,
+        process: Option<crate::platform::ProcessInstance>,
+    ) {
+        FOREGROUND_CHANGE_AFTER_READS.with(|change| *change.borrow_mut() = Some((reads, process)));
     }
 
     /// Makes `process` the one a test channel reports leading the foreground.
