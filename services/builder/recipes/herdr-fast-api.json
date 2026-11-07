@@ -1,0 +1,124 @@
+{
+  "schema": "portal.build-recipe/1",
+  "project": "herdr-fast-api",
+  "roles": {
+    "task": {
+      "vcpu": 16,
+      "memory_gib": 32
+    },
+    "image": {
+      "vcpu": 16,
+      "memory_gib": 32
+    },
+    "test": {
+      "vcpu": 16,
+      "memory_gib": 32
+    },
+    "review": {
+      "vcpu": 8,
+      "memory_gib": 16
+    }
+  },
+  "group_size": 1,
+  "build_job_memory_gib": 2,
+  "environment": {
+    "toolchain": {
+      "kind": "container",
+      "base": "archlinux@sha256:4e77cf2ea5f410e6f8be5abf93ccf17ce2436e87a138c167208356711a405dbd",
+      "packageArchive": "https://archive.archlinux.org/packages",
+      "lock": "herdr-fast-api.lock",
+      "dockerfile": [
+        "RUN set -eu; if getent passwd 1000 >/dev/null || getent group 1000 >/dev/null; then echo 'UID or GID 1000 already exists' >&2; exit 1; fi; printf 'portal:x:1000:\\n' >> /etc/group; printf 'portal:x:1000:1000:Portal build user:/w:/bin/bash\\n' >> /etc/passwd",
+        "RUN set -eu; curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/archive/1.29.3/x86_64-unknown-linux-gnu/rustup-init; echo 'b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init' | sha256sum -c -; chmod 755 /tmp/rustup-init; RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.96.1 --component clippy,rustfmt; rm /tmp/rustup-init; chmod -R a+rX /opt/rust",
+        "RUN set -eu; curl -fsSLo /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz; echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz' | sha256sum -c -; mkdir /opt/zig-0.16.0; tar -xJf /tmp/zig.tar.xz -C /opt/zig-0.16.0 --strip-components=1; rm /tmp/zig.tar.xz",
+        "RUN set -eu; curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.xz; echo '6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6  /tmp/node.tar.xz' | sha256sum -c -; mkdir /opt/node-v24.22.1; tar -xJf /tmp/node.tar.xz -C /opt/node-v24.22.1 --strip-components=1; rm /tmp/node.tar.xz",
+        "RUN set -eu; curl -fsSLo /tmp/bun.zip https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64-baseline.zip; echo 'a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7  /tmp/bun.zip' | sha256sum -c -; python3 -I -c \"import zipfile; zipfile.ZipFile('/tmp/bun.zip').extract('bun-linux-x64-baseline/bun', '/tmp')\"; install -m 755 /tmp/bun-linux-x64-baseline/bun /usr/local/bin/bun; rm -r /tmp/bun.zip /tmp/bun-linux-x64-baseline",
+        "RUN set -eu; curl -fsSLo /tmp/just.tar.gz https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-x86_64-unknown-linux-musl.tar.gz; echo '409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e  /tmp/just.tar.gz' | sha256sum -c -; tar -xzf /tmp/just.tar.gz -C /usr/local/bin just; rm /tmp/just.tar.gz",
+        "RUN set -eu; curl -fsSLo /tmp/nextest.tar.gz https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.149/cargo-nextest-0.9.149-x86_64-unknown-linux-gnu.tar.gz; echo '32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770  /tmp/nextest.tar.gz' | sha256sum -c -; tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest; rm /tmp/nextest.tar.gz",
+        "ENV RUSTUP_HOME=/opt/rust/rustup ZIG=/opt/zig-0.16.0/zig PATH=/opt/rust/cargo/bin:/opt/zig-0.16.0:/opt/node-v24.22.1/bin:/usr/local/sbin:/usr/local/bin:/usr/bin",
+        "RUN set -eu; rustc --version | grep -q '^rustc 1\\.96\\.1 '; cargo clippy --version; rustfmt --version; test \"$(zig version)\" = 0.16.0; test \"$(node --version)\" = v24.22.1; test \"$(bun --version)\" = 1.3.14; test \"$(just --version)\" = 'just 1.59.0'; cargo nextest --version | grep -q '^cargo-nextest 0\\.9\\.149 '; ctest --version | grep -q '^ctest version 4\\.4\\.3$'"
+      ]
+    },
+    "workdir": "/w",
+    "user": "{slot.uid}:{slot.gid}",
+    "network": "host",
+    "env": {
+      "HOME": "/w/home",
+      "XDG_CONFIG_HOME": "/w/config",
+      "CARGO_HOME": "/w/cargo",
+      "CARGO_TARGET_DIR": "/w/build/target",
+      "CARGO_TERM_COLOR": "never",
+      "CARGO_PROFILE_DEV_DEBUG": "1",
+      "CARGO_PROFILE_TEST_DEBUG": "1",
+      "ZIG_GLOBAL_CACHE_DIR": "/w/zig-cache",
+      "ZIG_LOCAL_CACHE_DIR": "/w/zig-cache"
+    },
+    "directories": [
+      "cargo",
+      "zig-cache",
+      "home",
+      "config",
+      "results"
+    ],
+    "keep": [
+      "cargo",
+      "zig-cache"
+    ],
+    "remove_before_save": [
+      "home/.cache"
+    ]
+  },
+  "build_dir": "build",
+  "commands": {
+    "build": [
+      "bash",
+      "-c",
+      "set -eu\njobs=$1\nbuild=/w/build\nmkdir -p \"$build\"\ncargo fetch --locked\ncargo nextest run --locked --no-run --build-jobs \"$jobs\"\ncat > \"$build/CTestTestfile.cmake.new\" <<CTEST\n# Written by the build step of services/builder/recipes/herdr-fast-api.json: the fork's\n# Linux \\`just check\\` (lint, ci-tests, docs-contract-test; windows-lint is not here) as\n# CTest tests run from the source, plus ghostty-scalar, the scalar libghostty check the\n# fork's Linux CI job runs (.github/workflows/ci.yml), in its own target folder.\nadd_test(lint just lint)\nset_tests_properties(lint PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo-target ENVIRONMENT CARGO_BUILD_JOBS=$jobs LABELS check)\nadd_test(ci-tests just ci-tests)\nset_tests_properties(ci-tests PROPERTIES WORKING_DIRECTORY /w/src RESOURCE_LOCK cargo-target ENVIRONMENT CARGO_BUILD_JOBS=$jobs LABELS check)\nadd_test(docs-contract-test just docs-contract-test)\nset_tests_properties(docs-contract-test PROPERTIES WORKING_DIRECTORY /w/src LABELS check)\nadd_test(ghostty-scalar cargo nextest run --locked -E \"package(ghostty-vt) | test(ghostty)\" --status-level fail --final-status-level fail --failure-output final --success-output never)\nset_tests_properties(ghostty-scalar PROPERTIES WORKING_DIRECTORY /w/src ENVIRONMENT \"LIBGHOSTTY_VT_SIMD=false;LIBGHOSTTY_VT_OPTIMIZE=ReleaseSafe;CARGO_TARGET_DIR=/w/build/target-scalar;CARGO_BUILD_JOBS=$jobs\" LABELS ci)\nCTEST\nmv -f \"$build/CTestTestfile.cmake.new\" \"$build/CTestTestfile.cmake\"\n",
+      "build",
+      "{buildJobs}"
+    ]
+  },
+  "jobs": {
+    "build": {
+      "label": "Build the test programs",
+      "steps": [
+        "build"
+      ]
+    },
+    "test": {
+      "label": "Focused checks",
+      "requires_build": true,
+      "parameters": {
+        "select": {
+          "pattern": "^[A-Za-z0-9_.|^$()*+?\\[\\]\\\\-]{1,512}$",
+          "flag": "-R"
+        },
+        "label": {
+          "pattern": "^[A-Za-z0-9_.|^$()*+?\\[\\]\\\\-]{1,512}$",
+          "flag": "-L"
+        }
+      },
+      "aliases": {
+        "TESTS": "select"
+      }
+    },
+    "test-full": {
+      "label": "just check (Linux)",
+      "requires_build": true,
+      "group": true
+    }
+  },
+  "tests": {
+    "exclude_labels": "",
+    "timeout_s": 1800,
+    "serial": [],
+    "intermediates": [
+      "target/debug/incremental/**",
+      "target-scalar/**"
+    ],
+    "reset": [
+      "home",
+      "config"
+    ]
+  }
+}
