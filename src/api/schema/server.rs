@@ -67,6 +67,14 @@ pub struct ServerCapabilities {
     /// launch incarnation equals it. Older servers ignore the field and write.
     #[serde(default)]
     pub agent_send_keys_expected_launch_incarnation: bool,
+    /// `agent.prompt` honors `expected_launch_incarnation`: it refuses with
+    /// `agent_launch_mismatch`, typing nothing, unless the target's current
+    /// launch incarnation equals it. Older servers ignore the field and type.
+    #[serde(default)]
+    pub agent_prompt_expected_launch_incarnation: bool,
+    /// Supports `agent.launch_status`, which answers by a launch's token alone.
+    #[serde(default)]
+    pub agent_launch_status: bool,
     /// `terminal attach`, `terminal session control` and `terminal session
     /// observe` honor `--expect-launch`. Older servers ignore the guarded
     /// admission and attach nothing, so the CLI refuses before asking them.

@@ -3143,6 +3143,17 @@ impl TerminalState {
             .and_then(crate::terminal::launch_incarnation::LaunchIncarnation::attested_token)
     }
 
+    /// Whether this terminal still keeps the launch `token`, in any phase and
+    /// whether or not its process leads the foreground now. Herdr drops a
+    /// launch once its process exited, the pane respawned, another process
+    /// or kind took the terminal, or a new start was admitted, and a live
+    /// handoff carries a bound one, so a token no terminal keeps never comes back.
+    pub(crate) fn holds_launch(&self, token: &str) -> bool {
+        self.launch_incarnation
+            .as_ref()
+            .is_some_and(|launch| launch.token() == token)
+    }
+
     /// The attested launch's token with its bound process. The token is
     /// reported or acted on only while that process provably still leads
     /// the terminal's foreground.

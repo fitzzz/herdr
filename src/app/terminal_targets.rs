@@ -130,7 +130,7 @@ impl App {
         }
     }
 
-    fn terminal_targets(&self) -> Vec<TerminalTarget> {
+    pub(super) fn terminal_targets(&self) -> Vec<TerminalTarget> {
         self.state
             .workspaces
             .iter()

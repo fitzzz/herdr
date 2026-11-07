@@ -12,6 +12,23 @@ pub(crate) enum GuardedWrite {
     },
 }
 
+/// Why a guarded submission stopped short: the launch it was meant for no
+/// longer led the terminal's foreground. Carried in the submission's error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedSubmissionStop {
+    NothingWritten,
+    TextPartlyWritten { written: usize, total: usize },
+    EnterNotSent,
+}
+
+impl std::fmt::Display for GuardedSubmissionStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the expected process no longer leads the foreground")
+    }
+}
+
+impl std::error::Error for GuardedSubmissionStop {}
+
 #[cfg(unix)]
 mod unix;
 

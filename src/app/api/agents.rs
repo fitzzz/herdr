@@ -109,6 +109,69 @@ impl App {
         )
     }
 
+    /// What this server knows of a launch, by its token alone: a name can pass
+    /// to another agent and a move changes the pane, and neither changes it.
+    pub(super) fn handle_agent_launch_status(
+        &self,
+        id: String,
+        params: crate::api::schema::AgentLaunchStatusParams,
+    ) -> String {
+        use crate::api::schema::AgentLaunchState;
+
+        let token = params.launch_incarnation;
+        if !crate::terminal::launch_incarnation::is_canonical_token(&token) {
+            return encode_error(
+                id,
+                "invalid_launch_incarnation",
+                format!("{token:?} is not a launch incarnation"),
+            );
+        }
+        let Some(terminal_id) = self
+            .state
+            .terminals
+            .iter()
+            .find(|(_, terminal)| terminal.holds_launch(&token))
+            .map(|(terminal_id, _)| terminal_id.clone())
+        else {
+            return encode_success(
+                id,
+                ResponseResult::AgentLaunchStatus {
+                    launch_incarnation: token,
+                    state: AgentLaunchState::None,
+                    terminal_id: None,
+                    pane_id: None,
+                    agent: None,
+                },
+            );
+        };
+        let state = if self
+            .current_launch(terminal_id.as_str())
+            .is_some_and(|(current, _)| current == token)
+        {
+            AgentLaunchState::Attested
+        } else {
+            AgentLaunchState::Held
+        };
+        let shown = self
+            .terminal_targets()
+            .into_iter()
+            .find(|target| target.terminal_id == terminal_id.as_str());
+        let pane_id = shown
+            .as_ref()
+            .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id));
+        let agent = shown.and_then(|target| self.agent_info(target.ws_idx, target.pane_id));
+        encode_success(
+            id,
+            ResponseResult::AgentLaunchStatus {
+                launch_incarnation: token,
+                state,
+                terminal_id: Some(terminal_id.to_string()),
+                pane_id,
+                agent,
+            },
+        )
+    }
+
     /// The launch helper an admitted start typed claims that admission from
     /// its own process, read from the connection as `peer_ancestry` (the
     /// sender first). The nonce is spent by this first use whatever the
@@ -251,6 +314,11 @@ impl App {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
+        let target = params.target.clone();
+        let expected = params
+            .expected_launch_incarnation
+            .clone()
+            .unwrap_or_default();
         match self.queue_agent_prompt(request.id, params) {
             Ok((id, agent, completion)) => {
                 std::thread::spawn(move || {
@@ -264,6 +332,9 @@ impl App {
                         ),
                         Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                             encode_error(id, "timeout", err.to_string())
+                        }
+                        Ok(Err(err)) if guarded_submission_stop(&err).is_some() => {
+                            guarded_submission_response(id, &target, &expected, &err)
                         }
                         Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
                         Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
@@ -302,6 +373,26 @@ impl App {
             .cloned()
         else {
             return Err(agent_not_found(id, &params.target));
+        };
+        // Before anything else about the terminal: for a launch that is not
+        // this one, nothing else matters. Checked in the step that queues the
+        // prompt, so the launch cannot change in between, and from the process
+        // table read now, so a replacement detection has not seen is refused.
+        let guard = match params.expected_launch_incarnation.as_deref() {
+            None => None,
+            Some(expected) => {
+                let current = self.current_launch(terminal_id.as_str());
+                let Some((_, process)) = current.filter(|(token, _)| *token == expected) else {
+                    let current = current.map(|(token, _)| token);
+                    return Err(agent_prompt_launch_mismatch(
+                        id,
+                        &params.target,
+                        expected,
+                        current,
+                    ));
+                };
+                Some(process)
+            }
         };
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
@@ -380,7 +471,15 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
+            let queued = match guard {
+                Some(process) => runtime
+                    .queue_guarded_user_input(Bytes::from(focus), process)
+                    .map(drop),
+                None => runtime
+                    .try_send_bytes(Bytes::from(focus))
+                    .map_err(std::io::Error::other),
+            };
+            if let Err(err) = queued {
                 return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
             }
         }
@@ -403,6 +502,7 @@ impl App {
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
+                guard,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
@@ -733,6 +833,61 @@ fn agent_session_mismatch(
     encode_error(id, "agent_session_mismatch", message)
 }
 
+fn agent_prompt_launch_mismatch(
+    id: String,
+    target: &str,
+    expected: &str,
+    current: Option<&str>,
+) -> String {
+    let message = match current {
+        Some(current) => format!(
+            "agent {target} runs launch {current}, not the expected launch {expected}; nothing was typed"
+        ),
+        None => format!(
+            "agent {target} runs no attested launch, not the expected launch {expected}; nothing was typed"
+        ),
+    };
+    encode_error(id, "agent_launch_mismatch", message)
+}
+
+/// Why a guarded submission stopped, when `err` says one did.
+fn guarded_submission_stop(
+    err: &std::io::Error,
+) -> Option<crate::pty::actor::GuardedSubmissionStop> {
+    err.get_ref()?
+        .downcast_ref::<crate::pty::actor::GuardedSubmissionStop>()
+        .copied()
+}
+
+fn guarded_submission_response(
+    id: String,
+    target: &str,
+    expected: &str,
+    err: &std::io::Error,
+) -> String {
+    use crate::pty::actor::GuardedSubmissionStop;
+
+    match guarded_submission_stop(err) {
+        Some(GuardedSubmissionStop::NothingWritten) | None => {
+            agent_prompt_launch_mismatch(id, target, expected, None)
+        }
+        Some(GuardedSubmissionStop::TextPartlyWritten { written, total }) => encode_error(
+            id,
+            "agent_prompt_interrupted",
+            format!(
+                "agent {target} stopped running the expected launch {expected} while its prompt was typed; {written} of {total} bytes were written, the rest and Enter were not sent"
+            ),
+        ),
+        Some(GuardedSubmissionStop::EnterNotSent) => encode_error(
+            id,
+            "agent_prompt_interrupted",
+            format!(
+                "agent {target} stopped running the expected launch {expected} after its prompt was typed; Enter was not sent"
+            ),
+        ),
+    }
+}
+
 fn agent_launch_mismatch(
     id: String,
     target: &str,
@@ -827,6 +982,7 @@ mod tests {
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "A != B".into(),
                 wait: None,
             },
@@ -927,6 +1083,7 @@ mod tests {
             "req",
             AgentPromptParams {
                 target: public_pane_id,
+                expected_launch_incarnation: None,
                 text: "A != B".into(),
                 wait: None,
             },
@@ -956,6 +1113,7 @@ mod tests {
             "req-raw",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "A != B".into(),
                 wait: None,
             },
@@ -971,6 +1129,7 @@ mod tests {
             "req-label",
             AgentPromptParams {
                 target: "opencode".into(),
+                expected_launch_incarnation: None,
                 text: "wrong target".into(),
                 wait: None,
             },
@@ -998,6 +1157,7 @@ mod tests {
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "unrelated prompt".into(),
                 wait: None,
             },
@@ -1121,6 +1281,7 @@ contains = ["TEST-DRAFT"]
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "hello".into(),
                 wait: None,
             },
@@ -1145,6 +1306,7 @@ contains = ["TEST-DRAFT"]
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "hello".into(),
                 wait: None,
             },
@@ -1169,6 +1331,7 @@ contains = ["TEST-DRAFT"]
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "hello".into(),
                 wait: None,
             },
@@ -1211,6 +1374,7 @@ contains = ["TEST-DRAFT"]
             "req",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "A != B".into(),
                 wait: None,
             },
@@ -1502,6 +1666,7 @@ contains = ["TEST-DRAFT"]
             "req-pending",
             AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "A != B".into(),
                 wait: None,
             },

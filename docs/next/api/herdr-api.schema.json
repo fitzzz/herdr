@@ -1244,6 +1244,18 @@
           ],
           "type": "object"
         },
+        "AgentLaunchStatusParams": {
+          "description": "Asks what this server knows of one admitted launch, by its token alone.",
+          "properties": {
+            "launch_incarnation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "launch_incarnation"
+          ],
+          "type": "object"
+        },
         "AgentLauncher": {
           "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
           "properties": {
@@ -1272,6 +1284,13 @@
         },
         "AgentPromptParams": {
           "properties": {
+            "expected_launch_incarnation": {
+              "description": "The launch the caller expects the target to run: the\n`launch_incarnation` its `agent.start` or `agent.start_with_launcher`\nreply returned. When present, the server compares it, byte for byte,\nwith the target's current launch incarnation in the same step that\nqueues the prompt, and refuses with `agent_launch_mismatch`, typing\nnothing, when they differ or no launch is attested. The terminal writer\nproves the launch's process again before it writes the text and before\nit writes Enter; a check that fails after some of the text was written\nanswers `agent_prompt_interrupted`, and Enter is not sent. Advertised by\n`ServerCapabilities::agent_prompt_expected_launch_incarnation`; older\nservers ignore the field.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "target": {
               "type": "string"
             },
@@ -5633,6 +5652,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.launch_status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentLaunchStatusParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.attest_launch",
               "type": "string"
             },
@@ -6997,6 +7032,26 @@
             "revision"
           ],
           "type": "object"
+        },
+        "AgentLaunchState": {
+          "description": "What a server knows of an admitted launch, by its token.",
+          "oneOf": [
+            {
+              "const": "attested",
+              "description": "Its process is proved now: the terminal's agent process, leading the\nforeground. The reply's `agent` carries the token.",
+              "type": "string"
+            },
+            {
+              "const": "held",
+              "description": "A terminal keeps the launch and it is not proved now: not yet claimed\nor detected, carried by a live handoff the next server has not attested\nyet, or its process does not lead the foreground. It may be running.",
+              "type": "string"
+            },
+            {
+              "const": "none",
+              "description": "No terminal keeps it: its process exited, its pane closed or respawned,\nanother process or agent kind took the terminal, a new start was\nadmitted there, or this server never had it (a restart or restore does\nnot carry a launch; a live handoff does). A token is never reused, and\none in no terminal never comes back.",
+              "type": "string"
+            }
+          ]
         },
         "AgentLauncher": {
           "description": "A process-scoped launcher. Native agent arguments and identity stay separate.",
@@ -9949,6 +10004,51 @@
             {
               "properties": {
                 "agent": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The agent in that pane. It carries the token only when `state` is\n`attested`."
+                },
+                "launch_incarnation": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "description": "The pane showing that terminal now; a move changes it.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/AgentLaunchState"
+                },
+                "terminal_id": {
+                  "description": "The terminal keeping the launch; absent when `state` is `none`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "agent_launch_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "launch_incarnation",
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
                   "$ref": "#/schemas/success_response/$defs/AgentInfo"
                 },
                 "binding": {
@@ -10963,9 +11063,19 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_launch_status": {
+              "default": false,
+              "description": "Supports `agent.launch_status`, which answers by a launch's token alone.",
+              "type": "boolean"
+            },
             "agent_launcher": {
               "default": false,
               "description": "Managed launcher start and persisted recovery are both supported.",
+              "type": "boolean"
+            },
+            "agent_prompt_expected_launch_incarnation": {
+              "default": false,
+              "description": "`agent.prompt` honors `expected_launch_incarnation`: it refuses with\n`agent_launch_mismatch`, typing nothing, unless the target's current\nlaunch incarnation equals it. Older servers ignore the field and type.",
               "type": "boolean"
             },
             "agent_prompt_outcome": {

@@ -141,6 +141,8 @@ pub enum Method {
     AgentStartWithLauncher(AgentStartWithLauncherParams),
     #[serde(rename = "agent.launcher_info")]
     AgentLauncherInfo(AgentTarget),
+    #[serde(rename = "agent.launch_status")]
+    AgentLaunchStatus(AgentLaunchStatusParams),
     #[serde(rename = "agent.attest_launch")]
     AgentAttestLaunch(AgentAttestLaunchParams),
     #[serde(rename = "agent.prompt")]

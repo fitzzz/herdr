@@ -436,6 +436,8 @@ mod tests {
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
                 agent_send_keys_expected_launch_incarnation: false,
+                agent_prompt_expected_launch_incarnation: false,
+                agent_launch_status: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),

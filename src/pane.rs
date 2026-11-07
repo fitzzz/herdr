@@ -1534,7 +1534,7 @@ enum PaneRuntimeIo {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
         /// The process a test makes lead the foreground; none by default.
-        foreground: Mutex<Option<crate::platform::ProcessInstance>>,
+        foreground: Arc<Mutex<Option<crate::platform::ProcessInstance>>>,
     },
 }
 
@@ -1736,20 +1736,48 @@ impl PaneRuntimeIo {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                {
+                    if guard.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "guarded writes need a terminal with process groups",
+                        ));
+                    }
+                    return actor.queue_user_input_submission(text, enter, delay, deadline);
+                }
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    match guard {
+                        Some(process) => {
+                            actor.queue_guarded_user_input_submission(text, enter, delay, process)
+                        }
+                        None => actor.queue_user_input_submission(text, enter, delay),
+                    }
                 }
             }
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => {
+            PaneRuntimeIo::TestChannel {
+                sender, foreground, ..
+            } => {
                 let _ = deadline;
+                // Checked when each write happens, as the PTY actor does.
+                let foreground = foreground.clone();
+                let leads = move || {
+                    guard.is_none_or(|process| {
+                        crate::terminal::launch_incarnation::leads_foreground(
+                            process,
+                            *foreground
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        )
+                    })
+                };
                 if sender.capacity() == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -1758,6 +1786,12 @@ impl PaneRuntimeIo {
                 }
                 let sender = sender.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                if !leads() {
+                    let _ = reply_tx.send(Err(std::io::Error::other(
+                        crate::pty::actor::GuardedSubmissionStop::NothingWritten,
+                    )));
+                    return Ok(reply_rx);
+                }
                 if delay.is_zero() {
                     // Like the PTY actor, zero-delay submissions complete in
                     // queue order.
@@ -1774,6 +1808,11 @@ impl PaneRuntimeIo {
                         .map_err(std::io::Error::other)
                         .and_then(|()| {
                             std::thread::sleep(delay);
+                            if !leads() {
+                                return Err(std::io::Error::other(
+                                    crate::pty::actor::GuardedSubmissionStop::EnterNotSent,
+                                ));
+                            }
                             sender.try_send(enter).map_err(std::io::Error::other)
                         });
                     let _ = reply_tx.send(result);
@@ -3826,9 +3865,10 @@ impl PaneRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(text, enter, delay, deadline, guard)
     }
 
     /// Queues `bytes` to be written only while `process` leads the pane's
@@ -4205,7 +4245,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
-                    foreground: Mutex::new(None),
+                    foreground: Arc::new(Mutex::new(None)),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -5582,7 +5622,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
-                foreground: Mutex::new(None),
+                foreground: Arc::new(Mutex::new(None)),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5624,7 +5664,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
-                foreground: Mutex::new(None),
+                foreground: Arc::new(Mutex::new(None)),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),

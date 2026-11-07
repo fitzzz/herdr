@@ -233,8 +233,46 @@ pub struct AgentStartWithLauncherParams {
 pub struct AgentPromptParams {
     pub target: String,
     pub text: String,
+    /// The launch the caller expects the target to run: the
+    /// `launch_incarnation` its `agent.start` or `agent.start_with_launcher`
+    /// reply returned. When present, the server compares it, byte for byte,
+    /// with the target's current launch incarnation in the same step that
+    /// queues the prompt, and refuses with `agent_launch_mismatch`, typing
+    /// nothing, when they differ or no launch is attested. The terminal writer
+    /// proves the launch's process again before it writes the text and before
+    /// it writes Enter; a check that fails after some of the text was written
+    /// answers `agent_prompt_interrupted`, and Enter is not sent. Advertised by
+    /// `ServerCapabilities::agent_prompt_expected_launch_incarnation`; older
+    /// servers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_launch_incarnation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+}
+
+/// Asks what this server knows of one admitted launch, by its token alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentLaunchStatusParams {
+    pub launch_incarnation: String,
+}
+
+/// What a server knows of an admitted launch, by its token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLaunchState {
+    /// Its process is proved now: the terminal's agent process, leading the
+    /// foreground. The reply's `agent` carries the token.
+    Attested,
+    /// A terminal keeps the launch and it is not proved now: not yet claimed
+    /// or detected, carried by a live handoff the next server has not attested
+    /// yet, or its process does not lead the foreground. It may be running.
+    Held,
+    /// No terminal keeps it: its process exited, its pane closed or respawned,
+    /// another process or agent kind took the terminal, a new start was
+    /// admitted there, or this server never had it (a restart or restore does
+    /// not carry a launch; a live handoff does). A token is never reused, and
+    /// one in no terminal never comes back.
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

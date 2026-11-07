@@ -142,6 +142,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         id: "prompt".into(),
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
+            expected_launch_incarnation: None,
             text: "review this".into(),
             wait: None,
         }),
@@ -157,6 +158,7 @@ fn agent_start_and_prompt_requests_round_trip() {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
+            expected_launch_incarnation: None,
             text: "review this".into(),
             wait: Some(AgentPromptWaitOptions {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
@@ -783,6 +785,8 @@ fn success_response_round_trips() {
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
                 agent_send_keys_expected_launch_incarnation: false,
+                agent_prompt_expected_launch_incarnation: false,
+                agent_launch_status: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),

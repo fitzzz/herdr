@@ -993,3 +993,316 @@ async fn a_start_the_shell_resolves_itself_stays_unattested() {
     assert_refused(&guarded, "agent_launch_mismatch", &mut rx);
     assert_written(&send_esc(&mut app, &launch, serde_json::json!({})), &mut rx);
 }
+
+/// Prompts through the handler the server dispatches `agent.prompt` to.
+fn prompt(
+    app: &mut App,
+    launch: &Launch,
+    guard: Option<&str>,
+) -> std::sync::mpsc::Receiver<String> {
+    let mut params = serde_json::json!({"target": launch.public_pane, "text": "hello"});
+    if let Some(guard) = guard {
+        params["expected_launch_incarnation"] = serde_json::json!(guard);
+    }
+    let json = serde_json::json!({"id": "prompt", "method": "agent.prompt", "params": params});
+    let request: Request = serde_json::from_str(&json.to_string()).expect("a valid request");
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(app.handle_deferred_agent_api_request(request, respond_to));
+    response
+}
+
+fn answered(response: &std::sync::mpsc::Receiver<String>) -> serde_json::Value {
+    serde_json::from_str(
+        &response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the prompt is answered"),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_guarded_prompt_is_typed_and_submitted_for_its_own_launch() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Claude);
+    foreground(&app, &launch, Some(process(4242, 7)));
+
+    let response = answered(&prompt(&mut app, &launch, Some(&launch.token.clone())));
+
+    assert_eq!(response["result"]["type"], "agent_prompted", "{response}");
+    assert!(rx.try_recv().is_ok(), "the text was typed");
+    assert!(rx.try_recv().is_ok(), "and submitted");
+}
+
+#[tokio::test]
+async fn a_prompt_guarded_for_another_launch_types_nothing() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Claude);
+    foreground(&app, &launch, Some(process(4242, 7)));
+
+    let other = format!("launch_{}", "0".repeat(32));
+    for guard in [
+        other.as_str(),
+        // Strictly the token: nothing is trimmed or folded.
+        &format!(" {}", launch.token),
+        &launch.token.to_uppercase(),
+        "",
+    ] {
+        let response = answered(&prompt(&mut app, &launch, Some(guard)));
+        assert_eq!(
+            response["error"]["code"], "agent_launch_mismatch",
+            "{guard:?}: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was typed"),
+            "{response}"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "a refusal types nothing");
+}
+
+#[tokio::test]
+async fn a_prompt_guarded_for_a_launch_that_left_the_foreground_types_nothing() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Claude);
+    let token = launch.token.clone();
+
+    // A replacement the shell started leads the foreground, before detection saw it.
+    foreground(&app, &launch, Some(process(4243, 8)));
+    let response = answered(&prompt(&mut app, &launch, Some(&token)));
+    assert_eq!(
+        response["error"]["code"], "agent_launch_mismatch",
+        "{response}"
+    );
+
+    // No foreground could be read: that proves nothing.
+    foreground(&app, &launch, None);
+    let response = answered(&prompt(&mut app, &launch, Some(&token)));
+    assert_eq!(
+        response["error"]["code"], "agent_launch_mismatch",
+        "{response}"
+    );
+
+    // Its process exited: the token is gone for good.
+    foreground(&app, &launch, Some(process(4242, 7)));
+    exit(&mut app, &launch, Agent::Claude);
+    let response = answered(&prompt(&mut app, &launch, Some(&token)));
+    assert_eq!(
+        response["error"]["code"], "agent_launch_mismatch",
+        "{response}"
+    );
+
+    assert!(rx.try_recv().is_err(), "a refusal types nothing");
+}
+
+#[tokio::test]
+async fn a_launch_lost_between_the_text_and_the_enter_gets_no_enter() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Claude);
+    foreground(&app, &launch, Some(process(4242, 7)));
+
+    let response = prompt(&mut app, &launch, Some(&launch.token.clone()));
+    assert!(rx.recv().await.is_some(), "the text is typed first");
+    // During the delay before Enter another process takes the foreground.
+    foreground(&app, &launch, Some(process(4243, 8)));
+
+    let response = answered(&response);
+    assert_eq!(
+        response["error"]["code"], "agent_prompt_interrupted",
+        "{response}"
+    );
+    assert!(rx.try_recv().is_err(), "no Enter was written");
+}
+
+#[tokio::test]
+async fn an_unguarded_prompt_is_written_as_before() {
+    let mut app = app();
+    let (launch, mut rx) = attested(&mut app, Agent::Claude);
+    // Whoever leads the foreground: no launch was asked for.
+    foreground(&app, &launch, Some(process(4243, 8)));
+
+    let response = answered(&prompt(&mut app, &launch, None));
+
+    assert_eq!(response["result"]["type"], "agent_prompted", "{response}");
+    assert!(rx.try_recv().is_ok());
+    assert!(rx.try_recv().is_ok());
+}
+
+/// What `agent.launch_status` answers for `token`.
+fn launch_status(app: &mut App, token: &str) -> serde_json::Value {
+    request(
+        app,
+        serde_json::json!({"id": "status", "method": "agent.launch_status",
+                           "params": {"launch_incarnation": token}}),
+    )
+}
+
+#[tokio::test]
+async fn launch_status_finds_an_attested_launch_by_its_token_alone() {
+    let mut app = app();
+    let (launch, _rx) = attested(&mut app, Agent::Claude);
+    foreground(&app, &launch, Some(process(4242, 7)));
+
+    let reply = launch_status(&mut app, &launch.token);
+
+    let result = &reply["result"];
+    assert_eq!(result["type"], "agent_launch_status", "{reply}");
+    assert_eq!(result["launch_incarnation"], launch.token.as_str());
+    assert_eq!(result["state"], "attested");
+    assert_eq!(result["terminal_id"], launch.terminal_id.as_str());
+    assert_eq!(result["pane_id"], launch.public_pane.as_str());
+    assert_eq!(result["agent"]["launch_incarnation"], launch.token.as_str());
+    assert_eq!(result["agent"]["agent_status"], "idle");
+}
+
+#[tokio::test]
+async fn launch_status_follows_the_launch_when_its_name_goes() {
+    let mut app = app();
+    let (launch, _rx) = attested(&mut app, Agent::Claude);
+    foreground(&app, &launch, Some(process(4242, 7)));
+
+    let renamed = request(
+        &mut app,
+        serde_json::json!({"id": "rename", "method": "agent.rename",
+                           "params": {"target": launch.public_pane, "name": "elsewhere"}}),
+    );
+    assert_eq!(renamed["result"]["agent"]["name"], "elsewhere", "{renamed}");
+
+    let reply = launch_status(&mut app, &launch.token);
+    assert_eq!(reply["result"]["state"], "attested", "{reply}");
+    assert_eq!(reply["result"]["agent"]["name"], "elsewhere");
+}
+
+#[tokio::test]
+async fn launch_status_says_held_while_a_terminal_keeps_a_launch_it_cannot_attest_now() {
+    let mut app = app();
+    let (launch, _rx) = start(&mut app, "worker", "claude", &[]);
+
+    // Admitted, before any claim.
+    let reply = launch_status(&mut app, &launch.token);
+    assert_eq!(reply["result"]["state"], "held", "{reply}");
+    assert_eq!(reply["result"]["terminal_id"], launch.terminal_id.as_str());
+    assert_eq!(reply["result"]["pane_id"], launch.public_pane.as_str());
+
+    // Claimed, before detection saw the process.
+    let claimed = claim(
+        &mut app,
+        &launch,
+        &launch.nonce,
+        Some((process(4242, 7), SHELL)),
+    );
+    assert_eq!(claimed["result"]["type"], "ok", "{claimed}");
+    assert_eq!(
+        launch_status(&mut app, &launch.token)["result"]["state"],
+        "held"
+    );
+
+    // Attested, and not leading the foreground: not gone.
+    observe(&mut app, &launch, Agent::Claude, process(4242, 7));
+    foreground(&app, &launch, Some(process(4300, 9)));
+    let reply = launch_status(&mut app, &launch.token);
+    assert_eq!(reply["result"]["state"], "held", "{reply}");
+    assert_eq!(
+        reply["result"]["agent"]["launch_incarnation"],
+        serde_json::Value::Null
+    );
+
+    foreground(&app, &launch, Some(process(4242, 7)));
+    assert_eq!(
+        launch_status(&mut app, &launch.token)["result"]["state"],
+        "attested"
+    );
+}
+
+#[tokio::test]
+async fn launch_status_says_none_once_no_terminal_holds_the_launch() {
+    // Its process exited.
+    let mut first = app();
+    let (launch, _rx) = attested(&mut first, Agent::Claude);
+    exit(&mut first, &launch, Agent::Claude);
+    let reply = launch_status(&mut first, &launch.token);
+    assert_eq!(reply["result"]["state"], "none", "{reply}");
+    assert_eq!(reply["result"]["pane_id"], serde_json::Value::Null);
+
+    // Its pane closed.
+    let mut second = app();
+    let (launch, _rx) = attested(&mut second, Agent::Claude);
+    let closed = request(
+        &mut second,
+        serde_json::json!({"id": "close", "method": "pane.close",
+                           "params": {"pane_id": launch.public_pane}}),
+    );
+    assert_eq!(closed["result"]["type"], "ok", "{closed}");
+    assert_eq!(
+        launch_status(&mut second, &launch.token)["result"]["state"],
+        "none"
+    );
+
+    // A later start took the terminal.
+    let mut third = app();
+    let (launch, _rx) = attested(&mut third, Agent::Claude);
+    let (later, _nonce) =
+        crate::terminal::launch_incarnation::LaunchIncarnation::admit(Agent::Claude);
+    third
+        .state
+        .terminals
+        .get_mut(&launch.terminal_id)
+        .unwrap()
+        .admit_launch_incarnation(Some(later));
+    assert_eq!(
+        launch_status(&mut third, &launch.token)["result"]["state"],
+        "none"
+    );
+
+    // A token no launch of this server ever had.
+    let mut fourth = app();
+    let unknown = format!("launch_{}", "0".repeat(32));
+    assert_eq!(
+        launch_status(&mut fourth, &unknown)["result"]["state"],
+        "none"
+    );
+}
+
+#[tokio::test]
+async fn launch_status_refuses_what_is_not_a_token() {
+    let mut app = app();
+    for value in [
+        "",
+        "launch_",
+        "LAUNCH_00000000000000000000000000000000",
+        " launch_00000000000000000000000000000000",
+    ] {
+        let reply = launch_status(&mut app, value);
+        assert_eq!(
+            reply["error"]["code"], "invalid_launch_incarnation",
+            "{value:?}: {reply}"
+        );
+    }
+}
+
+#[test]
+fn a_launch_carried_by_a_live_handoff_is_held_before_the_next_server_attests_it() {
+    let mut old = crate::terminal::TerminalState::new(
+        crate::terminal::TerminalId::alloc(),
+        std::path::PathBuf::from("/"),
+    );
+    let (launch, _nonce) =
+        crate::terminal::launch_incarnation::LaunchIncarnation::admit(Agent::Codex);
+    let token = launch.token().to_string();
+    old.admit_launch_incarnation(Some(launch));
+    old.claim_launch_incarnation(process(4242, 7), SHELL, Some(SHELL))
+        .unwrap();
+    old.observe_agent_process(Agent::Codex, process(4242, 7));
+
+    let mut next = crate::terminal::TerminalState::new(
+        crate::terminal::TerminalId::alloc(),
+        std::path::PathBuf::from("/"),
+    );
+    assert!(!next.holds_launch(&token));
+    next.restore_handoff_launch_incarnation(old.handoff_launch_incarnation().unwrap());
+
+    assert_eq!(next.launch_incarnation(), None, "not attested yet");
+    assert!(next.holds_launch(&token), "and not gone either");
+}

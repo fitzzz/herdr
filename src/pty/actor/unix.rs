@@ -84,6 +84,9 @@ enum PtyIoDataCommand {
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        /// Each write of the submission, the text and Enter, happens only
+        /// while this process still leads the terminal's foreground.
+        guard: Option<crate::platform::ProcessInstance>,
         reply: std_mpsc::Sender<std::io::Result<()>>,
     },
 }
@@ -192,6 +195,29 @@ impl PtyIoActorHandle {
         enter: Bytes,
         delay: Duration,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, None)
+    }
+
+    /// As [`Self::queue_user_input_submission`], with each write made only
+    /// while `process` leads the terminal's foreground; the receiver's error
+    /// then carries a [`super::GuardedSubmissionStop`].
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        process: crate::platform::ProcessInstance,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_submission(text, enter, delay, Some(process))
+    }
+
+    fn queue_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        guard: Option<crate::platform::ProcessInstance>,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
             .lock()
@@ -208,6 +234,7 @@ impl PtyIoActorHandle {
                 text,
                 enter,
                 delay,
+                guard,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -517,6 +544,7 @@ struct PtyIoActorRunner {
 struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
+    guard: Option<crate::platform::ProcessInstance>,
     phase: SubmissionPhase,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
@@ -733,6 +761,7 @@ impl PtyIoActorRunner {
                 text,
                 enter,
                 delay,
+                guard,
                 reply,
             } => {
                 if self.state == ActorState::Running {
@@ -745,6 +774,7 @@ impl PtyIoActorRunner {
                     self.active_submission = Some(ActiveSubmission {
                         enter,
                         delay,
+                        guard,
                         phase,
                         reply,
                     });
@@ -1023,6 +1053,37 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
+            // So is each write of a guarded submission: a failed check ends
+            // the submission, so its Enter never follows text meant for
+            // another process.
+            if let (Some(boundary), Some(process)) = (
+                write.boundary,
+                self.active_submission
+                    .as_ref()
+                    .and_then(|active| active.guard),
+            ) {
+                let leader =
+                    crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd())
+                        .and_then(crate::terminal::launch_incarnation::group_leader);
+                if !crate::terminal::launch_incarnation::leads_foreground(process, leader) {
+                    let stopped = self.pending_writes.pop_front().unwrap();
+                    let written = std::mem::take(&mut self.current_write_offset);
+                    let stop = match boundary {
+                        SubmissionBoundary::Enter => super::GuardedSubmissionStop::EnterNotSent,
+                        SubmissionBoundary::Text if written == 0 => {
+                            super::GuardedSubmissionStop::NothingWritten
+                        }
+                        SubmissionBoundary::Text => {
+                            super::GuardedSubmissionStop::TextPartlyWritten {
+                                written,
+                                total: stopped.bytes.len(),
+                            }
+                        }
+                    };
+                    self.fail_active_submission(std::io::Error::other(stop));
+                    continue;
+                }
+            }
             // A guarded write is checked before every write attempt, a
             // continuation after a short write included: the process it was
             // meant for must still lead the foreground. A failed check stops
@@ -1327,6 +1388,102 @@ mod tests {
             Ok(super::super::GuardedWrite::Written)
         );
         assert!(runner.pending_writes.is_empty());
+
+        unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
+        shell.kill().ok();
+        shell.wait().ok();
+    }
+
+    /// A guarded submission proves its process before the text and again before
+    /// Enter: a job that takes the foreground during the delay gets no Enter,
+    /// and one that leads it before the text gets nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guarded_submission_writes_each_step_only_while_its_process_leads_the_foreground() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("pty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "set -m; sleep 1000; sleep 1000"]);
+        let mut shell = pair.slave.spawn_command(cmd).expect("shell");
+        let shell_pid = shell.process_id().expect("shell pid");
+        let master = pair.master.as_raw_fd().expect("master fd");
+        let owned = unsafe { OwnedFd::from_raw_fd(libc::dup(master)) };
+        let mut runner = actor_runner_for_fd(owned);
+        let fd = runner.file.as_raw_fd();
+        let first = foreground_leader_once(fd, |leader| leader.pid != shell_pid);
+
+        let submit = |runner: &mut PtyIoActorRunner, process, delay| {
+            let (reply, outcome) = std_mpsc::channel();
+            runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+                text: Bytes::from_static(b"text"),
+                enter: Bytes::from_static(b"\r"),
+                delay,
+                guard: Some(process),
+                reply,
+            });
+            outcome
+        };
+        let stop_of = |outcome: &std_mpsc::Receiver<std::io::Result<()>>| {
+            outcome
+                .try_recv()
+                .expect("answered")
+                .expect_err("stopped")
+                .get_ref()
+                .and_then(|err| err.downcast_ref::<super::super::GuardedSubmissionStop>())
+                .copied()
+        };
+
+        // Its process leads throughout: the text, then Enter.
+        let outcome = submit(&mut runner, first, Duration::ZERO);
+        assert_eq!(
+            runner.flush_pending_writes_once().unwrap(),
+            Some(SubmissionBoundary::Text)
+        );
+        runner.complete_submission_boundary(SubmissionBoundary::Text);
+        runner.schedule_submission_enter();
+        assert_eq!(
+            runner.flush_pending_writes_once().unwrap(),
+            Some(SubmissionBoundary::Enter)
+        );
+        runner.complete_submission_boundary(SubmissionBoundary::Enter);
+        assert!(outcome.try_recv().expect("answered").is_ok());
+
+        // The text is written, then another job takes the foreground.
+        let outcome = submit(&mut runner, first, Duration::ZERO);
+        assert_eq!(
+            runner.flush_pending_writes_once().unwrap(),
+            Some(SubmissionBoundary::Text)
+        );
+        runner.complete_submission_boundary(SubmissionBoundary::Text);
+        unsafe { libc::kill(first.pid as libc::pid_t, libc::SIGKILL) };
+        let second = foreground_leader_once(fd, |leader| {
+            leader.pid != shell_pid && leader.pid != first.pid
+        });
+        runner.schedule_submission_enter();
+        assert_eq!(runner.flush_pending_writes_once().unwrap(), None);
+        assert_eq!(
+            stop_of(&outcome),
+            Some(super::super::GuardedSubmissionStop::EnterNotSent)
+        );
+        assert!(runner.active_submission.is_none());
+        assert!(runner.pending_writes.is_empty());
+
+        // Another job leads before the text: nothing is written.
+        let outcome = submit(&mut runner, first, Duration::ZERO);
+        assert_eq!(runner.flush_pending_writes_once().unwrap(), None);
+        assert_eq!(
+            stop_of(&outcome),
+            Some(super::super::GuardedSubmissionStop::NothingWritten)
+        );
+        assert!(runner.active_submission.is_none());
 
         unsafe { libc::kill(second.pid as libc::pid_t, libc::SIGKILL) };
         shell.kill().ok();

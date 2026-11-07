@@ -127,6 +127,20 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_incarnation: Option<String>,
     },
+    AgentLaunchStatus {
+        launch_incarnation: String,
+        state: super::agents::AgentLaunchState,
+        /// The terminal keeping the launch; absent when `state` is `none`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_id: Option<String>,
+        /// The pane showing that terminal now; a move changes it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        /// The agent in that pane. It carries the token only when `state` is
+        /// `attested`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentInfo>,
+    },
     AgentLauncherInfo {
         agent: AgentInfo,
         binding: Option<crate::agent_launcher::BoundAgentLauncher>,

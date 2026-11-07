@@ -884,6 +884,7 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:prompt".into(),
         method: Method::AgentPrompt(AgentPromptParams {
             target: target.clone(),
+            expected_launch_incarnation: None,
             text: text.clone(),
             wait: wait.then_some(AgentPromptWaitOptions {
                 until,

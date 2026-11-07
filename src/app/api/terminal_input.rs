@@ -224,6 +224,7 @@ impl App {
                     Bytes::new(),
                     Duration::ZERO,
                     None,
+                    None,
                 ) {
                     Ok(completion) => completion,
                     Err(err) => {

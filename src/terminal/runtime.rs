@@ -511,9 +511,10 @@ impl TerminalRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::platform::ProcessInstance>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(text, enter, delay, deadline, guard)
     }
 
     pub(crate) fn paste_payload(&self, text: String) -> bytes::Bytes {

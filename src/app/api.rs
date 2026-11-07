@@ -1100,6 +1100,9 @@ impl App {
             Method::AgentLauncherInfo(target) => {
                 return self.handle_agent_launcher_info(request.id, target)
             }
+            Method::AgentLaunchStatus(params) => {
+                return self.handle_agent_launch_status(request.id, params)
+            }
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,

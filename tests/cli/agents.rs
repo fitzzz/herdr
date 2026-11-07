@@ -1883,3 +1883,138 @@ fn attest_launch_helper_execs_the_resolved_path_with_the_typed_argv0() {
     );
     fs::remove_dir_all(base).unwrap();
 }
+
+/// Through the real server and a real PTY: `agent.prompt` guarded by a launch
+/// types only for that launch, and `agent.launch_status` answers by the token
+/// alone, until no terminal keeps it.
+#[cfg(unix)]
+#[test]
+fn a_prompt_guarded_by_its_launch_reaches_only_it_and_launch_status_follows_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let lines = base.join("pi-lines");
+    let pids = base.join("pi-pids");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\necho $$ >> '{pids}'\nexport HERDR_AGENT=pi\n'{herdr}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\n  printf 'line:%s\\n' \"$line\" >> '{lines}'\ndone\n",
+            pids = pids.display(),
+            herdr = env!("CARGO_BIN_EXE_herdr"),
+            lines = lines.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let capabilities = send_request(&socket_path, r#"{"id":"ping","method":"ping","params":{}}"#);
+    let capabilities = &capabilities["result"]["capabilities"];
+    assert_eq!(
+        capabilities["agent_prompt_expected_launch_incarnation"],
+        true
+    );
+    assert_eq!(capabilities["agent_launch_status"], true);
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+        ],
+    );
+    assert_eq!(started["result"]["type"], "agent_started", "{started}");
+    let token = started["result"]["launch_incarnation"]
+        .as_str()
+        .expect("the start reply carries the launch incarnation")
+        .to_string();
+    let status = || {
+        send_request(
+            &socket_path,
+            &serde_json::json!({"id": "status", "method": "agent.launch_status",
+                                "params": {"launch_incarnation": token}})
+            .to_string(),
+        )
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            status()["result"]["state"] == "attested"
+        }),
+        "agent.launch_status attests the started launch"
+    );
+    let attested = status();
+    assert_eq!(
+        attested["result"]["pane_id"],
+        pane_id.as_str(),
+        "{attested}"
+    );
+    assert_eq!(attested["result"]["agent"]["name"], "worker", "{attested}");
+
+    let prompt = |expected: &str| {
+        send_request(
+            &socket_path,
+            &serde_json::json!({"id": "prompt", "method": "agent.prompt",
+                                "params": {"target": "worker", "text": "hello",
+                                           "expected_launch_incarnation": expected,
+                                           "wait": {"timeout_ms": 1000}}})
+            .to_string(),
+        )
+    };
+    let wrong = prompt("launch_00000000000000000000000000000000");
+    assert_eq!(wrong["error"]["code"], "agent_launch_mismatch", "{wrong}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        fs::read_to_string(&lines).is_err(),
+        "a refused prompt types nothing"
+    );
+
+    // Whatever its acceptance evidence says, it reached the launch and was submitted.
+    prompt(&token);
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            fs::read_to_string(&lines).is_ok_and(|text| text.contains("hello"))
+        }),
+        "the guarded prompt reached its launch"
+    );
+
+    // The launch's process exits: no terminal keeps it, and nothing brings it back.
+    for args in [
+        ["pane", "send-text", &pane_id, "quit"],
+        ["pane", "send-keys", &pane_id, "enter"],
+    ] {
+        let output = run_cli(&socket_path, &args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            status()["result"]["state"] == "none"
+        }),
+        "agent.launch_status says no terminal keeps it"
+    );
+    let stale = prompt(&token);
+    // The name may outlive its launch in the pane; the guard is what refuses.
+    assert_eq!(stale["error"]["code"], "agent_launch_mismatch", "{stale}");
+    cleanup_spawned_herdr(herdr, base);
+}

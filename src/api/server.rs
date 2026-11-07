@@ -86,6 +86,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         agent_prompt_outcome: true,
         agent_send_keys_expected_session: true,
         agent_send_keys_expected_launch_incarnation: true,
+        agent_prompt_expected_launch_incarnation: true,
+        agent_launch_status: true,
         terminal_attach_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()
@@ -648,6 +650,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartWithLauncher(_) => "agent.start_with_launcher",
         Method::AgentLauncherInfo(_) => "agent.launcher_info",
+        Method::AgentLaunchStatus(_) => "agent.launch_status",
         Method::AgentAttestLaunch(_) => "agent.attest_launch",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
@@ -1157,6 +1160,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
                 target: "reviewer".into(),
+                expected_launch_incarnation: None,
                 text: "review this".into(),
                 wait: None,
             }),
@@ -1539,6 +1543,8 @@ mod tests {
                 agent_prompt_outcome: false,
                 agent_send_keys_expected_session: false,
                 agent_send_keys_expected_launch_incarnation: false,
+                agent_prompt_expected_launch_incarnation: false,
+                agent_launch_status: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),
