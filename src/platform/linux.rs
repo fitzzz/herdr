@@ -1346,6 +1346,13 @@ mod tests {
         for partial in [
             b"".to_vec(),
             b"4242 (sleep) S 1 2".to_vec(),
+            // EOF partway through start time 987654 must not become start 987.
+            b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987".to_vec(),
+            // EOF right after all its digits: nothing shows the field ended.
+            b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654".to_vec(),
+            // The kernel writes digits only; a sign is not its start time.
+            b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 +987654 1"
+                .to_vec(),
             b"4242 (sleep".to_vec(),
             b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 x 1".to_vec(),
         ] {
@@ -1356,6 +1363,18 @@ mod tests {
                 String::from_utf8_lossy(&partial)
             );
         }
+        // A complete start time followed by its delimiter is read, even when the
+        // read stops there.
+        assert_eq!(
+            identity_from_stat_read(
+                Ok(
+                    b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 "
+                        .to_vec()
+                ),
+                || true
+            ),
+            Running { started: 987654 }
+        );
         // A name that is not UTF-8, or holds ") " itself, still names its start.
         for comm in [b"sleep-\xff".as_slice(), b"a) b (c", b"sleep"] {
             assert_eq!(
