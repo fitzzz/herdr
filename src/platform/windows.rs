@@ -2397,6 +2397,12 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
     stream.peer_creds().ok()?.pid()
 }
 
+/// This platform gives no boot identity Herdr reads, so a restore tells a
+/// launch's process gone by its id and start time alone.
+pub(crate) fn boot_id() -> Option<String> {
+    None
+}
+
 /// A process, when it started and the id of its parent; Windows has no
 /// process groups. A process that started after the cached snapshot, such as
 /// the CLI that sent a report, is read from a fresh one.

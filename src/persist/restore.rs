@@ -2647,6 +2647,8 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            launch: None,
+                            ended_launches: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -2730,6 +2732,8 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                launch: None,
+                                ended_launches: Vec::new(),
                             },
                         ),
                         (
@@ -2743,6 +2747,8 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                launch: None,
+                                ended_launches: Vec::new(),
                             },
                         ),
                     ]),
@@ -2798,6 +2804,8 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    launch: None,
+                    ended_launches: Vec::new(),
                 },
             )
         };
@@ -2818,6 +2826,8 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            launch: None,
+            ended_launches: Vec::new(),
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2974,6 +2984,8 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            launch: None,
+                            ended_launches: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -3075,6 +3087,8 @@ mod tests {
                             agent_resume: None,
                             launch_argv: None,
                             agent_launcher: None,
+                            launch: None,
+                            ended_launches: Vec::new(),
                         },
                     )]),
                     zoomed: false,
@@ -3696,6 +3710,254 @@ mod tests {
         assert_eq!(terminal.launch_incarnation(), None);
     }
 
+    /// The pane's terminal after a cold restore of `snapshot`, with what that
+    /// restore's next save records.
+    #[cfg(unix)]
+    fn cold_restored(snapshot: &SessionSnapshot) -> (TerminalState, SessionSnapshot) {
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, terminals, runtimes) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        drop(runtimes);
+        (terminals.into_values().next().unwrap(), saved)
+    }
+
+    /// What the next save records once `record` ran on the pane's terminal
+    /// after a cold restore of `snapshot`.
+    #[cfg(unix)]
+    fn saved_after(
+        snapshot: &SessionSnapshot,
+        record: impl FnOnce(&mut TerminalState),
+    ) -> SessionSnapshot {
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, mut terminals, runtimes) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        record(terminals.values_mut().next().unwrap());
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let saved = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        drop(runtimes);
+        saved
+    }
+
+    #[cfg(unix)]
+    fn reserialized(snapshot: &SessionSnapshot) -> SessionSnapshot {
+        serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn saved_pane(snapshot: &SessionSnapshot) -> &super::super::snapshot::PaneSnapshot {
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn saved_pane_mut(snapshot: &mut SessionSnapshot) -> &mut super::super::snapshot::PaneSnapshot {
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap()
+    }
+
+    /// The review's counterexample at the producer: Herdr revokes a launch on
+    /// an exit it may have misread while the process runs on, and a live
+    /// handoff then carries nothing for it. Neither is evidence that the
+    /// process is gone, so the token is never `ended_at_restore`: not after
+    /// the handoff, and not after a cold restore of a save made after the
+    /// revocation.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_live_handoff_after_a_revoked_token_never_answers_ended_at_restore() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let revoke = |terminal: &mut TerminalState| {
+            let token = attested_launch_with_binding(terminal);
+            // An observed exit the process outlives (the state model's
+            // mistaken-exit case): the token is revoked for good.
+            let _ = terminal.set_detected_state_with_screen_signals_at(
+                Some(crate::detect::Agent::Codex),
+                AgentState::Idle,
+                false,
+                false,
+                false,
+                true,
+                std::time::Instant::now(),
+            );
+            assert!(!terminal.holds_launch(&token), "the exit revoked it");
+            token
+        };
+        let mut token = String::new();
+        let terminal = handed_off(&snapshot, |terminal| token = revoke(terminal)).await;
+        assert!(!terminal.holds_launch(&token));
+        assert_eq!(
+            terminal.ended_launch(&token),
+            None,
+            "a handoff proves no end"
+        );
+        assert!(terminal.ended_launches().is_empty());
+
+        let mut token = String::new();
+        let saved = saved_after(&snapshot, |terminal| token = revoke(terminal));
+        assert_eq!(
+            saved_pane(&saved).launch,
+            None,
+            "a revoked launch is not saved"
+        );
+        let (terminal, _) = cold_restored(&saved);
+        assert_eq!(terminal.ended_launch(&token), None);
+    }
+
+    /// A save records the launch bound to the pane's process; a cold restore
+    /// that finds that process gone records it ended, with the evidence, and
+    /// later saves, restores and live handoffs keep that record.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_cold_restore_records_a_saved_bound_launch_whose_process_is_gone() {
+        use crate::api::schema::LaunchEndEvidence;
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let mut token = String::new();
+        let saved = saved_after(&snapshot, |terminal| {
+            token = attested_launch_with_binding(terminal);
+        });
+        let launch = saved_pane(&saved)
+            .launch
+            .clone()
+            .expect("the bound launch is saved");
+        assert_eq!(launch.incarnation, token);
+        assert_eq!((launch.process_id, launch.process_started), (4242, 7));
+        assert_eq!(launch.boot_id, crate::platform::boot_id());
+
+        // No process 4242 started at tick 7 in this boot.
+        let mut absent = reserialized(&saved);
+        saved_pane_mut(&mut absent).launch =
+            Some(crate::terminal::launch_incarnation::SavedLaunch {
+                process_id: u32::MAX - 1,
+                ..launch.clone()
+            });
+        // A save from another boot.
+        let mut rebooted = reserialized(&saved);
+        saved_pane_mut(&mut rebooted).launch =
+            Some(crate::terminal::launch_incarnation::SavedLaunch {
+                boot_id: Some("00000000-0000-0000-0000-000000000000".into()),
+                ..launch.clone()
+            });
+        for (saved, evidence) in [
+            (absent, LaunchEndEvidence::ProcessAbsent),
+            (rebooted, LaunchEndEvidence::BootChanged),
+        ] {
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let (terminal, next_save) = cold_restored(&saved);
+            assert!(
+                !terminal.holds_launch(&token),
+                "a restore revives no launch"
+            );
+            let ended = terminal
+                .ended_launch(&token)
+                .unwrap_or_else(|| panic!("{evidence:?}: the restore records the launch ended"));
+            assert_eq!(ended.evidence, evidence);
+            assert!(ended.restored_at >= before);
+            assert_eq!(saved_pane(&next_save).launch, None);
+            assert_eq!(saved_pane(&next_save).ended_launches, vec![ended.clone()]);
+
+            // A later cold restore keeps it, and does not record it again.
+            let (again, _) = cold_restored(&next_save);
+            assert_eq!(again.ended_launches(), std::slice::from_ref(ended));
+
+            // A later live handoff keeps it too.
+            let handed = handed_off(&next_save, |_| {}).await;
+            assert_eq!(handed.ended_launch(&token), Some(ended));
+        }
+    }
+
+    /// A process with the saved id and start time outlived its server: the
+    /// restore proves nothing ended and records nothing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_cold_restore_whose_saved_process_still_runs_claims_nothing() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let mut token = String::new();
+        let mut saved = saved_after(&snapshot, |terminal| {
+            token = attested_launch_with_binding(terminal);
+        });
+        let me = crate::platform::process_and_parent(std::process::id())
+            .expect("this test process is readable");
+        let pane = saved_pane_mut(&mut saved);
+        let launch = pane.launch.as_mut().unwrap();
+        launch.process_id = me.process.pid;
+        launch.process_started = me.process.started.expect("its start time is readable");
+
+        let (terminal, next_save) = cold_restored(&saved);
+        assert_eq!(terminal.ended_launch(&token), None);
+        assert!(saved_pane(&next_save).ended_launches.is_empty());
+    }
+
+    /// A live handoff continues the pane's process, so it records no ended
+    /// launch: the carried launch stays held.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_live_handoff_records_no_ended_launch() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let mut token = String::new();
+        let saved = saved_after(&snapshot, |terminal| {
+            token = attested_launch_with_binding(terminal);
+        });
+        // The handoff's snapshot also saves the launch, here with a process
+        // that is not running.
+        let terminal = handed_off(&saved, |terminal| {
+            attested_launch_with_binding(terminal);
+        })
+        .await;
+        assert!(terminal.ended_launches().is_empty());
+        assert_eq!(terminal.ended_launch(&token), None);
+    }
+
+    /// A launch admitted but not bound to a process by the last save is not
+    /// saved, so a restore after it says nothing of it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_launch_bound_after_the_last_save_answers_none() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let mut token = String::new();
+        let saved = saved_after(&snapshot, |terminal| {
+            let (launch, _nonce) = crate::terminal::launch_incarnation::LaunchIncarnation::admit(
+                crate::detect::Agent::Codex,
+            );
+            token = launch.token().to_string();
+            terminal.admit_launch_incarnation(Some(launch));
+        });
+        assert_eq!(saved_pane(&saved).launch, None);
+        let (terminal, _) = cold_restored(&saved);
+        assert_eq!(terminal.ended_launch(&token), None);
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn a_cold_restore_revives_no_launch_and_no_binding_launch_evidence() {
@@ -4197,6 +4459,8 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                launch: None,
+                ended_launches: Vec::new(),
             },
         );
         let mut history = SessionHistorySnapshot {

@@ -88,6 +88,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         agent_send_keys_expected_launch_incarnation: true,
         agent_prompt_expected_launch_incarnation: true,
         agent_launch_status: true,
+        agent_launch_status_restore: false,
+        agent_launch_env: false,
         terminal_attach_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()
@@ -1545,6 +1547,8 @@ mod tests {
                 agent_send_keys_expected_launch_incarnation: false,
                 agent_prompt_expected_launch_incarnation: false,
                 agent_launch_status: false,
+                agent_launch_status_restore: false,
+                agent_launch_env: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),
             }),
@@ -1611,6 +1615,13 @@ mod tests {
     fn ping_advertises_agent_send_keys_expected_launch_incarnation() {
         let capabilities = default_capabilities().expect("capabilities");
         assert!(capabilities.agent_send_keys_expected_launch_incarnation);
+    }
+
+    #[test]
+    fn ping_advertises_ended_at_restore_and_the_launch_env() {
+        let capabilities = default_capabilities().expect("capabilities");
+        assert!(capabilities.agent_launch_status_restore);
+        assert_eq!(capabilities.agent_launch_env, cfg!(unix));
     }
 
     #[test]

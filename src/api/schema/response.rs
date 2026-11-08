@@ -140,6 +140,19 @@ pub enum ResponseResult {
         /// `attested`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<AgentInfo>,
+        /// When the restore that found the launch gone ran, in milliseconds
+        /// since the Unix epoch; only for `ended_at_restore`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restored_at: Option<u64>,
+        /// What showed that restore the launch's process was gone; only for
+        /// `ended_at_restore`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<super::agents::LaunchEndEvidence>,
+    },
+    /// The helper's claim bound the admission to its process: the token that
+    /// process is the launch of.
+    AgentLaunchAttested {
+        launch_incarnation: String,
     },
     AgentLauncherInfo {
         agent: AgentInfo,

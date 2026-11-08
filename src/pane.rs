@@ -4442,6 +4442,26 @@ mod tests {
         assert_eq!(cmd.get_env("DISPLAY"), Some(OsStr::new(":42")));
     }
 
+    /// A launch token belongs to the one process its helper execs: neither an
+    /// environment inherited by the server nor launch env gives a pane's shell
+    /// one, so nothing that shell runs later, a resume included, inherits it.
+    #[test]
+    fn pane_launch_env_never_gives_a_shell_a_launch_token() {
+        let key = crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR;
+        let mut cmd = CommandBuilder::new("shell");
+        cmd.env(key, "launch_00000000000000000000000000000000");
+
+        apply_pane_launch_env(
+            &mut cmd,
+            &PaneLaunchEnv::from_extra(vec![(
+                key.into(),
+                "launch_11111111111111111111111111111111".into(),
+            )]),
+        );
+
+        assert!(cmd.get_env(key).is_none());
+    }
+
     #[test]
     fn pane_terminal_identity_removes_outer_terminal_identity() {
         let keys = [

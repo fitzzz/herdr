@@ -1166,6 +1166,12 @@ pub(crate) fn local_stream_peer_process_id(stream: &crate::ipc::LocalStream) -> 
     (ret == 0 && pid > 0).then_some(pid as u32)
 }
 
+/// This platform gives no boot identity Herdr reads, so a restore tells a
+/// launch's process gone by its id and start time alone.
+pub(crate) fn boot_id() -> Option<String> {
+    None
+}
+
 /// A process, when it started and the id of its parent.
 pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     let info = process_bsdinfo(pid)?;

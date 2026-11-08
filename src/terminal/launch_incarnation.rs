@@ -32,12 +32,36 @@
 //! good: a token is never attested again once it was revoked, and a restore
 //! never revives one. A live handoff carries a bound launch, which the next
 //! server attests again only when it sees the same process itself.
+//!
+//! Restore evidence. Each session save records a launch bound to a process
+//! ([`SavedLaunch`]: the token, that process's id and start time, and the
+//! kernel boot it ran in). A cold restore, which starts new processes for its
+//! panes, reads the process table for that identity once: another boot, or no
+//! process with that id and start time, proves the launch's process is gone,
+//! and the restored terminal records that ([`EndedLaunch`]) for
+//! `agent.launch_status` to answer. A process with that identity still running,
+//! or one it cannot read, proves nothing and records nothing. Exit
+//! observations, revocations and live handoffs never record an ended launch:
+//! they are not evidence that the process is gone.
+//!
+//! The admitted process's environment. The helper execs the agent with the
+//! token in [`LAUNCH_INCARNATION_ENV_VAR`], given only to that process (and
+//! what it starts), never to the pane's shell, a saved launcher or a session
+//! save, so a later launch in the pane, a resume included, does not inherit it.
 
 use crate::detect::Agent;
 use crate::platform::ProcessInstance;
 
 /// The argument that makes the herdr binary run the attesting launch helper.
 pub(crate) const ATTEST_LAUNCH_COMMAND: &str = "__attest-launch";
+
+/// The variable the helper sets, in the process it execs only, to the token of
+/// the admission that process claimed.
+pub(crate) const LAUNCH_INCARNATION_ENV_VAR: &str = "HERDR_LAUNCH_INCARNATION";
+
+/// How many ended launches a terminal keeps, newest last. An older one dropped
+/// answers `none`, which claims nothing.
+pub(crate) const ENDED_LAUNCHES_KEPT: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
@@ -197,6 +221,60 @@ impl LaunchIncarnation {
         })
     }
 }
+
+impl LaunchIncarnation {
+    /// What a session save records: only a launch bound to a process with a
+    /// known start time, with the boot it runs in where the platform has one.
+    pub(crate) fn saved(&self, boot_id: Option<String>) -> Option<SavedLaunch> {
+        let process = self.process()?;
+        Some(SavedLaunch {
+            incarnation: self.token.clone(),
+            process_id: process.pid,
+            process_started: process.started?,
+            boot_id,
+        })
+    }
+}
+
+/// A launch bound to a process, as a session save records it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SavedLaunch {
+    pub incarnation: String,
+    pub process_id: u32,
+    pub process_started: u64,
+    /// `/proc/sys/kernel/random/boot_id` when saved; absent where the
+    /// platform has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+impl SavedLaunch {
+    /// What a cold restore proves about this launch's process from the boot
+    /// it runs in now (`boot_id`) and the process with the saved id now
+    /// (`process_now`): gone when the host booted again or no process has
+    /// that id and start time. A process with that identity, or one whose
+    /// start time cannot be read, proves nothing (`None`).
+    pub(crate) fn ended_at_restore(
+        &self,
+        boot_id: Option<&str>,
+        process_now: Option<ProcessInstance>,
+    ) -> Option<LaunchEndEvidence> {
+        let _ = (boot_id, process_now);
+        None
+    }
+}
+
+/// A launch a cold restore found gone, kept by the terminal restored in its
+/// pane, by later saves and by later handoffs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EndedLaunch {
+    pub incarnation: String,
+    /// When that restore ran, in milliseconds since the Unix epoch.
+    pub restored_at: u64,
+    pub evidence: LaunchEndEvidence,
+}
+
+pub(crate) use crate::api::schema::LaunchEndEvidence;
 
 /// A launch carried by a live handoff: its token and the process it is bound
 /// to, by id and start time.
@@ -446,6 +524,78 @@ mod tests {
         }]));
         let (unclaimed, _) = LaunchIncarnation::admit(Agent::Codex);
         assert!(!unclaimed.reported_by(&[process(42, 7)]));
+    }
+
+    #[test]
+    fn a_save_records_only_a_launch_bound_to_a_process_with_its_boot() {
+        let (admitted, _) = LaunchIncarnation::admit(Agent::Codex);
+        assert_eq!(admitted.saved(Some("boot".into())), None);
+        let bound = claimed(Agent::Codex, process(42, 7));
+        assert_eq!(
+            bound.saved(Some("boot".into())),
+            Some(SavedLaunch {
+                incarnation: bound.token().to_string(),
+                process_id: 42,
+                process_started: 7,
+                boot_id: Some("boot".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_restore_proves_a_saved_launch_gone_only_by_another_boot_or_its_missing_process() {
+        let saved = SavedLaunch {
+            incarnation: mint("launch"),
+            process_id: 42,
+            process_started: 7,
+            boot_id: Some("boot-a".into()),
+        };
+        let same = Some(process(42, 7));
+        let rows: [(
+            Option<&str>,
+            Option<ProcessInstance>,
+            Option<LaunchEndEvidence>,
+        ); 7] = [
+            // Another boot: whatever the table shows now is another process.
+            (Some("boot-b"), same, Some(LaunchEndEvidence::BootChanged)),
+            (Some("boot-b"), None, Some(LaunchEndEvidence::BootChanged)),
+            // The same boot: no process with that id, or another start time.
+            (Some("boot-a"), None, Some(LaunchEndEvidence::ProcessAbsent)),
+            (
+                Some("boot-a"),
+                Some(process(42, 8)),
+                Some(LaunchEndEvidence::ProcessAbsent),
+            ),
+            // The same process still runs: nothing ended.
+            (Some("boot-a"), same, None),
+            // A start time it cannot read proves nothing.
+            (
+                Some("boot-a"),
+                Some(ProcessInstance {
+                    pid: 42,
+                    started: None,
+                }),
+                None,
+            ),
+            // No boot identity now: the process table alone decides.
+            (None, None, Some(LaunchEndEvidence::ProcessAbsent)),
+        ];
+        for (boot, now, expected) in rows {
+            assert_eq!(
+                saved.ended_at_restore(boot, now),
+                expected,
+                "{boot:?} {now:?}"
+            );
+        }
+        let unbooted = SavedLaunch {
+            boot_id: None,
+            ..saved
+        };
+        assert_eq!(unbooted.ended_at_restore(Some("boot-b"), same), None);
+        assert_eq!(
+            unbooted.ended_at_restore(Some("boot-b"), None),
+            Some(LaunchEndEvidence::ProcessAbsent)
+        );
     }
 
     #[cfg(unix)]

@@ -230,4 +230,21 @@ mod tests {
         launcher.env.insert("INVALID=KEY".into(), "value".into());
         assert!(launcher.validate().is_err());
     }
+
+    /// Only the launch helper sets a launch's token, so a launcher, which a
+    /// session save keeps and a resume runs again, cannot carry one.
+    #[test]
+    fn a_launcher_cannot_set_a_launch_token() {
+        let mut launcher = AgentLauncher {
+            executable: "/usr/bin/printf".into(),
+            prefix_args: vec![],
+            env: Default::default(),
+        };
+        assert!(launcher.validate().is_ok());
+        launcher.env.insert(
+            crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR.into(),
+            "launch_00000000000000000000000000000000".into(),
+        );
+        assert!(launcher.validate().is_err());
+    }
 }

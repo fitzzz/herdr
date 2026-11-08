@@ -1295,6 +1295,79 @@ async fn launch_status_says_none_once_no_terminal_holds_the_launch() {
     );
 }
 
+/// A launch a cold restore of its pane found gone answers `ended_at_restore`
+/// with that restore's record, by its token alone; a launch only revoked, by
+/// an observed exit, still answers `none`.
+#[tokio::test]
+async fn launch_status_answers_ended_at_restore_only_for_a_launch_a_restore_found_gone() {
+    let mut app = app();
+    let (launch, _rx) = attested(&mut app, Agent::Claude);
+    exit(&mut app, &launch, Agent::Claude);
+    let revoked = launch_status(&mut app, &launch.token);
+    assert_eq!(revoked["result"]["state"], "none", "{revoked}");
+    assert_eq!(revoked["result"].get("evidence"), None);
+    assert_eq!(revoked["result"].get("restored_at"), None);
+
+    let ended = crate::terminal::launch_incarnation::EndedLaunch {
+        incarnation: launch.token.clone(),
+        restored_at: 1_700_000_000_000,
+        evidence: crate::api::schema::LaunchEndEvidence::BootChanged,
+    };
+    app.state
+        .terminals
+        .get_mut(&launch.terminal_id)
+        .unwrap()
+        .restore_ended_launches(vec![ended]);
+    let reply = launch_status(&mut app, &launch.token);
+    let result = &reply["result"];
+    assert_eq!(result["state"], "ended_at_restore", "{reply}");
+    assert_eq!(result["launch_incarnation"], launch.token.as_str());
+    assert_eq!(result["terminal_id"], launch.terminal_id.as_str());
+    assert_eq!(result["pane_id"], launch.public_pane.as_str());
+    assert_eq!(result["restored_at"], 1_700_000_000_000_u64);
+    assert_eq!(result["evidence"], "boot_changed");
+    assert_eq!(result.get("agent"), None, "no agent proves an ended launch");
+
+    let other = format!("launch_{}", "1".repeat(32));
+    assert_eq!(launch_status(&mut app, &other)["result"]["state"], "none");
+}
+
+/// The claim's reply gives the helper the token of the admission its process
+/// is, for the process it execs; a refused claim gives none.
+#[tokio::test]
+async fn the_claim_reply_gives_the_helper_its_admissions_token() {
+    let mut granted = app();
+    let (launch, _rx) = start(&mut granted, "worker", "claude", &[]);
+    let claimed = claim(
+        &mut granted,
+        &launch,
+        &launch.nonce,
+        Some((process(4242, 7), SHELL)),
+    );
+    assert_eq!(
+        claimed["result"]["type"], "agent_launch_attested",
+        "{claimed}"
+    );
+    assert_eq!(
+        claimed["result"]["launch_incarnation"],
+        launch.token.as_str()
+    );
+
+    let mut refused = app();
+    let (launch, _rx) = start(&mut refused, "worker", "claude", &[]);
+    let reply = claim(
+        &mut refused,
+        &launch,
+        &launch.nonce,
+        Some((process(4242, 7), 99)),
+    );
+    assert_eq!(
+        reply["error"]["code"], "launch_attestation_refused",
+        "{reply}"
+    );
+    assert!(!reply.to_string().contains(&launch.token));
+}
+
 #[tokio::test]
 async fn launch_status_refuses_what_is_not_a_token() {
     let mut app = app();

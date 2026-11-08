@@ -1742,6 +1742,132 @@ fn agent_start_attests_its_own_process_and_send_keys_follows_only_that_launch() 
     cleanup_spawned_herdr(herdr, base);
 }
 
+/// The process an admitted start execs gets that admission's token in
+/// `HERDR_LAUNCH_INCARNATION`; the pane's shell, and a later launch the shell
+/// runs without an admission, do not.
+#[cfg(unix)]
+#[test]
+fn an_admitted_agent_gets_its_token_in_its_environment_and_its_shell_does_not() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    let seen = base.join("pi-env");
+    let shell_seen = base.join("shell-env");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\necho \"${{HERDR_LAUNCH_INCARNATION-unset}}\" >> '{seen}'\nexport HERDR_AGENT=pi\n'{herdr}' pane report-agent \"$HERDR_PANE_ID\" --source custom:fake-pi --agent pi --state idle >/dev/null\nwhile IFS= read -r line; do\n  [ \"$line\" = quit ] && exit 0\ndone\n",
+            seen = seen.display(),
+            herdr = env!("CARGO_BIN_EXE_herdr"),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let herdr = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let started = run_cli_json(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "worker",
+            "--kind",
+            "pi",
+            "--pane",
+            &pane_id,
+            "--timeout",
+            "8000",
+        ],
+    );
+    let token = started["result"]["launch_incarnation"]
+        .as_str()
+        .expect("the start reply carries the launch incarnation")
+        .to_string();
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            fs::read_to_string(&seen).is_ok_and(|text| !text.is_empty())
+        }),
+        "the agent ran"
+    );
+    assert_eq!(fs::read_to_string(&seen).unwrap(), format!("{token}\n"));
+
+    let shell_line = format!(
+        "echo \"${{HERDR_LAUNCH_INCARNATION-unset}}\" > '{}'",
+        shell_seen.display()
+    );
+    for args in [
+        ["pane", "send-text", &pane_id, "quit"],
+        ["pane", "send-keys", &pane_id, "enter"],
+        ["pane", "send-text", &pane_id, &shell_line],
+        ["pane", "send-keys", &pane_id, "enter"],
+        ["pane", "send-text", &pane_id, "pi"],
+        ["pane", "send-keys", &pane_id, "enter"],
+    ] {
+        let output = run_cli(&socket_path, &args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || fs::read_to_string(&seen).is_ok_and(|text| text.lines().count() == 2)
+            && fs::read_to_string(&shell_seen).is_ok()
+    ));
+    assert_eq!(fs::read_to_string(&shell_seen).unwrap(), "unset\n");
+    assert_eq!(
+        fs::read_to_string(&seen).unwrap(),
+        format!("{token}\nunset\n"),
+        "a launch the shell ran itself inherits no token"
+    );
+    cleanup_spawned_herdr(herdr, base);
+}
+
+/// The helper never passes on a token it did not get from the claim, so one
+/// inherited from wherever the helper was run does not reach the agent.
+#[cfg(target_os = "linux")]
+#[test]
+fn attest_launch_helper_never_passes_on_an_inherited_token() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .args([
+            "__attest-launch",
+            "nonce_unreachable",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo \"${HERDR_LAUNCH_INCARNATION-unset}\"",
+        ])
+        .env("HERDR_SOCKET_PATH", base.join("absent.sock"))
+        .env(
+            "HERDR_LAUNCH_INCARNATION",
+            "launch_00000000000000000000000000000000",
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "unset\n",
+        "{output:?}"
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
 /// An operator whose `pi` is a shell function keeps it: the pane's shell
 /// resolves the start as it always did, and that start runs unattested.
 #[cfg(unix)]

@@ -857,6 +857,20 @@ pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     })
 }
 
+/// This boot's identity, `/proc/sys/kernel/random/boot_id`, read once: it
+/// changes only when the host boots again.
+pub(crate) fn boot_id() -> Option<String> {
+    static BOOT_ID: OnceLock<Option<String>> = OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .ok()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+        })
+        .clone()
+}
+
 /// `/proc/<pid>/stat` fields counted from the state after the command name:
 /// field 4 (ppid) and field 22 (starttime, in clock ticks since boot).
 const STAT_PPID: usize = 1;

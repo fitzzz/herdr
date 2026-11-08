@@ -672,6 +672,8 @@ pub struct TerminalState {
     /// The admitted `herdr agent start` launch and the process it is bound to
     /// ([`crate::terminal::launch_incarnation`]).
     launch_incarnation: Option<crate::terminal::launch_incarnation::LaunchIncarnation>,
+    /// Launches a cold restore of this pane found gone, newest last.
+    ended_launches: Vec<crate::terminal::launch_incarnation::EndedLaunch>,
     /// The conversations agent processes in this pane were shown to run.
     process_sessions: ProcessSessions,
     /// Whether the restore that started this terminal repeated the agent's
@@ -722,6 +724,7 @@ impl TerminalState {
             agent_launch: None,
             agent_launch_revision: 0,
             launch_incarnation: None,
+            ended_launches: Vec::new(),
             process_sessions: ProcessSessions::default(),
             agent_launch_restore: None,
         }
@@ -3266,6 +3269,36 @@ impl TerminalState {
         &self,
     ) -> Option<crate::terminal::launch_incarnation::HandoffLaunchIncarnation> {
         self.launch_incarnation.as_ref()?.handoff()
+    }
+
+    /// The launch a session save records: only one bound to a process.
+    pub(crate) fn saved_launch(&self) -> Option<crate::terminal::launch_incarnation::SavedLaunch> {
+        self.launch_incarnation
+            .as_ref()?
+            .saved(crate::platform::boot_id())
+    }
+
+    /// The launches a cold restore of this pane found gone, newest last.
+    pub(crate) fn ended_launches(&self) -> &[crate::terminal::launch_incarnation::EndedLaunch] {
+        &self.ended_launches
+    }
+
+    /// The launch `token`, when a cold restore of this pane found it gone.
+    pub(crate) fn ended_launch(
+        &self,
+        token: &str,
+    ) -> Option<&crate::terminal::launch_incarnation::EndedLaunch> {
+        self.ended_launches
+            .iter()
+            .find(|ended| ended.incarnation == token)
+    }
+
+    /// The ended launches restore gives the terminal of this pane.
+    pub(crate) fn restore_ended_launches(
+        &mut self,
+        ended: Vec<crate::terminal::launch_incarnation::EndedLaunch>,
+    ) {
+        self.ended_launches = ended;
     }
 
     /// The launch a live handoff carried, which detection attests again when

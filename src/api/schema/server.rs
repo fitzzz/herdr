@@ -75,6 +75,14 @@ pub struct ServerCapabilities {
     /// Supports `agent.launch_status`, which answers by a launch's token alone.
     #[serde(default)]
     pub agent_launch_status: bool,
+    /// `agent.launch_status` answers `ended_at_restore` for a launch whose
+    /// process a cold restore found gone. Older servers answer `none`.
+    #[serde(default)]
+    pub agent_launch_status_restore: bool,
+    /// The launch helper gives the process it execs that admission's token
+    /// in `HERDR_LAUNCH_INCARNATION`, and the claim's reply carries it.
+    #[serde(default)]
+    pub agent_launch_env: bool,
     /// `terminal attach`, `terminal session control` and `terminal session
     /// observe` honor `--expect-launch`. Older servers ignore the guarded
     /// admission and attach nothing, so the CLI refuses before asking them.

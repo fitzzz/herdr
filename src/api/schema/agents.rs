@@ -268,12 +268,30 @@ pub enum AgentLaunchState {
     /// or detected, carried by a live handoff the next server has not attested
     /// yet, or its process does not lead the foreground. It may be running.
     Held,
-    /// No terminal keeps it: its process exited, its pane closed or respawned,
-    /// another process or agent kind took the terminal, a new start was
-    /// admitted there, or this server never had it (a restart or restore does
-    /// not carry a launch; a live handoff does). A token is never reused, and
-    /// one in no terminal never comes back.
+    /// A cold restore found the launch's process gone: the last session save
+    /// recorded the launch bound to a process, and at the restore the host had
+    /// booted again or no process had that id and start time. The reply names
+    /// the terminal restored in its pane, when (`restored_at`) and the
+    /// `evidence`. Nothing else, an observed exit or a revoked token included,
+    /// gives this answer.
+    EndedAtRestore,
+    /// No terminal keeps it and no restore found it gone: its process exited,
+    /// its pane closed or respawned, another process or agent kind took the
+    /// terminal, a new start was admitted there, or this server never had it
+    /// (a restart or restore does not carry a launch; a live handoff does).
+    /// This is not evidence that its process stopped. A token is never
+    /// reused, and one in no terminal never comes back.
     None,
+}
+
+/// What showed a cold restore that a launch's process was gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchEndEvidence {
+    /// The host booted again since the save that recorded the launch.
+    BootChanged,
+    /// In the same boot, no process had the launch's process id and start time.
+    ProcessAbsent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

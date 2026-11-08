@@ -141,6 +141,8 @@ impl App {
                     terminal_id: None,
                     pane_id: None,
                     agent: None,
+                    restored_at: None,
+                    evidence: None,
                 },
             );
         };
@@ -172,6 +174,8 @@ impl App {
                 terminal_id: Some(terminal_id.to_string()),
                 pane_id,
                 agent,
+                restored_at: None,
+                evidence: None,
             },
         )
     }

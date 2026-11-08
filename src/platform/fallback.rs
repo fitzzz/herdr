@@ -224,6 +224,12 @@ pub(crate) fn local_stream_peer_process_id(_stream: &crate::ipc::LocalStream) ->
     None
 }
 
+/// This platform gives no boot identity Herdr reads, so a restore tells a
+/// launch's process gone by its id and start time alone.
+pub(crate) fn boot_id() -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub(crate) fn process_and_parent(_pid: u32) -> Option<super::AncestorProcess> {
     None

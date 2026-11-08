@@ -137,6 +137,14 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// The admitted launch bound to the pane's process when saved, so the next
+    /// cold restore can tell whether that process is gone. A restore never
+    /// revives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch: Option<crate::terminal::launch_incarnation::SavedLaunch>,
+    /// Launches a cold restore of this pane found gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ended_launches: Vec<crate::terminal::launch_incarnation::EndedLaunch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,6 +449,10 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                launch: terminal.and_then(crate::terminal::TerminalState::saved_launch),
+                ended_launches: terminal
+                    .map(|terminal| terminal.ended_launches().to_vec())
+                    .unwrap_or_default(),
             },
         );
     }
@@ -809,6 +821,8 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                launch: None,
+                ended_launches: Vec::new(),
             },
         );
         panes.insert(
@@ -822,6 +836,8 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                launch: None,
+                ended_launches: Vec::new(),
             },
         );
 
@@ -1725,6 +1741,8 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                launch: None,
+                ended_launches: Vec::new(),
             },
         );
         panes.insert(
@@ -1740,6 +1758,8 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                launch: None,
+                ended_launches: Vec::new(),
             },
         );
 
