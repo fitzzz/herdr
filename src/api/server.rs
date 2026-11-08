@@ -88,8 +88,8 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         agent_send_keys_expected_launch_incarnation: true,
         agent_prompt_expected_launch_incarnation: true,
         agent_launch_status: true,
-        agent_launch_status_restore: false,
-        agent_launch_env: false,
+        agent_launch_status_restore: true,
+        agent_launch_env: cfg!(unix),
         terminal_attach_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
             .into_iter()

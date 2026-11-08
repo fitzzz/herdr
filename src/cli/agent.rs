@@ -1064,7 +1064,10 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
 /// resolved `argv[0]` to, keeping `argv[0]` as typed; without it `argv[0]` is
 /// looked up on `PATH`. The agent runs whether or not the claim succeeded;
 /// without it the launch is never attested, so keys guarded by its launch
-/// incarnation are refused. Returns only when the executable could not run.
+/// incarnation are refused. The exec'd process gets the token the claim's
+/// reply named in `HERDR_LAUNCH_INCARNATION`, and no value of it otherwise,
+/// whatever the helper inherited. Returns only when the executable could not
+/// run.
 ///
 /// `__attest-launch <nonce> --resolved-by-shell` is typed to run instead
 /// when the pane's shell resolves the agent's command itself (an alias, a
@@ -1096,10 +1099,14 @@ pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
             return Ok(2);
         }
     };
-    if let Err(reason) = attest_launch(nonce, false) {
-        eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
-    }
-    exec_launch(executable.map(String::as_str), argv)
+    let token = match attest_launch(nonce, false) {
+        Ok(token) => token,
+        Err(reason) => {
+            eprintln!("herdr: this agent launch is not attested ({reason}); keys guarded by its launch incarnation will be refused");
+            None
+        }
+    };
+    exec_launch(executable.map(String::as_str), argv, token.as_deref())
 }
 
 /// The helper argument that ends an admission the pane's shell resolves.
@@ -1108,7 +1115,9 @@ pub(crate) const RESOLVED_BY_SHELL_FLAG: &str = "--resolved-by-shell";
 /// The helper argument naming the executable the pane's shell resolved.
 pub(crate) const EXEC_PATH_FLAG: &str = "--path";
 
-fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
+/// Sends the claim; a bound claim returns the token its reply names, when
+/// that is a launch token (an older server's reply names none).
+fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<Option<String>, String> {
     let socket = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR)
         .ok_or_else(|| format!("{} is not set", crate::api::SOCKET_PATH_ENV_VAR))?;
     let client = crate::api::client::ApiClient::for_target(
@@ -1127,7 +1136,10 @@ fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
         .request_value_with_timeout(&request, Duration::from_secs(10))
         .map_err(|err| err.to_string())?;
     match response.get("error") {
-        None => Ok(()),
+        None => Ok(response["result"]["launch_incarnation"]
+            .as_str()
+            .filter(|token| crate::terminal::launch_incarnation::is_canonical_token(token))
+            .map(str::to_string)),
         Some(error) => Err(error["message"]
             .as_str()
             .unwrap_or("the server refused the attestation")
@@ -1135,21 +1147,34 @@ fn attest_launch(nonce: &str, resolved_by_shell: bool) -> Result<(), String> {
     }
 }
 
-/// Execs `argv` as `executable` when given, else `argv[0]` found on `PATH`.
+/// Execs `argv` as `executable` when given, else `argv[0]` found on `PATH`,
+/// with `token` as its `HERDR_LAUNCH_INCARNATION`, or without one.
 #[cfg(unix)]
-fn exec_launch(executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
+fn exec_launch(
+    executable: Option<&str>,
+    argv: &[String],
+    token: Option<&str>,
+) -> std::io::Result<i32> {
     use std::os::unix::process::CommandExt as _;
     let program = executable.unwrap_or(&argv[0]);
-    let err = std::process::Command::new(program)
-        .arg0(&argv[0])
-        .args(&argv[1..])
-        .exec();
+    let mut command = std::process::Command::new(program);
+    command.arg0(&argv[0]).args(&argv[1..]);
+    let key = crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR;
+    match token {
+        Some(token) => command.env(key, token),
+        None => command.env_remove(key),
+    };
+    let err = command.exec();
     eprintln!("herdr: could not run {program}: {err}");
     Ok(127)
 }
 
 #[cfg(not(unix))]
-fn exec_launch(_executable: Option<&str>, argv: &[String]) -> std::io::Result<i32> {
+fn exec_launch(
+    _executable: Option<&str>,
+    argv: &[String],
+    _token: Option<&str>,
+) -> std::io::Result<i32> {
     eprintln!(
         "herdr: launch attestation is not supported on this platform; not running {}",
         argv[0]

@@ -259,8 +259,18 @@ impl SavedLaunch {
         boot_id: Option<&str>,
         process_now: Option<ProcessInstance>,
     ) -> Option<LaunchEndEvidence> {
-        let _ = (boot_id, process_now);
-        None
+        if let (Some(saved), Some(now)) = (self.boot_id.as_deref(), boot_id) {
+            if saved != now {
+                return Some(LaunchEndEvidence::BootChanged);
+            }
+        }
+        match process_now {
+            None => Some(LaunchEndEvidence::ProcessAbsent),
+            Some(now) => now
+                .started
+                .is_some_and(|started| started != self.process_started)
+                .then_some(LaunchEndEvidence::ProcessAbsent),
+        }
     }
 }
 
@@ -298,7 +308,13 @@ fn same_process(bound: &ProcessInstance, other: &ProcessInstance) -> bool {
 /// terminal reaches; a replacement the shell started leads another group,
 /// and a reused process id has another start time.
 pub(crate) fn group_leader(pgid: u32) -> Option<ProcessInstance> {
-    crate::platform::process_and_parent(pgid).map(|now| ProcessInstance {
+    process_now(pgid)
+}
+
+/// The process with id `pid` now, with its start time; `None` when there is
+/// none.
+pub(crate) fn process_now(pid: u32) -> Option<ProcessInstance> {
+    crate::platform::process_and_parent(pid).map(|now| ProcessInstance {
         pid: now.process.pid,
         started: now.process.started,
     })

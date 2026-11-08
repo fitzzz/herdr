@@ -133,16 +133,40 @@ impl App {
             .find(|(_, terminal)| terminal.holds_launch(&token))
             .map(|(terminal_id, _)| terminal_id.clone())
         else {
+            // Only a cold restore's own record says the launch's process is
+            // gone; a token no terminal holds says nothing of it.
+            let ended = self
+                .state
+                .terminals
+                .iter()
+                .find_map(|(terminal_id, terminal)| {
+                    terminal
+                        .ended_launch(&token)
+                        .map(|ended| (terminal_id.clone(), ended.restored_at, ended.evidence))
+                });
+            let (state, terminal_id, pane_id, restored_at, evidence) = match ended {
+                Some((terminal_id, restored_at, evidence)) => (
+                    AgentLaunchState::EndedAtRestore,
+                    Some(terminal_id.to_string()),
+                    self.terminal_targets()
+                        .into_iter()
+                        .find(|target| target.terminal_id == terminal_id.as_str())
+                        .and_then(|target| self.public_pane_id(target.ws_idx, target.pane_id)),
+                    Some(restored_at),
+                    Some(evidence),
+                ),
+                None => (AgentLaunchState::None, None, None, None, None),
+            };
             return encode_success(
                 id,
                 ResponseResult::AgentLaunchStatus {
                     launch_incarnation: token,
-                    state: AgentLaunchState::None,
-                    terminal_id: None,
-                    pane_id: None,
+                    state,
+                    terminal_id,
+                    pane_id,
                     agent: None,
-                    restored_at: None,
-                    evidence: None,
+                    restored_at,
+                    evidence,
                 },
             );
         };
@@ -237,7 +261,10 @@ impl App {
             }
         };
         match claimed {
-            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Ok(launch_incarnation) => encode_success(
+                id,
+                ResponseResult::AgentLaunchAttested { launch_incarnation },
+            ),
             Err(refusal) => encode_error(
                 id,
                 "launch_attestation_refused",

@@ -193,7 +193,10 @@ fn observe(app: &mut App, launch: &Launch, agent: Agent, process: ProcessInstanc
 fn attested(app: &mut App, kind: Agent) -> (Launch, tokio::sync::mpsc::Receiver<Bytes>) {
     let (launch, rx) = start(app, "worker", crate::detect::agent_label(kind), &[]);
     let claimed = claim(app, &launch, &launch.nonce, Some((process(4242, 7), SHELL)));
-    assert_eq!(claimed["result"]["type"], "ok", "{claimed}");
+    assert_eq!(
+        claimed["result"]["type"], "agent_launch_attested",
+        "{claimed}"
+    );
     observe(app, &launch, kind, process(4242, 7));
     // The managed start finished: the agent is idle past its settle delay.
     let terminal = app.state.terminals.get_mut(&launch.terminal_id).unwrap();
@@ -305,7 +308,10 @@ async fn the_token_is_attested_only_once_detection_sees_the_claimed_process() {
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok", "{claimed}");
+    assert_eq!(
+        claimed["result"]["type"], "agent_launch_attested",
+        "{claimed}"
+    );
     assert_eq!(
         current(&mut app, &launch),
         None,
@@ -336,7 +342,7 @@ async fn the_nonce_is_spent_by_its_first_use() {
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(first["result"]["type"], "ok");
+    assert_eq!(first["result"]["type"], "agent_launch_attested");
     // A line repeated from shell history claims the same nonce again.
     let repeated = claim(
         &mut app,
@@ -480,7 +486,7 @@ async fn a_new_start_gets_a_new_token_and_the_old_one_is_refused() {
         &second.nonce,
         Some((process(4250, 20), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok");
+    assert_eq!(claimed["result"]["type"], "agent_launch_attested");
     observe(&mut app, &second, Agent::Codex, process(4250, 20));
     assert_eq!(current(&mut app, &second), Some(second.token.clone()));
 
@@ -597,7 +603,7 @@ async fn a_new_launch_resuming_the_same_session_is_not_the_old_launch() {
         &second.nonce,
         Some((process(4260, 30), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok");
+    assert_eq!(claimed["result"]["type"], "agent_launch_attested");
     observe(&mut app, &second, Agent::Codex, process(4260, 30));
     report_session(&mut app, &second, "ses_same", Some(process(4260, 30)));
 
@@ -694,7 +700,7 @@ async fn the_attestation_request_parses_strictly() {
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok");
+    assert_eq!(claimed["result"]["type"], "agent_launch_attested");
 }
 
 #[tokio::test]
@@ -771,7 +777,7 @@ async fn a_launcher_binding_is_confirmed_only_for_the_launch_whose_process_repor
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok");
+    assert_eq!(claimed["result"]["type"], "agent_launch_attested");
     observe(&mut app, &launch, Agent::Codex, process(4242, 7));
     app.state
         .terminals
@@ -895,7 +901,7 @@ async fn an_official_report_from_the_claimed_process_attests_it_without_a_probe(
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok");
+    assert_eq!(claimed["result"]["type"], "agent_launch_attested");
     // The claimed process leads the foreground, though no probe saw it.
     foreground(&app, &launch, Some(process(4242, 7)));
     app.state
@@ -1223,7 +1229,10 @@ async fn launch_status_says_held_while_a_terminal_keeps_a_launch_it_cannot_attes
         &launch.nonce,
         Some((process(4242, 7), SHELL)),
     );
-    assert_eq!(claimed["result"]["type"], "ok", "{claimed}");
+    assert_eq!(
+        claimed["result"]["type"], "agent_launch_attested",
+        "{claimed}"
+    );
     assert_eq!(
         launch_status(&mut app, &launch.token)["result"]["state"],
         "held"

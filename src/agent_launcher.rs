@@ -131,6 +131,17 @@ impl AgentLauncher {
         {
             return Err("launcher arguments or environment are invalid or too large".into());
         }
+        // Only the launch helper sets a launch's token, for the process it
+        // execs; a launcher is saved and run again by a resume.
+        if self
+            .env
+            .contains_key(crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR)
+        {
+            return Err(format!(
+                "launcher environment cannot set {}",
+                crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR
+            ));
+        }
         if !crate::platform::launcher_executable_available(std::path::Path::new(&self.executable)) {
             return Err("launcher executable is missing or not executable".into());
         }

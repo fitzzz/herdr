@@ -7047,8 +7047,13 @@
               "type": "string"
             },
             {
+              "const": "ended_at_restore",
+              "description": "A cold restore found the launch's process gone: the last session save\nrecorded the launch bound to a process, and at the restore the host had\nbooted again or no process had that id and start time. The reply names\nthe terminal restored in its pane, when (`restored_at`) and the\n`evidence`. Nothing else, an observed exit or a revoked token included,\ngives this answer.",
+              "type": "string"
+            },
+            {
               "const": "none",
-              "description": "No terminal keeps it: its process exited, its pane closed or respawned,\nanother process or agent kind took the terminal, a new start was\nadmitted there, or this server never had it (a restart or restore does\nnot carry a launch; a live handoff does). A token is never reused, and\none in no terminal never comes back.",
+              "description": "No terminal keeps it and no restore found it gone: its process exited,\nits pane closed or respawned, another process or agent kind took the\nterminal, a new start was admitted there, or this server never had it\n(a restart or restore does not carry a launch; a live handoff does).\nThis is not evidence that its process stopped. A token is never\nreused, and one in no terminal never comes back.",
               "type": "string"
             }
           ]
@@ -8145,6 +8150,21 @@
             "messages"
           ],
           "type": "object"
+        },
+        "LaunchEndEvidence": {
+          "description": "What showed a cold restore that a launch's process was gone.",
+          "oneOf": [
+            {
+              "const": "boot_changed",
+              "description": "The host booted again since the save that recorded the launch.",
+              "type": "string"
+            },
+            {
+              "const": "process_absent",
+              "description": "In the same boot, no process had the launch's process id and start time.",
+              "type": "string"
+            }
+          ]
         },
         "LauncherArgvOrigin": {
           "enum": [
@@ -10014,6 +10034,17 @@
                   ],
                   "description": "The agent in that pane. It carries the token only when `state` is\n`attested`."
                 },
+                "evidence": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/LaunchEndEvidence"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "What showed that restore the launch's process was gone; only for\n`ended_at_restore`."
+                },
                 "launch_incarnation": {
                   "type": "string"
                 },
@@ -10021,6 +10052,15 @@
                   "description": "The pane showing that terminal now; a move changes it.",
                   "type": [
                     "string",
+                    "null"
+                  ]
+                },
+                "restored_at": {
+                  "description": "When the restore that found the launch gone ran, in milliseconds\nsince the Unix epoch; only for `ended_at_restore`.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
                     "null"
                   ]
                 },
@@ -10043,6 +10083,23 @@
                 "type",
                 "launch_incarnation",
                 "state"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The helper's claim bound the admission to its process: the token that\nprocess is the launch of.",
+              "properties": {
+                "launch_incarnation": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_launch_attested",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "launch_incarnation"
               ],
               "type": "object"
             },
@@ -11063,9 +11120,19 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_launch_env": {
+              "default": false,
+              "description": "The launch helper gives the process it execs that admission's token\nin `HERDR_LAUNCH_INCARNATION`, and the claim's reply carries it.",
+              "type": "boolean"
+            },
             "agent_launch_status": {
               "default": false,
               "description": "Supports `agent.launch_status`, which answers by a launch's token alone.",
+              "type": "boolean"
+            },
+            "agent_launch_status_restore": {
+              "default": false,
+              "description": "`agent.launch_status` answers `ended_at_restore` for a launch whose\nprocess a cold restore found gone. Older servers answer `none`.",
               "type": "boolean"
             },
             "agent_launcher": {

@@ -546,6 +546,50 @@ fn restore_workspace(
     )
 }
 
+/// The launches the terminal restored for `pane` records as ended: those its
+/// save kept and, in a cold restore only, the saved launch whose process the
+/// process table shows gone now. A live handoff continues the pane's process,
+/// so it proves no end.
+fn restored_ended_launches(
+    pane: Option<&super::snapshot::PaneSnapshot>,
+    cold: bool,
+) -> Vec<crate::terminal::launch_incarnation::EndedLaunch> {
+    let Some(pane) = pane else {
+        return Vec::new();
+    };
+    let mut ended = pane.ended_launches.clone();
+    if let Some(saved) = pane.launch.as_ref().filter(|_| cold) {
+        match saved.ended_at_restore(
+            crate::platform::boot_id().as_deref(),
+            crate::terminal::launch_incarnation::process_now(saved.process_id),
+        ) {
+            Some(evidence) => {
+                info!(
+                    launch = %saved.incarnation,
+                    ?evidence,
+                    "restore found the saved launch's process gone"
+                );
+                ended.push(crate::terminal::launch_incarnation::EndedLaunch {
+                    incarnation: saved.incarnation.clone(),
+                    restored_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_millis() as u64),
+                    evidence,
+                });
+            }
+            None => info!(
+                launch = %saved.incarnation,
+                "the saved launch's process still runs; restore claims nothing of it"
+            ),
+        }
+    }
+    let excess = ended
+        .len()
+        .saturating_sub(crate::terminal::launch_incarnation::ENDED_LAUNCHES_KEPT);
+    ended.drain(..excess);
+    ended
+}
+
 fn unavailable_restored_terminal(
     pane: Option<&super::snapshot::PaneSnapshot>,
     cwd: PathBuf,
@@ -554,6 +598,7 @@ fn unavailable_restored_terminal(
     warn!(cwd = %cwd.display(), reason = %reason, "preserving unavailable restored pane");
     let mut terminal = TerminalState::new(TerminalId::alloc(), cwd);
     terminal.restore_error = Some(reason);
+    terminal.restore_ended_launches(restored_ended_launches(pane, true));
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
@@ -652,6 +697,7 @@ fn restore_tab(
                 .and_then(|pane| pane.agent_launcher.clone())
                 .map(crate::agent_launcher::BoundAgentLauncher::without_launch_evidence);
             terminal.begin_handoff_observation_epoch(placeholder.observation_epoch);
+            terminal.restore_ended_launches(restored_ended_launches(saved_pane, false));
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
             continue;
@@ -748,6 +794,7 @@ fn restore_tab(
                 }
             });
         let was_imported = imported_runtime.is_some();
+        let ended_launches = restored_ended_launches(saved_pane, !was_imported);
         #[cfg(unix)]
         let preserved_terminal_id = imported_runtime
             .as_ref()
@@ -862,6 +909,7 @@ fn restore_tab(
             if let Some(seed) = restored_agent_launch {
                 terminal.seed_agent_launch(seed);
             }
+            terminal.restore_ended_launches(ended_launches);
             panes.insert(*id, PaneState::new(terminal_id));
             terminals.push(terminal);
             continue;
@@ -998,6 +1046,7 @@ fn restore_tab(
                 if let Some(carried) = handed_off_launch_incarnation {
                     terminal.restore_handoff_launch_incarnation(carried);
                 }
+                terminal.restore_ended_launches(ended_launches);
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
@@ -3926,15 +3975,13 @@ mod tests {
     async fn a_live_handoff_records_no_ended_launch() {
         let (snapshot, _) = snapshot_with_saved_pane_history();
         let mut token = String::new();
-        let saved = saved_after(&snapshot, |terminal| {
+        // The handoff's snapshot saves the launch, here bound to a process
+        // that is not running, and the handoff still claims nothing of it.
+        let terminal = handed_off(&snapshot, |terminal| {
             token = attested_launch_with_binding(terminal);
-        });
-        // The handoff's snapshot also saves the launch, here with a process
-        // that is not running.
-        let terminal = handed_off(&saved, |terminal| {
-            attested_launch_with_binding(terminal);
         })
         .await;
+        assert!(terminal.holds_launch(&token), "the carried launch is held");
         assert!(terminal.ended_launches().is_empty());
         assert_eq!(terminal.ended_launch(&token), None);
     }

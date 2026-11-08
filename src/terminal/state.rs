@@ -3174,22 +3174,25 @@ impl TerminalState {
     }
 
     /// The launch helper `process`, child of `parent`, claimed the admission;
-    /// `shell` is the pane's shell. A refused claim ends the launch, since its
-    /// one-use nonce is spent.
+    /// `shell` is the pane's shell. A bound claim returns the launch's token
+    /// for that process. A refused claim ends the launch, since its one-use
+    /// nonce is spent.
     pub(crate) fn claim_launch_incarnation(
         &mut self,
         process: ProcessInstance,
         parent: u32,
         shell: Option<u32>,
-    ) -> Result<(), crate::terminal::launch_incarnation::ClaimRefusal> {
+    ) -> Result<String, crate::terminal::launch_incarnation::ClaimRefusal> {
         let Some(launch) = self.launch_incarnation.as_mut() else {
             return Err(crate::terminal::launch_incarnation::ClaimRefusal::NotTheShellsChild);
         };
-        let claimed = launch.claim(process, parent, shell);
-        if claimed.is_err() {
-            self.launch_incarnation = None;
+        match launch.claim(process, parent, shell) {
+            Ok(()) => Ok(launch.token().to_string()),
+            Err(refusal) => {
+                self.launch_incarnation = None;
+                Err(refusal)
+            }
         }
-        claimed
     }
 
     /// Detection identified `process`, running `agent`, as this terminal's

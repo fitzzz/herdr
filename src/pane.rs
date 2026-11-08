@@ -184,6 +184,8 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
+    // Only the launch helper gives a token, to the one process it execs.
+    cmd.env_remove(crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR);
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
