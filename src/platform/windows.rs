@@ -2403,8 +2403,8 @@ pub(crate) fn boot_id() -> Option<String> {
     None
 }
 
-/// Herdr reads no process start times here, so no launch is saved and no
-/// identity is ever known.
+/// Herdr binds no launch here (there is no `exec`, so no launch token), so no
+/// launch is saved for a restore to decide and no identity is read for one.
 pub(crate) fn process_identity(_pid: u32) -> super::ProcessIdentity {
     super::ProcessIdentity::Unreadable
 }

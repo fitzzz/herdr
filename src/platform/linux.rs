@@ -900,15 +900,24 @@ fn identity_from_stat_read(
 }
 
 /// The start time field of a stat, read after the last `)` that ends the
-/// command name; the fields after it are ASCII.
+/// command name. The field counts only when it is all digits and a delimiter
+/// follows it (the kernel always writes more fields after it): a read that
+/// ends inside the field, or right after it, may have cut it short.
 fn start_ticks_from_stat(stat: &[u8]) -> Option<u64> {
-    let after = &stat[stat.iter().rposition(|&byte| byte == b')')? + 1..];
-    std::str::from_utf8(after)
-        .ok()?
-        .split_ascii_whitespace()
-        .nth(STAT_STARTTIME)?
-        .parse()
-        .ok()
+    let mut rest = &stat[stat.iter().rposition(|&byte| byte == b')')? + 1..];
+    for index in 0..=STAT_STARTTIME {
+        rest = &rest[rest.iter().position(|byte| !byte.is_ascii_whitespace())?..];
+        let end = rest.iter().position(u8::is_ascii_whitespace)?;
+        if index == STAT_STARTTIME {
+            let field = &rest[..end];
+            if !field.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            return std::str::from_utf8(field).ok()?.parse().ok();
+        }
+        rest = &rest[end..];
+    }
+    None
 }
 
 /// `/proc/<pid>/stat` fields counted from the state after the command name:
