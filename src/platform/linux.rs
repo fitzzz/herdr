@@ -875,39 +875,40 @@ pub(crate) fn boot_id() -> Option<String> {
 /// needs ([`super::ProcessIdentity`]).
 pub(crate) fn process_identity(pid: u32) -> super::ProcessIdentity {
     identity_from_stat_read(std::fs::read(format!("/proc/{pid}/stat")), || {
-        no_such_process(pid)
+        super::unix_common::no_such_process(pid)
     })
 }
 
 /// `read` is `/proc/<pid>/stat` as read; `absent` asks the kernel whether no
-/// process has that id.
+/// process has that id. Only the start time is read from the stat, so a name
+/// that is not UTF-8 (or holds a parenthesis) does not matter; a stat that
+/// does not parse is unreadable, and a failed read is absence only when the
+/// kernel says no such process (a /proc that is not mounted, or hides the
+/// process, says nothing).
 fn identity_from_stat_read(
     read: std::io::Result<Vec<u8>>,
     absent: impl FnOnce() -> bool,
 ) -> super::ProcessIdentity {
-    // Red stub (#141 fork review finding 1): as process_and_parent reads it.
-    let _ = absent;
-    match read
-        .ok()
-        .and_then(|stat| String::from_utf8(stat).ok())
-        .and_then(|stat| stat_field_after_comm(&stat, STAT_STARTTIME))
-    {
-        Some(started) => super::ProcessIdentity::Running { started },
-        None => super::ProcessIdentity::Absent,
+    match read {
+        Ok(stat) => start_ticks_from_stat(&stat)
+            .map_or(super::ProcessIdentity::Unreadable, |started| {
+                super::ProcessIdentity::Running { started }
+            }),
+        Err(_) if absent() => super::ProcessIdentity::Absent,
+        Err(_) => super::ProcessIdentity::Unreadable,
     }
 }
 
-/// Whether the kernel says no process has id `pid` (`kill(pid, 0)` fails with
-/// `ESRCH`). Any other answer, a permission refusal included, is not absence.
-fn no_such_process(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid, 0) };
-    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+/// The start time field of a stat, read after the last `)` that ends the
+/// command name; the fields after it are ASCII.
+fn start_ticks_from_stat(stat: &[u8]) -> Option<u64> {
+    let after = &stat[stat.iter().rposition(|&byte| byte == b')')? + 1..];
+    std::str::from_utf8(after)
+        .ok()?
+        .split_ascii_whitespace()
+        .nth(STAT_STARTTIME)?
+        .parse()
+        .ok()
 }
 
 /// `/proc/<pid>/stat` fields counted from the state after the command name:
@@ -1387,10 +1388,15 @@ mod tests {
             matches!(identity, super::super::ProcessIdentity::Running { .. }),
             "{identity:?}"
         );
-        // And an id no process can have is confirmed absent.
+        // An id above pid_max that the kernel answers ESRCH for is
+        // confirmed absent; an id that is not a pid_t at all is not asked.
+        assert_eq!(
+            process_identity(i32::MAX as u32),
+            super::super::ProcessIdentity::Absent
+        );
         assert_eq!(
             process_identity(u32::MAX - 1),
-            super::super::ProcessIdentity::Absent
+            super::super::ProcessIdentity::Unreadable
         );
     }
 

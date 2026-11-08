@@ -561,7 +561,7 @@ fn restored_ended_launches(
     if let Some(saved) = pane.launch.as_ref().filter(|_| cold) {
         match saved.ended_at_restore(
             crate::platform::boot_id().as_deref(),
-            crate::terminal::launch_incarnation::process_now(saved.process_id),
+            crate::platform::process_identity(saved.process_id),
         ) {
             Some(evidence) => {
                 info!(
@@ -579,7 +579,7 @@ fn restored_ended_launches(
             }
             None => info!(
                 launch = %saved.incarnation,
-                "the saved launch's process still runs; restore claims nothing of it"
+                "the saved launch's process still runs or cannot be read; restore claims nothing of it"
             ),
         }
     }
@@ -3905,7 +3905,7 @@ mod tests {
         let mut absent = reserialized(&saved);
         saved_pane_mut(&mut absent).launch =
             Some(crate::terminal::launch_incarnation::SavedLaunch {
-                process_id: u32::MAX - 1,
+                process_id: i32::MAX as u32,
                 ..launch.clone()
             });
         // A save from another boot.

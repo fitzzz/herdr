@@ -682,3 +682,16 @@ mod shared_ssh_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// Whether the kernel says no process has id `pid` (`kill(pid, 0)` fails with
+/// `ESRCH`). Any other answer, a permission refusal included, is not absence.
+pub(crate) fn no_such_process(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}

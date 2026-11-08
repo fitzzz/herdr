@@ -270,7 +270,9 @@ pub enum AgentLaunchState {
     Held,
     /// A cold restore found the launch's process gone: the last session save
     /// recorded the launch bound to a process, and at the restore the host had
-    /// booted again or no process had that id and start time. The reply names
+    /// booted again, the operating system reported no process with that id, or
+    /// the process with that id had another start time. A process Herdr could
+    /// not read proves nothing and gives no such answer. The reply names
     /// the terminal restored in its pane, when (`restored_at`) and the
     /// `evidence`. Nothing else, an observed exit or a revoked token included,
     /// gives this answer.
@@ -290,7 +292,9 @@ pub enum AgentLaunchState {
 pub enum LaunchEndEvidence {
     /// The host booted again since the save that recorded the launch.
     BootChanged,
-    /// In the same boot, no process had the launch's process id and start time.
+    /// In the same boot, the operating system reported no process with the
+    /// launch's process id, or the process with that id had another start
+    /// time.
     ProcessAbsent,
 }
 

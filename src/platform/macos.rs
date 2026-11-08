@@ -1190,6 +1190,22 @@ pub(crate) fn process_and_parent(pid: u32) -> Option<super::AncestorProcess> {
     })
 }
 
+/// Process `pid`'s identity now ([`super::ProcessIdentity`]): its start time
+/// from the kernel's BSD info, needing no name; when that cannot be read, gone
+/// only if the kernel says no such process.
+pub(crate) fn process_identity(pid: u32) -> super::ProcessIdentity {
+    if pid == 0 {
+        return super::ProcessIdentity::Unreadable;
+    }
+    match process_bsdinfo(pid) {
+        Some(info) => super::ProcessIdentity::Running {
+            started: start_time_from_bsdinfo(&info),
+        },
+        None if super::unix_common::no_such_process(pid) => super::ProcessIdentity::Absent,
+        None => super::ProcessIdentity::Unreadable,
+    }
+}
+
 /// When a process started, in microseconds since the epoch.
 fn start_time_from_bsdinfo(info: &libc::proc_bsdinfo) -> u64 {
     info.pbi_start_tvsec

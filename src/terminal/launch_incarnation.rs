@@ -250,26 +250,28 @@ pub(crate) struct SavedLaunch {
 
 impl SavedLaunch {
     /// What a cold restore proves about this launch's process from the boot
-    /// it runs in now (`boot_id`) and the process with the saved id now
-    /// (`process_now`): gone when the host booted again or no process has
-    /// that id and start time. A process with that identity, or one whose
-    /// start time cannot be read, proves nothing (`None`).
+    /// it runs in now (`boot_id`) and what can be read now of the saved
+    /// process id (`process`): gone when the host booted again, the kernel
+    /// says no process has that id, or one with another start time has it.
+    /// The same start time, and every read that failed or is unknown, proves
+    /// nothing (`None`).
     pub(crate) fn ended_at_restore(
         &self,
         boot_id: Option<&str>,
-        process_now: Option<ProcessInstance>,
+        process: crate::platform::ProcessIdentity,
     ) -> Option<LaunchEndEvidence> {
+        use crate::platform::ProcessIdentity;
         if let (Some(saved), Some(now)) = (self.boot_id.as_deref(), boot_id) {
             if saved != now {
                 return Some(LaunchEndEvidence::BootChanged);
             }
         }
-        match process_now {
-            None => Some(LaunchEndEvidence::ProcessAbsent),
-            Some(now) => now
-                .started
-                .is_some_and(|started| started != self.process_started)
-                .then_some(LaunchEndEvidence::ProcessAbsent),
+        match process {
+            ProcessIdentity::Absent => Some(LaunchEndEvidence::ProcessAbsent),
+            ProcessIdentity::Running { started } => {
+                (started != self.process_started).then_some(LaunchEndEvidence::ProcessAbsent)
+            }
+            ProcessIdentity::Unreadable => None,
         }
     }
 }
@@ -308,13 +310,7 @@ fn same_process(bound: &ProcessInstance, other: &ProcessInstance) -> bool {
 /// terminal reaches; a replacement the shell started leads another group,
 /// and a reused process id has another start time.
 pub(crate) fn group_leader(pgid: u32) -> Option<ProcessInstance> {
-    process_now(pgid)
-}
-
-/// The process with id `pid` now, with its start time; `None` when there is
-/// none.
-pub(crate) fn process_now(pid: u32) -> Option<ProcessInstance> {
-    crate::platform::process_and_parent(pid).map(|now| ProcessInstance {
+    crate::platform::process_and_parent(pgid).map(|now| ProcessInstance {
         pid: now.process.pid,
         started: now.process.started,
     })
@@ -560,41 +556,42 @@ mod tests {
 
     #[test]
     fn a_restore_proves_a_saved_launch_gone_only_by_another_boot_or_its_missing_process() {
+        use crate::platform::ProcessIdentity::{self, Absent, Running, Unreadable};
         let saved = SavedLaunch {
             incarnation: mint("launch"),
             process_id: 42,
             process_started: 7,
             boot_id: Some("boot-a".into()),
         };
-        let same = Some(process(42, 7));
-        let rows: [(
-            Option<&str>,
-            Option<ProcessInstance>,
-            Option<LaunchEndEvidence>,
-        ); 7] = [
+        let same = Running { started: 7 };
+        let rows: [(Option<&str>, ProcessIdentity, Option<LaunchEndEvidence>); 9] = [
             // Another boot: whatever the table shows now is another process.
             (Some("boot-b"), same, Some(LaunchEndEvidence::BootChanged)),
-            (Some("boot-b"), None, Some(LaunchEndEvidence::BootChanged)),
-            // The same boot: no process with that id, or another start time.
-            (Some("boot-a"), None, Some(LaunchEndEvidence::ProcessAbsent)),
+            (
+                Some("boot-b"),
+                Unreadable,
+                Some(LaunchEndEvidence::BootChanged),
+            ),
+            // The same boot: the kernel says no such process, or another start time.
             (
                 Some("boot-a"),
-                Some(process(42, 8)),
+                Absent,
+                Some(LaunchEndEvidence::ProcessAbsent),
+            ),
+            (
+                Some("boot-a"),
+                Running { started: 8 },
                 Some(LaunchEndEvidence::ProcessAbsent),
             ),
             // The same process still runs: nothing ended.
             (Some("boot-a"), same, None),
-            // A start time it cannot read proves nothing.
-            (
-                Some("boot-a"),
-                Some(ProcessInstance {
-                    pid: 42,
-                    started: None,
-                }),
-                None,
-            ),
-            // No boot identity now: the process table alone decides.
-            (None, None, Some(LaunchEndEvidence::ProcessAbsent)),
+            // #141 fork review finding 1: a read that failed, was refused or
+            // did not parse proves nothing.
+            (Some("boot-a"), Unreadable, None),
+            (None, Unreadable, None),
+            // No boot identity now: the process read alone decides.
+            (None, Absent, Some(LaunchEndEvidence::ProcessAbsent)),
+            (None, same, None),
         ];
         for (boot, now, expected) in rows {
             assert_eq!(
@@ -608,8 +605,9 @@ mod tests {
             ..saved
         };
         assert_eq!(unbooted.ended_at_restore(Some("boot-b"), same), None);
+        assert_eq!(unbooted.ended_at_restore(Some("boot-b"), Unreadable), None);
         assert_eq!(
-            unbooted.ended_at_restore(Some("boot-b"), None),
+            unbooted.ended_at_restore(Some("boot-b"), Absent),
             Some(LaunchEndEvidence::ProcessAbsent)
         );
     }
@@ -650,7 +648,10 @@ mod tests {
             boot_id: boot.clone(),
         };
         let still_running = child.try_wait().unwrap().is_none();
-        let ended = saved.ended_at_restore(boot.as_deref(), process_now(child.id()));
+        let ended = saved.ended_at_restore(
+            boot.as_deref(),
+            crate::platform::process_identity(child.id()),
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(still_running);

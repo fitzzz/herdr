@@ -230,6 +230,11 @@ pub(crate) fn boot_id() -> Option<String> {
     None
 }
 
+/// Unsupported platform stub: no identity is ever known.
+pub(crate) fn process_identity(_pid: u32) -> super::ProcessIdentity {
+    super::ProcessIdentity::Unreadable
+}
+
 /// Unsupported platform stub.
 pub(crate) fn process_and_parent(_pid: u32) -> Option<super::AncestorProcess> {
     None

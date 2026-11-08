@@ -7048,7 +7048,7 @@
             },
             {
               "const": "ended_at_restore",
-              "description": "A cold restore found the launch's process gone: the last session save\nrecorded the launch bound to a process, and at the restore the host had\nbooted again or no process had that id and start time. The reply names\nthe terminal restored in its pane, when (`restored_at`) and the\n`evidence`. Nothing else, an observed exit or a revoked token included,\ngives this answer.",
+              "description": "A cold restore found the launch's process gone: the last session save\nrecorded the launch bound to a process, and at the restore the host had\nbooted again, the operating system reported no process with that id, or\nthe process with that id had another start time. A process Herdr could\nnot read proves nothing and gives no such answer. The reply names\nthe terminal restored in its pane, when (`restored_at`) and the\n`evidence`. Nothing else, an observed exit or a revoked token included,\ngives this answer.",
               "type": "string"
             },
             {
@@ -8161,7 +8161,7 @@
             },
             {
               "const": "process_absent",
-              "description": "In the same boot, no process had the launch's process id and start time.",
+              "description": "In the same boot, the operating system reported no process with the\nlaunch's process id, or the process with that id had another start\ntime.",
               "type": "string"
             }
           ]

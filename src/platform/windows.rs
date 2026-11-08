@@ -2403,6 +2403,12 @@ pub(crate) fn boot_id() -> Option<String> {
     None
 }
 
+/// Herdr reads no process start times here, so no launch is saved and no
+/// identity is ever known.
+pub(crate) fn process_identity(_pid: u32) -> super::ProcessIdentity {
+    super::ProcessIdentity::Unreadable
+}
+
 /// A process, when it started and the id of its parent; Windows has no
 /// process groups. A process that started after the cached snapshot, such as
 /// the CLI that sent a report, is read from a fresh one.
