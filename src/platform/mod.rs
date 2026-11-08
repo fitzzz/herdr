@@ -56,6 +56,18 @@ pub struct ProcessInstance {
     pub started: Option<u64>,
 }
 
+/// What can be read now of one process id, for a decision that a process is
+/// gone (a cold restore's, [`crate::terminal::launch_incarnation`]): the
+/// kernel confirmed no process has that id, a process has it with this start
+/// time (in [`ProcessInstance::started`]'s units), or nothing that can be
+/// relied on. Every failed or partial read is `Unreadable`, never `Absent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessIdentity {
+    Absent,
+    Running { started: u64 },
+    Unreadable,
+}
+
 impl ProcessInstance {
     /// A process whose start time is unknown, so it matches by id alone.
     #[cfg(test)]

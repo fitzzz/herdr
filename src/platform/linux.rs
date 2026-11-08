@@ -871,6 +871,45 @@ pub(crate) fn boot_id() -> Option<String> {
         .clone()
 }
 
+/// Process `pid`'s identity now, read only from what a restore's decision
+/// needs ([`super::ProcessIdentity`]).
+pub(crate) fn process_identity(pid: u32) -> super::ProcessIdentity {
+    identity_from_stat_read(std::fs::read(format!("/proc/{pid}/stat")), || {
+        no_such_process(pid)
+    })
+}
+
+/// `read` is `/proc/<pid>/stat` as read; `absent` asks the kernel whether no
+/// process has that id.
+fn identity_from_stat_read(
+    read: std::io::Result<Vec<u8>>,
+    absent: impl FnOnce() -> bool,
+) -> super::ProcessIdentity {
+    // Red stub (#141 fork review finding 1): as process_and_parent reads it.
+    let _ = absent;
+    match read
+        .ok()
+        .and_then(|stat| String::from_utf8(stat).ok())
+        .and_then(|stat| stat_field_after_comm(&stat, STAT_STARTTIME))
+    {
+        Some(started) => super::ProcessIdentity::Running { started },
+        None => super::ProcessIdentity::Absent,
+    }
+}
+
+/// Whether the kernel says no process has id `pid` (`kill(pid, 0)` fails with
+/// `ESRCH`). Any other answer, a permission refusal included, is not absence.
+fn no_such_process(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 /// `/proc/<pid>/stat` fields counted from the state after the command name:
 /// field 4 (ppid) and field 22 (starttime, in clock ticks since boot).
 const STAT_PPID: usize = 1;
@@ -1280,6 +1319,80 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stat line as the kernel writes it, with `comm` as given.
+    fn stat_line(comm: &[u8], started: u64) -> Vec<u8> {
+        let mut line = b"4242 (".to_vec();
+        line.extend_from_slice(comm);
+        line.extend_from_slice(b") S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 ");
+        line.extend_from_slice(started.to_string().as_bytes());
+        line.extend_from_slice(b" 12345 678 18446744073709551615\n");
+        line
+    }
+
+    /// #141 fork review finding 1: only the kernel's own "no such process" is
+    /// absence; any read that fails, or parses only in part, claims nothing.
+    #[test]
+    fn a_failed_or_partial_stat_read_is_unreadable_not_absent() {
+        use super::super::ProcessIdentity::{Absent, Running, Unreadable};
+        let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let missing = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(identity_from_stat_read(denied(), || false), Unreadable);
+        // No stat file and no word from the kernel (a /proc that is not mounted,
+        // or hides the process): not absence.
+        assert_eq!(identity_from_stat_read(missing(), || false), Unreadable);
+        assert_eq!(identity_from_stat_read(missing(), || true), Absent);
+        for partial in [
+            b"".to_vec(),
+            b"4242 (sleep) S 1 2".to_vec(),
+            b"4242 (sleep".to_vec(),
+            b"4242 (sleep) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 x 1".to_vec(),
+        ] {
+            assert_eq!(
+                identity_from_stat_read(Ok(partial.clone()), || true),
+                Unreadable,
+                "{:?}",
+                String::from_utf8_lossy(&partial)
+            );
+        }
+        // A name that is not UTF-8, or holds ") " itself, still names its start.
+        for comm in [b"sleep-\xff".as_slice(), b"a) b (c", b"sleep"] {
+            assert_eq!(
+                identity_from_stat_read(Ok(stat_line(comm, 987654)), || true),
+                Running { started: 987654 },
+                "{:?}",
+                String::from_utf8_lossy(comm)
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_process_with_a_non_utf8_name_has_its_identity_read() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = crate::agent_launcher::TestDirectory::new();
+        let executable = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"sleep-\xff".to_vec()));
+        std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
+        let mut child = std::process::Command::new(&executable)
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let identity = process_identity(child.id());
+        let still_running = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(still_running);
+        assert!(
+            matches!(identity, super::super::ProcessIdentity::Running { .. }),
+            "{identity:?}"
+        );
+        // And an id no process can have is confirmed absent.
+        assert_eq!(
+            process_identity(u32::MAX - 1),
+            super::super::ProcessIdentity::Absent
+        );
+    }
 
     #[test]
     fn pty_unread_input_bytes_counts_what_the_terminal_side_has_not_read() {

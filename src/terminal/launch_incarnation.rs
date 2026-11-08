@@ -614,6 +614,52 @@ mod tests {
         );
     }
 
+    // A live process's comm need not be UTF-8. A failed text read of its
+    // stat is not evidence that the process disappeared during a restore.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_process_with_a_non_utf8_name_is_not_ended_at_restore() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let directory = crate::agent_launcher::TestDirectory::new();
+        let executable = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"sleep-\xff".to_vec()));
+        symlink("/bin/sleep", &executable).unwrap();
+        let mut child = std::process::Command::new(&executable)
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let stat = std::fs::read(format!("/proc/{}/stat", child.id())).unwrap();
+        let text = String::from_utf8_lossy(&stat);
+        let started = text
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let boot = crate::platform::boot_id();
+        let saved = SavedLaunch {
+            incarnation: mint("launch"),
+            process_id: child.id(),
+            process_started: started,
+            boot_id: boot.clone(),
+        };
+        let still_running = child.try_wait().unwrap().is_none();
+        let ended = saved.ended_at_restore(boot.as_deref(), process_now(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(still_running);
+        assert_eq!(
+            ended, None,
+            "an unreadable live process is not an ended launch"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_handoff_carries_a_bound_launch_for_the_next_server_to_attest_again() {
