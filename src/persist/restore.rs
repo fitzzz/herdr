@@ -892,6 +892,13 @@ fn restore_tab(
                 (Some(agent_name), Some(agent)) => {
                     terminal.restore_managed_agent(agent_name, agent)
                 }
+                // A name given with `agent rename` belongs to the conversation
+                // it was given to, which this restore resumes: the name binds
+                // to that conversation again, so another agent replacing it or
+                // the agent leaving the pane still frees it.
+                (Some(agent_name), None) if terminal.persisted_agent_session.is_some() => {
+                    terminal.set_agent_name(agent_name)
+                }
                 (Some(_), None) => {}
                 (None, _) => {}
             }
