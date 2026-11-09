@@ -3229,6 +3229,130 @@ mod tests {
         assert_eq!(terminal.launch_options_for_session("claude"), None);
     }
 
+    /// A pane whose agent was named with `agent rename` rather than started by
+    /// `agent start`, as a cold restore after a host shutdown reads it.
+    fn renamed_agent_snapshot() -> SessionSnapshot {
+        let mut snapshot = single_pane_snapshot(launch_options_session("claude", None));
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.agent_name = Some("worker".into());
+        pane.managed_agent_kind = None;
+        snapshot
+    }
+
+    fn restore_resuming(snapshot: &SessionSnapshot) -> HashMap<TerminalId, TerminalState> {
+        let (_workspaces, terminals, _runtimes) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        terminals
+    }
+
+    /// The restore resumes the conversation the name was given to, so the
+    /// resumed agent is the same agent and keeps the name; another agent
+    /// replacing it in the pane frees the name.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_cold_restore_that_resumes_a_renamed_agents_conversation_keeps_its_name() {
+        let mut terminals = restore_resuming(&renamed_agent_snapshot());
+        let terminal = terminals.values_mut().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+        assert_eq!(terminal.managed_agent_kind(), None);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+        // The resumed process reports its conversation as Claude's session
+        // hook does.
+        terminal.set_agent_session_ref(
+            "herdr:claude".into(),
+            "claude".into(),
+            seeded_session("claude"),
+            Some(1),
+        );
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            std::time::Instant::now(),
+        );
+        assert_eq!(terminal.agent_name, None);
+    }
+
+    /// The resumed agent leaving the pane frees the name, as it does for any
+    /// agent.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_renamed_agent_restored_by_resume_frees_its_name_when_it_exits() {
+        let mut terminals = restore_resuming(&renamed_agent_snapshot());
+        let terminal = terminals.values_mut().next().unwrap();
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+
+        let now = std::time::Instant::now();
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(crate::detect::Agent::Claude),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            now,
+        );
+        terminal.set_detected_state_with_screen_signals_at(
+            None,
+            AgentState::Unknown,
+            false,
+            false,
+            false,
+            false,
+            now + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(terminal.agent_name, None);
+        assert!(!terminal.is_agent_terminal());
+    }
+
+    /// Nothing is resumed, so no agent runs under the name.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_cold_restore_without_resume_still_drops_a_renamed_agents_name() {
+        let (_workspaces, terminals, _runtimes) = restore(
+            &renamed_agent_snapshot(),
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert_eq!(terminal.agent_name, None);
+    }
+
     /// The conversation saved for the restored pane, with its launch options,
     /// after `act` runs on its terminal.
     fn saved_after_restore(
