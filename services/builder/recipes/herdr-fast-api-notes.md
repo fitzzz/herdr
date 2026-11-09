@@ -7,6 +7,8 @@
 This recipe is the **Linux CI gate**. It is not all of `just check` and it does not replace GitHub CI.
 
 It runs `just lint`, `just ci-tests`, `just docs-contract-test` and the scalar libghostty check of the Linux CI job.
+In a build service result each check is the CTest test of the same name: `lint`, `ci-tests` and `docs-contract-test`
+for the three `just` recipes, and `ghostty-scalar` for the scalar libghostty check.
 
 It does not run:
 
