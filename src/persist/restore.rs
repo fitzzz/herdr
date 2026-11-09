@@ -3360,6 +3360,27 @@ mod tests {
         assert_eq!(terminal.agent_name, None);
     }
 
+    /// A reported resume command with no saved conversation is still
+    /// resumed, but the name was given to a conversation the restore cannot
+    /// name, so it is not bound to the resumed agent and comes back unnamed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_renamed_pane_resumed_only_by_its_reported_command_comes_back_unnamed() {
+        let mut snapshot = renamed_agent_snapshot();
+        let pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        pane.agent_session = None;
+        pane.agent_resume = Some(super::super::snapshot::PaneAgentResumeSnapshot {
+            source: "prime-agent".into(),
+            agent: "prime-agent".into(),
+            argv: vec!["prime-agent".into(), "--continue".into()],
+        });
+        let terminals = restore_resuming(&snapshot);
+        let terminal = terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert_eq!(terminal.agent_name, None);
+    }
+
     /// The conversation saved for the restored pane, with its launch options,
     /// after `act` runs on its terminal.
     fn saved_after_restore(
