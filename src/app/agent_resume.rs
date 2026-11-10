@@ -796,6 +796,54 @@ mod tests {
         }
     }
 
+    /// A restore names the pane when it plans to resume the conversation the
+    /// name was given to. When the resume is then declined, the pane keeps
+    /// the name with the conversation saved for the next restore, as a pane
+    /// started by `agent start` does, until the existing rules free it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_declined_resume_keeps_a_renamed_panes_name_until_another_agent_takes_the_pane() {
+        let temp = crate::agent_launcher::TestDirectory::new();
+        let launcher = temp.path().join("agent-accounts");
+        let (mut app, id) = app_with_unbound_codex_pane(&launcher, None);
+        // As the restore named it: bound to the saved conversation.
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.set_agent_name("worker".into());
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Idle,
+        );
+
+        assert!(app.start_pending_agent_resume_for_terminal(&id, 24, 80, true));
+        let terminal = &app.state.terminals[&id];
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert!(terminal.restore_error.is_some(), "the resume was declined");
+        assert_eq!(terminal.agent_name.as_deref(), Some("worker"));
+        let saved = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        let pane = saved.workspaces[0].tabs[0].panes.values().next().unwrap();
+        assert_eq!(pane.agent_name.as_deref(), Some("worker"));
+        assert_eq!(pane.agent_session.as_ref().unwrap().value, "same-uuid");
+
+        app.state
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
+        assert_eq!(app.state.terminals[&id].agent_name, None);
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_missing_account_launcher_refuses_before_native_spawn() {

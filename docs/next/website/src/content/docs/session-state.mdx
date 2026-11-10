@@ -124,6 +124,8 @@ Unsupported, missing, invalid, duplicated, or stale session references restore a
 
 If native agent session restore applies to a pane, Herdr resumes the agent session instead of replaying saved pane history for that pane.
 
+When a restore plans to resume a pane's saved conversation, the pane keeps its agent's name, whether it was given with `herdr agent start` or `herdr agent rename`, until another agent replaces the agent or the agent leaves the pane. If Herdr then does not resume it, for example because the pane's launcher was saved for another conversation, the agent's account is unknown, the saved directory is gone or the shell does not start, the pane keeps the name and the saved conversation for the next restore and shows why in the pane. A name given with `herdr agent rename` comes back only with a saved conversation, and a pane that restores as a shell without a planned resume comes back without a name.
+
 ## Live handoff
 
 Live handoff is for update and remote attach flows that need to replace a running Herdr server. It asks the old server to transfer live panes to the new server, so pane processes can keep running across the server replacement.
