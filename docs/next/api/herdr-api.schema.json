@@ -1244,6 +1244,26 @@
           ],
           "type": "object"
         },
+        "AgentClaimTrackedStartParams": {
+          "description": "Strict helper permission request. The server also authenticates the socket\npeer's process instance and its original pane shell.",
+          "properties": {
+            "launch_incarnation": {
+              "type": "string"
+            },
+            "nonce": {
+              "type": "string"
+            },
+            "start_request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "start_request_id",
+            "nonce",
+            "launch_incarnation"
+          ],
+          "type": "object"
+        },
         "AgentLaunchStatusParams": {
           "description": "Asks what this server knows of one admitted launch, by its token alone.",
           "properties": {
@@ -1447,6 +1467,17 @@
           ],
           "type": "object"
         },
+        "AgentStartStatusParams": {
+          "properties": {
+            "start_request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "start_request_id"
+          ],
+          "type": "object"
+        },
         "AgentStartWithLauncherParams": {
           "description": "Separately advertised so older servers cannot silently ignore the launcher.",
           "properties": {
@@ -1478,6 +1509,52 @@
             }
           },
           "required": [
+            "name",
+            "kind",
+            "pane_id",
+            "launcher"
+          ],
+          "type": "object"
+        },
+        "AgentStartWithLauncherTrackedParams": {
+          "description": "Separately advertised so older servers cannot silently ignore the launcher.",
+          "properties": {
+            "args": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "launcher": {
+              "$ref": "#/schemas/request/$defs/AgentLauncher"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "start_request_id": {
+              "type": "string"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "start_request_id",
+            "expected_terminal_id",
             "name",
             "kind",
             "pane_id",
@@ -5625,6 +5702,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentStartWithLauncherParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.start_with_launcher_tracked",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartWithLauncherTrackedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.start_status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentStartStatusParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.claim_tracked_start",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentClaimTrackedStartParams"
             }
           },
           "required": [
@@ -10008,6 +10133,19 @@
                 "launcher": {
                   "$ref": "#/schemas/success_response/$defs/AgentLauncher"
                 },
+                "start_request_id": {
+                  "description": "Only the separately advertised tracked method sets these fields.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "agent_started_with_launcher",
                   "type": "string"
@@ -10018,6 +10156,110 @@
                 "agent",
                 "argv",
                 "launcher"
+              ],
+              "type": "object"
+            },
+            {
+              "oneOf": [
+                {
+                  "properties": {
+                    "state": {
+                      "const": "unknown",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "evidence": {
+                      "$ref": "#/schemas/success_response/$defs/StartDiscardEvidence"
+                    },
+                    "restored_at": {
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "state": {
+                      "const": "discarded_at_restore",
+                      "type": "string"
+                    },
+                    "terminal_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state",
+                    "terminal_id",
+                    "restored_at",
+                    "evidence"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "agent": {
+                      "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                    },
+                    "launch_incarnation": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "const": "authorized_attested",
+                      "type": "string"
+                    },
+                    "terminal_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "state",
+                    "terminal_id",
+                    "launch_incarnation",
+                    "agent"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "properties": {
+                "start_request_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_start_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "start_request_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "launch_incarnation": {
+                  "type": "string"
+                },
+                "nonce": {
+                  "type": "string"
+                },
+                "start_request_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_tracked_start_authorized",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "start_request_id",
+                "nonce",
+                "launch_incarnation"
               ],
               "type": "object"
             },
@@ -11160,6 +11402,10 @@
               "description": "`agent.send_keys` honors `expected_session`: it refuses with\n`agent_session_mismatch`, writing nothing, unless the occupant's current\nnative session equals it. Older servers ignore the field and write.",
               "type": "boolean"
             },
+            "agent_start_discard_at_restore": {
+              "description": "The server can durably track a start request and reconcile it at restore.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
@@ -11300,6 +11546,12 @@
           "enum": [
             "right",
             "down"
+          ],
+          "type": "string"
+        },
+        "StartDiscardEvidence": {
+          "enum": [
+            "unclaimed_at_cold_restore"
           ],
           "type": "string"
         },
