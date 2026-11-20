@@ -1665,6 +1665,9 @@ impl AppState {
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeReadFinished(_) => Vec::new(),
+            // The runtime consumes tracked start completions before updating pure state.
+            #[cfg(unix)]
+            AppEvent::TrackedStartFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
         }
