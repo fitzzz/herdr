@@ -94,6 +94,8 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
+#[cfg(unix)]
+pub(crate) use agent::run_attested_tracked_start;
 pub(crate) use agent::{EXEC_PATH_FLAG, RESOLVED_BY_SHELL_FLAG};
 
 /// The attesting launch helper an admitted agent start types; see

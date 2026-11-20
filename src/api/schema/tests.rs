@@ -788,6 +788,7 @@ fn success_response_round_trips() {
                 agent_prompt_expected_launch_incarnation: false,
                 agent_launch_status: false,
                 agent_launch_status_restore: false,
+                agent_start_discard_at_restore: false,
                 agent_launch_env: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),

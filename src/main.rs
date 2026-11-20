@@ -524,6 +524,12 @@ fn main() -> io::Result<()> {
     {
         std::process::exit(cli::run_attested_launch(&raw_args[2..])?);
     }
+    #[cfg(unix)]
+    if raw_args.get(1).map(String::as_str)
+        == Some(terminal::launch_incarnation::ATTEST_TRACKED_START_COMMAND)
+    {
+        std::process::exit(cli::run_attested_tracked_start(&raw_args[2..])?);
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }

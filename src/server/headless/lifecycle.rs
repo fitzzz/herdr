@@ -26,6 +26,12 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
+        if self.app.tracked_starts.io_pending() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "tracked agent start is committing; retry live handoff after it completes",
+            ));
+        }
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -102,13 +108,22 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
-        let manifest = crate::server::handoff::manifest_for(
+        let mut manifest = crate::server::handoff::manifest_for(
             snapshot,
             panes,
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
         );
+        let tracked_writer = self
+            .app
+            .tracked_starts
+            .records
+            .as_ref()
+            .filter(|writer| writer.has_history());
+        if tracked_writer.is_some() {
+            manifest.carry_tracked_starts(self.app.pending_starts_for_handoff());
+        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -130,6 +145,10 @@ impl HeadlessServer {
                     continue;
                 };
                 fds.push(runtime.duplicate_handoff_fd()?);
+            }
+            if let Some(writer) = tracked_writer {
+                use std::os::fd::IntoRawFd;
+                fds.push(writer.writer().try_clone()?.into_raw_fd());
             }
             Ok::<(), io::Error>(())
         })();
@@ -208,6 +227,9 @@ impl HeadlessServer {
             return Err(err);
         }
 
+        // The importer cannot serve tracked calls before commit. Dropping our
+        // copy now leaves the imported description as the only writer.
+        self.app.tracked_starts.records = None;
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
                 continue;
@@ -245,6 +267,7 @@ impl HeadlessServer {
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            self.app.tracked_starts.records.is_some(),
         )?;
 
         let client_path = client_socket_path();

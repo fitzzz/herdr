@@ -126,6 +126,21 @@ pub enum ResponseResult {
         /// As for `AgentStarted`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch_incarnation: Option<String>,
+        /// Only the separately advertised tracked method sets these fields.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_id: Option<String>,
+    },
+    AgentStartStatus {
+        start_request_id: String,
+        #[serde(flatten)]
+        state: super::agents::AgentStartState,
+    },
+    AgentTrackedStartAuthorized {
+        start_request_id: String,
+        nonce: String,
+        launch_incarnation: String,
     },
     AgentLaunchStatus {
         launch_incarnation: String,

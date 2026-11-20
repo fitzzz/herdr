@@ -224,4 +224,6 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+    #[cfg(unix)]
+    TrackedStartFinished(Box<crate::app::tracked_starts::Completion>),
 }

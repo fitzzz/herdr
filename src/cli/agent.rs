@@ -1106,7 +1106,62 @@ pub(crate) fn run_attested_launch(args: &[String]) -> std::io::Result<i32> {
             None
         }
     };
-    exec_launch(executable.map(String::as_str), argv, token.as_deref())
+    exec_launch(
+        executable.map(String::as_str),
+        argv,
+        token.as_deref(),
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// An opted-in launcher line can execute only on its own committed permission.
+#[cfg(unix)]
+pub(crate) fn run_attested_tracked_start(args: &[String]) -> std::io::Result<i32> {
+    let [socket, id, nonce, token, environment, separator, argv @ ..] = args else {
+        return Ok(2);
+    };
+    if separator != "--"
+        || !std::path::Path::new(socket).is_absolute()
+        || argv.is_empty()
+        || !crate::persist::start_records::canonical_request_id(id)
+        || nonce.is_empty()
+        || !crate::terminal::launch_incarnation::is_canonical_token(token)
+    {
+        return Ok(2);
+    }
+    let Ok(environment) =
+        serde_json::from_str::<std::collections::BTreeMap<String, String>>(environment)
+    else {
+        return Ok(2);
+    };
+    let client = crate::api::client::ApiClient::for_target(
+        crate::api::client::ConnectionTarget::SocketPath(socket.into()),
+    );
+    let request = Request {
+        id: "launch:tracked-attest".into(),
+        method: Method::AgentClaimTrackedStart(crate::api::schema::AgentClaimTrackedStartParams {
+            start_request_id: id.clone(),
+            nonce: nonce.clone(),
+            launch_incarnation: token.clone(),
+        }),
+    };
+    let timeout = Duration::from_secs(10);
+    let sent = std::time::Instant::now();
+    let Ok(reply) = client.request_value_with_timeout(&request, timeout) else {
+        return Ok(1);
+    };
+    let permission = &reply["result"];
+    if sent.elapsed() >= timeout
+        || reply.get("error").is_some()
+        || reply["id"].as_str() != Some(request.id.as_str())
+        || permission["type"] != "agent_tracked_start_authorized"
+        || permission["start_request_id"].as_str() != Some(id.as_str())
+        || permission["nonce"].as_str() != Some(nonce.as_str())
+        || permission["launch_incarnation"].as_str() != Some(token.as_str())
+    {
+        return Ok(1);
+    }
+    exec_launch(None, argv, Some(token), &environment)
 }
 
 /// The helper argument that ends an admission the pane's shell resolves.
@@ -1154,11 +1209,12 @@ fn exec_launch(
     executable: Option<&str>,
     argv: &[String],
     token: Option<&str>,
+    environment: &std::collections::BTreeMap<String, String>,
 ) -> std::io::Result<i32> {
     use std::os::unix::process::CommandExt as _;
     let program = executable.unwrap_or(&argv[0]);
     let mut command = std::process::Command::new(program);
-    command.arg0(&argv[0]).args(&argv[1..]);
+    command.arg0(&argv[0]).args(&argv[1..]).envs(environment);
     let key = crate::terminal::launch_incarnation::LAUNCH_INCARNATION_ENV_VAR;
     match token {
         Some(token) => command.env(key, token),
@@ -1174,6 +1230,7 @@ fn exec_launch(
     _executable: Option<&str>,
     argv: &[String],
     _token: Option<&str>,
+    _environment: &std::collections::BTreeMap<String, String>,
 ) -> std::io::Result<i32> {
     eprintln!(
         "herdr: launch attestation is not supported on this platform; not running {}",

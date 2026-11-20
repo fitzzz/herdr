@@ -79,6 +79,9 @@ pub struct ServerCapabilities {
     /// process a cold restore found gone. Older servers answer `none`.
     #[serde(default)]
     pub agent_launch_status_restore: bool,
+    /// The server can durably track a start request and reconcile it at restore.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub agent_start_discard_at_restore: bool,
     /// The launch helper gives the process it execs that admission's token
     /// in `HERDR_LAUNCH_INCARNATION`, and the claim's reply carries it.
     #[serde(default)]

@@ -154,6 +154,16 @@ impl App {
         params: AgentStartParams,
         launcher: Option<crate::api::schema::AgentLauncher>,
     ) -> Result<StartedAgent, AgentStartError> {
+        let start = self.prepare_agent_start(params, launcher, None)?;
+        self.dispatch_agent_start(start)
+    }
+
+    pub(super) fn prepare_agent_start(
+        &self,
+        params: AgentStartParams,
+        launcher: Option<crate::api::schema::AgentLauncher>,
+        tracked: Option<(&str, &str)>,
+    ) -> Result<PreparedAgentStart, AgentStartError> {
         let name = params.name;
         if !valid_agent_name(&name) {
             return Err(AgentStartError::InvalidName);
@@ -168,10 +178,6 @@ impl App {
         {
             return Err(AgentStartError::InvalidArgument);
         }
-        let persisted_agent_session =
-            crate::agent_resume::persisted_session_from_launch_args(kind, &params.args);
-        let launch_options =
-            crate::agent_resume::launch_options_from_agent_args(kind, &params.args);
         let conflicts = self.agent_name_conflicts(&name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -189,6 +195,13 @@ impl App {
             .and_then(|workspace| workspace.terminal_id(pane_id))
             .cloned()
             .ok_or_else(|| AgentStartError::TargetNotFound(params.pane_id.clone()))?;
+        #[cfg(unix)]
+        if self.tracked_starts.reserved(&terminal_id, &name) {
+            return Err(AgentStartError::TargetBusy(params.pane_id));
+        }
+        if tracked.is_some_and(|(_, expected_terminal)| terminal_id.as_str() != expected_terminal) {
+            return Err(AgentStartError::TargetNotFound(params.pane_id));
+        }
         let terminal = self
             .state
             .terminals
@@ -207,7 +220,7 @@ impl App {
         // Where the start can be attested, the shell runs the attesting
         // helper, which claims this admission from its own process and then
         // execs `argv` in it.
-        let mut attestation = attestable_launch(kind);
+        let mut attestation = attestable_launch(kind, tracked.map(|(id, _)| id));
         let helper = |attestation: &(String, _, String), tail: &[&str]| -> Vec<String> {
             [
                 attestation.0.clone(),
@@ -225,24 +238,59 @@ impl App {
             let argv = launcher.argv(&params.args);
             // The launcher is an executable the caller named, so the helper
             // execs it directly.
-            let typed = match &attestation {
-                Some(attestation) => helper(attestation, &["--"])
+            let typed = match (tracked, &attestation) {
+                (Some((request_id, _)), Some((executable, launch, nonce))) => {
+                    let socket = crate::api::socket_path();
+                    let socket = socket
+                        .to_str()
+                        .filter(|_| socket.is_absolute())
+                        .ok_or_else(|| {
+                            AgentStartError::TargetUnavailable(params.pane_id.clone())
+                        })?;
+                    let environment = serde_json::to_string(&launcher.env)
+                        .map_err(|err| AgentStartError::InvalidLauncher(err.to_string()))?;
+                    [
+                        executable.as_str(),
+                        crate::terminal::launch_incarnation::ATTEST_TRACKED_START_COMMAND,
+                        socket,
+                        request_id,
+                        nonce,
+                        launch.token(),
+                        &environment,
+                        "--",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .chain(argv.iter().cloned())
+                    .collect()
+                }
+                (Some(_), None) => {
+                    return Err(AgentStartError::TargetUnavailable(params.pane_id));
+                }
+                (None, Some(attestation)) => helper(attestation, &["--"])
                     .into_iter()
                     .chain(argv.iter().cloned())
                     .collect(),
-                None => argv.clone(),
+                (None, None) => argv.clone(),
             };
-            let command =
-                crate::platform::agent_launcher_command(&typed, &launcher.env, &shell_name)
-                    .ok_or_else(|| {
-                        AgentStartError::InvalidLauncher(
-                            "launcher cannot be encoded for the target shell".into(),
-                        )
-                    })?;
+            // The strict helper uses the server-selected socket and its own
+            // environment. Launcher overrides apply only once exec is authorized.
+            let helper_environment = std::collections::BTreeMap::new();
+            let environment = if tracked.is_some() {
+                &helper_environment
+            } else {
+                &launcher.env
+            };
+            let command = crate::platform::agent_launcher_command(&typed, environment, &shell_name)
+                .ok_or_else(|| {
+                    AgentStartError::InvalidLauncher(
+                        "launcher cannot be encoded for the target shell".into(),
+                    )
+                })?;
             (argv, command)
         } else {
             let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
-            argv.extend(params.args);
+            argv.extend(params.args.iter().cloned());
             // The pane's shell resolves the agent's command as it always did;
             // the helper runs only when that resolves to an executable file,
             // and execs the file the shell selected.
@@ -275,62 +323,70 @@ impl App {
             return Err(AgentStartError::InvalidTimeout);
         }
 
-        let now = Instant::now();
+        let launch_metadata = tracked
+            .is_none()
+            .then(|| AgentLaunchMetadata::from_start(kind, &params.args, launcher, &argv));
+        Ok(PreparedAgentStart {
+            pane: params.pane_id,
+            terminal_id,
+            name,
+            kind,
+            timeout,
+            bytes,
+            argv,
+            attestation: attestation.map(|(_, launch, nonce)| (launch, nonce)),
+            launch_metadata,
+        })
+    }
+
+    pub(super) fn dispatch_agent_start(
+        &mut self,
+        start: PreparedAgentStart,
+    ) -> Result<StartedAgent, AgentStartError> {
+        let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(&start.pane) else {
+            return Err(AgentStartError::TargetNotFound(start.pane));
+        };
+        let terminal_id = start.terminal_id;
+        if self.state.workspaces[ws_idx].terminal_id(pane_id) != Some(&terminal_id) {
+            return Err(AgentStartError::TargetNotFound(start.pane));
+        }
+        let runtime = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .ok_or_else(|| AgentStartError::TargetUnavailable(start.pane.clone()))?;
         let terminal = self
             .state
             .terminals
             .get_mut(&terminal_id)
-            .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
-        terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            .ok_or_else(|| AgentStartError::TargetUnavailable(start.pane.clone()))?;
+        terminal.begin_managed_agent(
+            start.name,
+            start.kind,
+            Instant::now(),
+            AGENT_START_SETTLE_DELAY,
+            start.timeout,
+        );
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(start.bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
-        let launch_incarnation = attestation
+        let launch_incarnation = start
+            .attestation
             .as_ref()
-            .map(|(_, launch, _)| launch.token().to_string());
-        terminal.admit_launch_incarnation(attestation.map(|(_, launch, _)| launch));
-        if let Some(options) = launch_options {
-            terminal.seed_agent_launch(crate::terminal::AgentLaunchSeed {
-                agent: kind,
-                options,
-                resumed_without_options: false,
-                account: None,
-                launch: crate::terminal::SeededLaunch::Started {
-                    session: persisted_agent_session
-                        .as_ref()
-                        .map(|session| session.session_ref.clone()),
-                },
-            });
-        }
-        if let Some(launcher) = launcher {
-            let binding = crate::agent_launcher::BoundAgentLauncher {
-                session_launch_incarnation: None,
-                observed: false,
-                argv: argv.clone(),
-                argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
-                launcher,
-                agent: crate::detect::agent_label(kind).to_string(),
-                session: persisted_agent_session
-                    .as_ref()
-                    .map(|session| session.session_ref.clone()),
-            };
-            terminal.record_agent_launcher_admission(binding, persisted_agent_session);
-        } else {
-            terminal.agent_launcher = None;
-            if let Some(session) = persisted_agent_session {
-                terminal.set_managed_agent_launch_session(session);
-            }
+            .map(|(launch, _)| launch.token().to_string());
+        terminal.admit_launch_incarnation(start.attestation.map(|(launch, _)| launch));
+        if let Some(metadata) = start.launch_metadata {
+            metadata.apply(terminal);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
 
         let agent = self
             .agent_info(ws_idx, pane_id)
-            .ok_or(AgentStartError::TargetUnavailable(params.pane_id))?;
+            .ok_or(AgentStartError::TargetUnavailable(start.pane))?;
         Ok(StartedAgent {
             agent,
-            argv,
+            argv: start.argv,
             launch_incarnation,
         })
     }
@@ -567,7 +623,7 @@ impl App {
         })
     }
 
-    fn agent_name_conflicts(
+    pub(super) fn agent_name_conflicts(
         &self,
         name: &str,
         except_terminal_id: &str,
@@ -578,6 +634,78 @@ impl App {
                 agent.name.as_deref() == Some(name) && agent.terminal_id != except_terminal_id
             })
             .collect()
+    }
+}
+
+pub(super) struct PreparedAgentStart {
+    pub(super) pane: String,
+    pub(super) terminal_id: crate::terminal::TerminalId,
+    pub(super) name: String,
+    kind: crate::detect::Agent,
+    pub(super) timeout: Duration,
+    bytes: Vec<u8>,
+    argv: Vec<String>,
+    pub(super) attestation: Option<(
+        crate::terminal::launch_incarnation::LaunchIncarnation,
+        String,
+    )>,
+    pub(super) launch_metadata: Option<AgentLaunchMetadata>,
+}
+
+pub(super) struct AgentLaunchMetadata {
+    seed: Option<crate::terminal::AgentLaunchSeed>,
+    binding: Option<crate::agent_launcher::BoundAgentLauncher>,
+    session: Option<crate::agent_resume::PersistedAgentSession>,
+}
+
+impl AgentLaunchMetadata {
+    pub(super) fn from_start(
+        kind: crate::detect::Agent,
+        args: &[String],
+        launcher: Option<crate::api::schema::AgentLauncher>,
+        argv: &[String],
+    ) -> Self {
+        let session = crate::agent_resume::persisted_session_from_launch_args(kind, args);
+        let session_ref = session.as_ref().map(|session| session.session_ref.clone());
+        let seed = crate::agent_resume::launch_options_from_agent_args(kind, args).map(|options| {
+            crate::terminal::AgentLaunchSeed {
+                agent: kind,
+                options,
+                resumed_without_options: false,
+                account: None,
+                launch: crate::terminal::SeededLaunch::Started {
+                    session: session_ref.clone(),
+                },
+            }
+        });
+        let binding = launcher.map(|launcher| crate::agent_launcher::BoundAgentLauncher {
+            session_launch_incarnation: None,
+            observed: false,
+            argv: argv.to_vec(),
+            argv_origin: crate::agent_launcher::LauncherArgvOrigin::Admission,
+            launcher,
+            agent: crate::detect::agent_label(kind).to_string(),
+            session: session_ref,
+        });
+        Self {
+            seed,
+            binding,
+            session,
+        }
+    }
+
+    pub(super) fn apply(self, terminal: &mut crate::terminal::TerminalState) {
+        if let Some(seed) = self.seed {
+            terminal.seed_agent_launch(seed);
+        }
+        if let Some(binding) = self.binding {
+            terminal.record_agent_launcher_admission(binding, self.session);
+        } else {
+            terminal.agent_launcher = None;
+            if let Some(session) = self.session {
+                terminal.set_managed_agent_launch_session(session);
+            }
+        }
     }
 }
 
@@ -596,6 +724,7 @@ pub(super) struct StartedAgent {
 /// and Herdr reads no process start times there, so no launch is attested.
 fn attestable_launch(
     agent: crate::detect::Agent,
+    tracked_request_id: Option<&str>,
 ) -> Option<(
     String,
     crate::terminal::launch_incarnation::LaunchIncarnation,
@@ -605,11 +734,15 @@ fn attestable_launch(
         return None;
     }
     let helper = crate::platform::launch_executable().ok()?;
-    let (launch, nonce) = crate::terminal::launch_incarnation::LaunchIncarnation::admit(agent);
+    use crate::terminal::launch_incarnation::LaunchIncarnation;
+    let (launch, nonce) = match tracked_request_id {
+        Some(id) => LaunchIncarnation::admit_tracked(agent, id),
+        None => LaunchIncarnation::admit(agent),
+    };
     Some((helper.display().to_string(), launch, nonce))
 }
 
-fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
+pub(super) fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
     #[cfg(test)]
     if runtime.child_pid().is_none() {
         return Some("sh".into());

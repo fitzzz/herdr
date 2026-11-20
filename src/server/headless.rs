@@ -3539,6 +3539,16 @@ impl HeadlessServer {
                 .handle_deferred_agent_send_keys(msg.request, msg.respond_to);
             return changed;
         }
+        #[cfg(unix)]
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::AgentStartWithLauncherTracked(_)
+                | api::schema::Method::AgentStartStatus(_)
+                | api::schema::Method::AgentClaimTrackedStart(_)
+        ) {
+            self.app.handle_tracked_start_request(msg);
+            return changed;
+        }
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self
                 .app

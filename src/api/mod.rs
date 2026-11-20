@@ -51,6 +51,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
             | Method::AgentStartWithLauncher(_)
+            | Method::AgentStartWithLauncherTracked(_)
             | Method::AgentPrompt(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)

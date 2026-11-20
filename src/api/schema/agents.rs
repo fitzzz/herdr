@@ -55,6 +55,50 @@ pub struct AgentAttestLaunchParams {
     pub resolved_by_shell: bool,
 }
 
+/// Strict helper permission request. The server also authenticates the socket
+/// peer's process instance and its original pane shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentClaimTrackedStartParams {
+    pub start_request_id: String,
+    pub nonce: String,
+    pub launch_incarnation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentStartWithLauncherTrackedParams {
+    pub start_request_id: String,
+    pub expected_terminal_id: String,
+    #[serde(flatten)]
+    pub start: AgentStartWithLauncherParams,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentStartStatusParams {
+    pub start_request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentStartState {
+    Unknown,
+    DiscardedAtRestore {
+        terminal_id: String,
+        restored_at: u64,
+        evidence: StartDiscardEvidence,
+    },
+    AuthorizedAttested {
+        terminal_id: String,
+        launch_incarnation: String,
+        agent: Box<AgentInfo>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StartDiscardEvidence {
+    UnclaimedAtColdRestore,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentWaitParams {
     pub target: String,

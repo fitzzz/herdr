@@ -19,6 +19,8 @@ use tracing::{info, warn};
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
 #[cfg(unix)]
+const TRACKED_START_HANDOFF_VERSION: u32 = 3;
+#[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -47,12 +49,17 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Present only when the source transfers a tracked-start writer. The
+    /// last descriptor is the original locked journal; panes come first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_starts: Option<Vec<crate::app::tracked_starts::HandoffStart>>,
 }
 
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
     pub fds: Vec<OwnedFd>,
+    pub tracked_start_writer: Option<OwnedFd>,
     #[cfg(target_os = "linux")]
     pub identities:
         Option<std::collections::HashMap<u32, super::handoff_identity::AdmittedPaneIdentity>>,
@@ -307,10 +314,16 @@ fn receive_inner(
         .transpose()?;
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds: Vec<OwnedFd> = recv_fds(&stream, manifest.panes.len())?
+    let descriptor_count = manifest.panes.len() + usize::from(manifest.tracked_starts.is_some());
+    let mut fds: Vec<OwnedFd> = recv_fds(&stream, descriptor_count)?
         .into_iter()
         .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .collect();
+    let tracked_start_writer = if manifest.tracked_starts.is_some() {
+        fds.pop()
+    } else {
+        None
+    };
     #[cfg(target_os = "linux")]
     if let Some(attempt) = identity {
         for fd in &fds {
@@ -321,6 +334,7 @@ fn receive_inner(
     Ok(ReceivedHandoff {
         manifest,
         fds,
+        tracked_start_writer,
         #[cfg(target_os = "linux")]
         identities,
         stream,
@@ -376,6 +390,18 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        tracked_starts: None,
+    }
+}
+
+#[cfg(unix)]
+impl HandoffManifest {
+    pub(crate) fn carry_tracked_starts(
+        &mut self,
+        starts: Vec<crate::app::tracked_starts::HandoffStart>,
+    ) {
+        self.version = TRACKED_START_HANDOFF_VERSION;
+        self.tracked_starts = Some(starts);
     }
 }
 
@@ -385,7 +411,9 @@ pub(crate) fn validate_manifest_format(manifest: &HandoffManifest) -> io::Result
         .snapshot
         .validate_launcher_version()
         .map_err(io::Error::other)?;
-    let required_version = if manifest.snapshot.has_agent_launcher() {
+    let required_version = if manifest.tracked_starts.is_some() {
+        TRACKED_START_HANDOFF_VERSION
+    } else if manifest.snapshot.has_agent_launcher() {
         2
     } else {
         HANDOFF_VERSION

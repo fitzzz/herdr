@@ -64,27 +64,40 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
-    // Start the JSON API socket server.
-    let _api_server = match api::start_server_with_stop_control(
-        api_tx.clone(),
-        event_hub.clone(),
-        should_quit.clone(),
-    ) {
-        Ok(server) => server,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
-            eprintln!("api socket: {}", api::socket_path().display());
-            std::process::exit(1);
-        }
-        Err(err) => return Err(err),
-    };
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
+        #[cfg(unix)]
+        let records = open_start_records(true).await;
+        let tracked_starts = {
+            #[cfg(unix)]
+            {
+                records.is_some()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        // Start the JSON API socket server.
+        let _api_server = match api::start_server_with_stop_control(
+            api_tx.clone(),
+            event_hub.clone(),
+            should_quit.clone(),
+            tracked_starts,
+        ) {
+            Ok(server) => server,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                eprintln!("error: herdr server is already running");
+                eprintln!("api socket: {}", api::socket_path().display());
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        };
+
         // Create the App (with AppState, event channels, etc.).
         let mut app = app::App::new(
             &loaded_config.config,
@@ -93,6 +106,10 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        #[cfg(unix)]
+        {
+            app.tracked_starts.records = records;
+        }
         seed_startup_workspace_if_empty(&mut app);
 
         // Create the headless server.
@@ -126,6 +143,45 @@ pub fn run_server() -> io::Result<()> {
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
     result
+}
+
+#[cfg(unix)]
+async fn open_start_records(
+    cold: bool,
+) -> Option<Arc<crate::persist::start_records::StartRecords>> {
+    use crate::persist::start_records::StartRecords;
+    let deadline = std::time::Instant::now() + crate::server::handoff::COMMIT_TIMEOUT;
+    loop {
+        let result = tokio::task::spawn_blocking(move || {
+            let path = crate::session::data_dir();
+            if cold {
+                StartRecords::open_cold(&path)
+            } else {
+                StartRecords::open_live(&path)
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(records)) => return Some(Arc::new(records)),
+            // A history-free handoff used the old format. Its old writer
+            // closes after commit; never do cold retirement on this path.
+            Ok(Err(err))
+                if !cold
+                    && err.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(Err(err)) => {
+                warn!(%err, "tracked agent starts unavailable");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, "tracked agent start writer could not start");
+                return None;
+            }
+        }
+    }
 }
 
 fn seed_startup_workspace_if_empty(app: &mut app::App) {
@@ -262,7 +318,32 @@ fn run_handoff_import_server(
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        let app = app::App::new_from_handoff(
+        let starts = received.manifest.tracked_starts.take();
+        let records = match (starts, received.tracked_start_writer.take()) {
+            (Some(starts), Some(fd)) => {
+                let (writer, starts) = tokio::task::spawn_blocking(move || {
+                    let writer = crate::persist::start_records::StartRecords::import_handoff(
+                        &crate::session::data_dir(),
+                        fd.into(),
+                    )?;
+                    for start in &starts {
+                        if !start.is_pending_in(&writer)? {
+                            return Err(io::Error::other(
+                                "handoff strict start has no exact pending record",
+                            ));
+                        }
+                    }
+                    Ok::<_, io::Error>((writer, starts))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                Some((Arc::new(writer), starts))
+            }
+            (None, None) => None,
+            _ => return Err(io::Error::other("handoff tracked-start writer is missing")),
+        };
+
+        let mut app = app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
@@ -270,6 +351,10 @@ fn run_handoff_import_server(
             &received.manifest.snapshot,
             &mut imports,
         )?;
+        if let Some((records, starts)) = records {
+            app.import_pending_starts(starts)?;
+            app.tracked_starts.records = Some(records);
+        }
         crate::server::handoff::report_restored(&mut received.stream)?;
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(
@@ -282,6 +367,7 @@ fn run_handoff_import_server(
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            true, // Requests are served only after ownership and journal initialization.
         )?;
         let mut server = HeadlessServer::new(
             app,
@@ -300,6 +386,9 @@ fn run_handoff_import_server(
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             warn!(err = %err, "failed to report handoff ownership; continuing as owner");
+        }
+        if server.app.tracked_starts.records.is_none() {
+            server.app.tracked_starts.records = open_start_records(false).await;
         }
         info!("handoff import server started");
         print_ready_message(&api::socket_path(), &client_socket_path());

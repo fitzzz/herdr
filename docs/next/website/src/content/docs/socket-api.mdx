@@ -1073,6 +1073,31 @@ restored metadata alone never confirms it, and a cold restore drops
 terminal, provider, native identity and the entire launcher before continuing.
 An unknown or mismatched result is not permission to retry or create a replacement.
 
+#### Tracked launcher starts
+
+A server that advertises `agent_start_discard_at_restore` lists both
+`agent.start_with_launcher_tracked` and `agent.start_status` in its methods.
+The tracked method takes the existing launcher arguments plus a canonical
+lowercase UUID in `start_request_id` and the original runtime terminal in
+`expected_terminal_id`. Its `agent_started_with_launcher` result echoes the
+request ID and original `terminal_id`. A reused ID returns
+`start_request_already_recorded` without queueing launcher input.
+
+Read the request by calling `agent.start_status` with its `start_request_id`.
+The result type is `agent_start_status` and echoes the request ID.
+
+| State | Evidence |
+| --- | --- |
+| `discarded_at_restore` | A fenced cold restore durably retired the exact unclaimed start. The result gives the original `terminal_id`, `restored_at` in UTC epoch milliseconds, and `evidence: unclaimed_at_cold_restore`. |
+| `authorized_attested` | One observation found the exact authorized launch still attested on its original terminal. The result gives the original `terminal_id`, the canonical `launch_incarnation`, and the current `agent` receipt with that same token. |
+| `unknown` | The server has no conclusive discard or current attestation for the ID. This includes a pending start, an authorized launch without current attestation, a foreign occupant, and a missing or unreadable record. |
+
+The tracked helper requires a durable, request-bound permission before it executes
+the launcher. A cold restore cannot discard a start once permission could have
+escaped. Live handoff preserves the pending claim and its continuing shell without
+certifying a discard. A client recovering a lost response uses the status lookup
+and keeps the original request when the answer is inconclusive.
+
 Same-identity recovery reapplies the launcher to Herdr's existing canonical
 native resume arguments, with the agent's launch options for the agent kinds that
 `ping` lists in `result.capabilities.launch_option_replay`. Herdr reads those

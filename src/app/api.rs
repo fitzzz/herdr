@@ -167,6 +167,12 @@ impl App {
             return Vec::new();
         }
 
+        #[cfg(unix)]
+        if let AppEvent::TrackedStartFinished(result) = ev {
+            self.finish_tracked_start_io(*result);
+            return Vec::new();
+        }
+
         if let AppEvent::WorktreeReadFinished(result) = ev {
             self.handle_api_worktree_read_finished(*result);
             return Vec::new();

@@ -335,6 +335,8 @@ impl App {
                     argv: started.argv,
                     launcher,
                     launch_incarnation: started.launch_incarnation,
+                    start_request_id: None,
+                    terminal_id: None,
                 },
             ),
             Err(err) => encode_error_body(id, self.agent_start_error_body(err)),

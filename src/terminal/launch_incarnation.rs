@@ -54,6 +54,7 @@ use crate::platform::ProcessInstance;
 
 /// The argument that makes the herdr binary run the attesting launch helper.
 pub(crate) const ATTEST_LAUNCH_COMMAND: &str = "__attest-launch";
+pub(crate) const ATTEST_TRACKED_START_COMMAND: &str = "__attest-tracked-start";
 
 /// The variable the helper sets, in the process it execs only, to the token of
 /// the admission that process claimed.
@@ -66,7 +67,10 @@ pub(crate) const ENDED_LAUNCHES_KEPT: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     /// Admitted; the helper has not claimed the launch yet.
-    Admitted { nonce: String },
+    Admitted {
+        nonce: String,
+        tracked_request_id: Option<String>,
+    },
     /// Bound to the process that claimed the admission, or carried by a live
     /// handoff, but not yet identified by detection as the agent process.
     Claimed(ProcessInstance),
@@ -94,6 +98,31 @@ impl LaunchIncarnation {
     /// A new admission of `agent`, with its public token and the one-use nonce
     /// the typed helper claims it with.
     pub(crate) fn admit(agent: Agent) -> (Self, String) {
+        Self::admission(agent, None)
+    }
+
+    pub(crate) fn admit_tracked(agent: Agent, start_request_id: &str) -> (Self, String) {
+        Self::admission(agent, Some(start_request_id.to_string()))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn carried_tracked(
+        agent: Agent,
+        request_id: &str,
+        nonce: &str,
+        token: &str,
+    ) -> Self {
+        Self {
+            token: token.to_string(),
+            agent,
+            phase: Phase::Admitted {
+                nonce: nonce.to_string(),
+                tracked_request_id: Some(request_id.to_string()),
+            },
+        }
+    }
+
+    fn admission(agent: Agent, tracked_request_id: Option<String>) -> (Self, String) {
         let nonce = mint("nonce");
         (
             Self {
@@ -101,6 +130,7 @@ impl LaunchIncarnation {
                 agent,
                 phase: Phase::Admitted {
                     nonce: nonce.clone(),
+                    tracked_request_id,
                 },
             },
             nonce,
@@ -130,9 +160,18 @@ impl LaunchIncarnation {
         }
     }
 
-    /// Whether this admission waits for `nonce`.
+    /// Whether the legacy claim may use this nonce. Tracked starts use the
+    /// request-bound handler so a legacy claim cannot bypass the journal.
     pub(crate) fn awaits(&self, nonce: &str) -> bool {
-        matches!(&self.phase, Phase::Admitted { nonce: pending } if pending == nonce)
+        matches!(&self.phase, Phase::Admitted { nonce: pending, tracked_request_id: None }
+            if pending == nonce)
+    }
+
+    pub(crate) fn awaits_tracked(&self, start_request_id: &str, nonce: &str, token: &str) -> bool {
+        self.token == token
+            && matches!(&self.phase, Phase::Admitted {
+                nonce: pending, tracked_request_id: Some(tracked)
+            } if pending == nonce && tracked == start_request_id)
     }
 
     /// The process the launch is bound to, once claimed.
@@ -461,6 +500,16 @@ mod tests {
         let (launch, nonce) = LaunchIncarnation::admit(Agent::Codex);
         assert_ne!(launch.token(), nonce, "the nonce is not the public token");
         assert!(nonce.starts_with("nonce_"));
+    }
+
+    #[test]
+    fn tracked_admission_cannot_be_claimed_by_the_legacy_nonce() {
+        let (launch, nonce) = LaunchIncarnation::admit_tracked(Agent::Codex, "start-a");
+        assert!(!launch.awaits(&nonce));
+        assert!(launch.awaits_tracked("start-a", &nonce, launch.token()));
+        assert!(!launch.awaits_tracked("start-b", &nonce, launch.token()));
+        assert!(!launch.awaits_tracked("start-a", "wrong", launch.token()));
+        assert!(!launch.awaits_tracked("start-a", &nonce, "other-token"));
     }
 
     #[test]

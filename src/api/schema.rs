@@ -139,6 +139,12 @@ pub enum Method {
     AgentStart(AgentStartParams),
     #[serde(rename = "agent.start_with_launcher")]
     AgentStartWithLauncher(AgentStartWithLauncherParams),
+    #[serde(rename = "agent.start_with_launcher_tracked")]
+    AgentStartWithLauncherTracked(AgentStartWithLauncherTrackedParams),
+    #[serde(rename = "agent.start_status")]
+    AgentStartStatus(AgentStartStatusParams),
+    #[serde(rename = "agent.claim_tracked_start")]
+    AgentClaimTrackedStart(AgentClaimTrackedStartParams),
     #[serde(rename = "agent.launcher_info")]
     AgentLauncherInfo(AgentTarget),
     #[serde(rename = "agent.launch_status")]

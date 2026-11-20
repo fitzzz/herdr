@@ -64,8 +64,19 @@ pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
+    tracked_starts: bool,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    let mut capabilities = default_capabilities();
+    if tracked_starts {
+        if let Some(capabilities) = &mut capabilities {
+            capabilities.agent_start_discard_at_restore = true;
+            capabilities.methods.extend([
+                "agent.start_with_launcher_tracked".into(),
+                "agent.start_status".into(),
+            ]);
+        }
+    }
+    start_server_inner(api_tx, event_hub, capabilities, Some(server_stop))
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -89,6 +100,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         agent_prompt_expected_launch_incarnation: true,
         agent_launch_status: true,
         agent_launch_status_restore: true,
+        agent_start_discard_at_restore: false,
         agent_launch_env: cfg!(unix),
         terminal_attach_expected_launch_incarnation: true,
         launch_option_replay: crate::detect::Agent::ALL
@@ -478,7 +490,9 @@ fn handle_connection_with_stop(
         method_body => {
             let peer_ancestry = matches!(
                 method_body,
-                Method::PaneReportAgentSession(_) | Method::AgentAttestLaunch(_)
+                Method::PaneReportAgentSession(_)
+                    | Method::AgentAttestLaunch(_)
+                    | Method::AgentClaimTrackedStart(_)
             )
             .then(|| crate::platform::local_stream_peer_process_id(&stream))
             .flatten()
@@ -651,6 +665,9 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentStartWithLauncher(_) => "agent.start_with_launcher",
+        Method::AgentStartWithLauncherTracked(_) => "agent.start_with_launcher_tracked",
+        Method::AgentStartStatus(_) => "agent.start_status",
+        Method::AgentClaimTrackedStart(_) => "agent.claim_tracked_start",
         Method::AgentLauncherInfo(_) => "agent.launcher_info",
         Method::AgentLaunchStatus(_) => "agent.launch_status",
         Method::AgentAttestLaunch(_) => "agent.attest_launch",
@@ -1548,6 +1565,7 @@ mod tests {
                 agent_prompt_expected_launch_incarnation: false,
                 agent_launch_status: false,
                 agent_launch_status_restore: false,
+                agent_start_discard_at_restore: false,
                 agent_launch_env: false,
                 terminal_attach_expected_launch_incarnation: false,
                 launch_option_replay: Vec::new(),

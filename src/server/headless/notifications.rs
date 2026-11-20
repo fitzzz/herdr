@@ -302,6 +302,14 @@ impl HeadlessServer {
         if self.host_shutdown_requested.load(Ordering::Acquire) {
             return false;
         }
+        #[cfg(unix)]
+        if matches!(&ev, AppEvent::TrackedStartFinished(_))
+            && self.should_quit.load(Ordering::Acquire)
+        {
+            // A journal write already in flight may commit, but shutdown
+            // must not publish permission or dispatch from its callback.
+            return false;
+        }
         let focus_response = match &mut ev {
             AppEvent::WorktreeAddFinished(result) => result
                 .api_request

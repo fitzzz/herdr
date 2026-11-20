@@ -25,6 +25,8 @@ mod tab_bar_status;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+#[cfg(unix)]
+pub(crate) mod tracked_starts;
 mod window_title;
 mod worktrees;
 
@@ -133,6 +135,8 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    #[cfg(unix)]
+    pub(crate) tracked_starts: tracked_starts::TrackedStarts,
     startup_per_agent_delay: Duration,
     /// `[session] account_launcher`, with `~` expanded.
     account_launcher: Option<std::path::PathBuf>,
@@ -603,6 +607,8 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            #[cfg(unix)]
+            tracked_starts: tracked_starts::TrackedStarts::default(),
             startup_per_agent_delay: Duration::from_millis(
                 config.session.startup_per_agent_delay_ms.into(),
             ),

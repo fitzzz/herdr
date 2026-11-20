@@ -3173,6 +3173,13 @@ impl TerminalState {
             .is_some_and(|launch| launch.awaits(nonce))
     }
 
+    #[cfg(unix)]
+    pub(crate) fn awaits_tracked_start(&self, id: &str, nonce: &str, token: &str) -> bool {
+        self.launch_incarnation
+            .as_ref()
+            .is_some_and(|launch| launch.awaits_tracked(id, nonce, token))
+    }
+
     /// The launch helper `process`, child of `parent`, claimed the admission;
     /// `shell` is the pane's shell. A bound claim returns the launch's token
     /// for that process. A refused claim ends the launch, since its one-use
