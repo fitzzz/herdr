@@ -992,6 +992,163 @@ fn terminal_input(
     )
 }
 
+#[cfg(target_os = "linux")]
+struct ParkedPaneShell(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl ParkedPaneShell {
+    fn park(api_socket: &Path, pane: &serde_json::Value, marker: &Path) -> Self {
+        use std::os::fd::FromRawFd;
+
+        // The shell stops itself at a builtin. No foreground child can consume
+        // the launch line or make the shell busy at admission.
+        assert_ok(terminal_input(
+            api_socket,
+            "pane.send_input",
+            serde_json::json!({
+                "pane_id": pane,
+                "text": format!("printf '%s\\n' $$ > {}; kill -STOP $$", marker.display()),
+                "keys": ["Enter"],
+            }),
+        ));
+        let pid = wait_for_pid_marker(marker, Duration::from_secs(5));
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        let shell = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
+        let proc_status = PathBuf::from(format!("/proc/{pid}/status"));
+        wait_for_file_contains(&proc_status, "State:\tT", Duration::from_secs(5));
+        shell
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ParkedPaneShell {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // A dead shell is harmless. The descriptor cannot resume a reused PID.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                libc::SIGCONT,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tracked_start_discards_only_the_unclaimed_request_after_cold_restore() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let state_home = base.join("state");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ran = base.join("launcher-ran");
+    let start = || {
+        let server = spawn_server_with_env(
+            &config_home,
+            &runtime_dir,
+            &api_socket,
+            &[
+                ("HERDR_SESSION", "tracked-start"),
+                ("XDG_STATE_HOME", state_home.to_str().unwrap()),
+            ],
+        );
+        wait_for_api(&api_socket, Duration::from_secs(10));
+        server
+    };
+    register_runtime_dir(&runtime_dir);
+    let mut old = start();
+    let created = terminal_input(
+        &api_socket,
+        "workspace.create",
+        serde_json::json!({"cwd": base, "focus": false}),
+    );
+    assert_ok(created.clone());
+    let pane = &created["result"]["root_pane"]["pane_id"];
+    let terminal = &created["result"]["root_pane"]["terminal_id"];
+    let shell = ParkedPaneShell::park(&api_socket, pane, &base.join("shell-pid"));
+    let start_request_id = "b1b3fb45-deb9-4b7e-98c7-6f7aa3cf58a9";
+    let params = serde_json::json!({
+        "start_request_id": start_request_id,
+        "expected_terminal_id": terminal,
+        "pane_id": pane,
+        "name": "tracked-unclaimed",
+        "kind": "codex",
+        "args": ["resume", "00000000-0000-4000-8000-000000000123"],
+        "launcher": {
+            "executable": "/bin/sh",
+            "prefix_args": ["-c", format!("printf 'ran\\n' >> {}", ran.display()), "launcher"],
+            "env": {},
+        },
+    });
+    let admit = |params| terminal_input(&api_socket, "agent.start_with_launcher_tracked", params);
+    let status = |id| {
+        terminal_input(
+            &api_socket,
+            "agent.start_status",
+            serde_json::json!({"start_request_id": id}),
+        )
+    };
+    let admitted = admit(params.clone());
+    assert_ok(admitted.clone());
+    assert_eq!(admitted["result"]["start_request_id"], start_request_id);
+    assert_eq!(admitted["result"]["terminal_id"], *terminal);
+    assert_eq!(status(start_request_id)["result"]["state"], "unknown");
+    assert_eq!(
+        admit(params.clone())["error"]["code"],
+        "start_request_already_recorded"
+    );
+    let mut conflicting = params.clone();
+    conflicting["name"] = serde_json::json!("another-launch");
+    assert_eq!(
+        admit(conflicting)["error"]["code"],
+        "start_request_already_recorded"
+    );
+    assert!(!ran.exists());
+
+    old.child.kill().unwrap();
+    old.child.wait().unwrap();
+    drop(old);
+    let mut restored = start();
+    let fact = status(start_request_id)["result"].clone();
+    assert_eq!(fact["type"], "agent_start_status");
+    assert_eq!(fact["state"], "discarded_at_restore");
+    assert_eq!(fact["start_request_id"], start_request_id);
+    assert_eq!(fact["terminal_id"], *terminal);
+    assert_eq!(fact["evidence"], "unclaimed_at_cold_restore");
+    assert!(fact["restored_at"].as_i64().is_some_and(|ms| ms > 0));
+    drop(shell);
+    assert_eq!(
+        admit(params)["error"]["code"],
+        "start_request_already_recorded"
+    );
+    assert!(!ran.exists());
+
+    restored.child.kill().unwrap();
+    restored.child.wait().unwrap();
+    drop(restored);
+    let last = start();
+    assert_eq!(status(start_request_id)["result"], fact);
+    assert_eq!(
+        status("f4476579-4061-449a-80f6-9c5880c61f2f")["result"]["state"],
+        "unknown"
+    );
+    assert!(!ran.exists());
+    assert_ok(terminal_input(
+        &api_socket,
+        "server.stop",
+        serde_json::json!({}),
+    ));
+    drop(last);
+    cleanup_test_base(&base);
+}
+
 fn terminal_input_write(
     socket_path: &Path,
     stream: &serde_json::Value,
@@ -1688,6 +1845,16 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 
 #[test]
 fn live_handoff_preserves_agent_launcher_and_requires_fresh_native_observation() {
+    exercise_agent_launcher_handoff(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tracked_start_recovers_the_attested_launch_after_losing_the_start_reply() {
+    exercise_agent_launcher_handoff(Some("e8aaeca9-4cc2-4f1a-82fc-90df748b1acc"));
+}
+
+fn exercise_agent_launcher_handoff(start_request_id: Option<&str>) {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1706,7 +1873,7 @@ fn live_handoff_preserves_agent_launcher_and_requires_fresh_native_observation()
         &fake_provider,
         r#"import json, os, socket, sys
 with open(sys.argv[1], 'w') as out:
-    json.dump([os.getpid(), sys.argv[4:], os.environ['FIXTURE_ACCOUNT'], os.environ['FIXTURE_REQUIRED'], sys.argv[3]], out)
+    json.dump([os.getpid(), sys.argv[4:], os.environ['FIXTURE_ACCOUNT'], os.environ['FIXTURE_REQUIRED'], sys.argv[3], os.environ.get('HERDR_LAUNCH_INCARNATION')], out)
 for line in sys.stdin:
     if line.startswith('report '):
         seq = int(line.split()[1])
@@ -1728,7 +1895,13 @@ for line in sys.stdin:
 "#,
     )
     .unwrap();
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    let state_home = base.join("state");
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("XDG_STATE_HOME", state_home.to_str().unwrap())],
+    );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
     let created = request(
@@ -1740,6 +1913,7 @@ for line in sys.stdin:
         .as_str()
         .unwrap()
         .to_string();
+    let terminal = &created["result"]["root_pane"]["terminal_id"];
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"ready", "method":"pane.send_input", "params":{
@@ -1754,16 +1928,34 @@ for line in sys.stdin:
         "env":{"HERDR_AGENT":"codex","FIXTURE_ACCOUNT":"selected-account","FIXTURE_REQUIRED":"1",
             "FIXTURE_PANE":pane,"FIXTURE_SESSION":uuid,"FIXTURE_REPORTED":reported}
     });
-    let started = request(
-        &api_socket,
-        serde_json::json!({"id":"start", "method":"agent.start_with_launcher", "params":{
-            "name":"launcher-handoff", "kind":"codex", "pane_id":pane, "args":args,"launcher":launcher}}),
-    );
-    assert_eq!(
-        started["result"]["type"], "agent_started_with_launcher",
-        "{started}"
-    );
-    assert_eq!(started["result"]["launcher"], launcher);
+    let mut params = serde_json::json!({
+        "name": "launcher-handoff", "kind": "codex", "pane_id": pane,
+        "args": args, "launcher": launcher,
+    });
+    let started = if let Some(id) = start_request_id {
+        params["start_request_id"] = serde_json::json!(id);
+        params["expected_terminal_id"] = terminal.clone();
+        let mut stream = UnixStream::connect(&api_socket).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": "lost-start", "method": "agent.start_with_launcher_tracked", "params": params
+            })
+        )
+        .unwrap();
+        // Herdr gets the complete request, but the caller never reads its reply.
+        drop(stream);
+        None
+    } else {
+        let started = terminal_input(&api_socket, "agent.start_with_launcher", params.clone());
+        assert_eq!(
+            started["result"]["type"], "agent_started_with_launcher",
+            "{started}"
+        );
+        assert_eq!(started["result"]["launcher"], launcher);
+        Some(started)
+    };
     wait_for_file_contains(&receipt, "selected-account", Duration::from_secs(5));
     let receipt_before: serde_json::Value =
         serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
@@ -1779,10 +1971,19 @@ for line in sys.stdin:
         "id":"lookup", "method":"agent.launcher_info", "params":{"target":pane}}),
         )
     };
-    let token = started["result"]["launch_incarnation"]
+    let token = receipt_before[5]
         .as_str()
-        .expect("the start reply carries the launch incarnation")
-        .to_string();
+        .expect("the actual launcher received its attested launch token");
+    if let Some(started) = &started {
+        assert_eq!(started["result"]["launch_incarnation"], token);
+    }
+    let start_status = |request_id| {
+        terminal_input(
+            &api_socket,
+            "agent.start_status",
+            serde_json::json!({"start_request_id": request_id}),
+        )
+    };
     // The provider sends the report itself, from the launch's own process.
     let report = |seq: u64| {
         assert_ok(request(
@@ -1823,22 +2024,45 @@ for line in sys.stdin:
     report_from_elsewhere(1);
     let unattributed = lookup();
     assert_eq!(unattributed["result"]["confirmed"], false, "{unattributed}");
-    assert_eq!(
-        unattributed["result"]["agent"]["launch_incarnation"],
-        token.as_str()
-    );
+    assert_eq!(unattributed["result"]["agent"]["launch_incarnation"], token);
     report(2);
     let before = lookup();
     assert_eq!(before["result"]["confirmed"], true, "{before}");
     assert_eq!(
         before["result"]["binding"]["session_launch_incarnation"],
-        token.as_str()
+        token
     );
     assert_eq!(before["result"]["binding"]["launcher"], launcher);
-    assert_eq!(
-        before["result"]["binding"]["argv"],
-        started["result"]["argv"]
-    );
+    if let Some(started) = &started {
+        assert_eq!(
+            before["result"]["binding"]["argv"],
+            started["result"]["argv"]
+        );
+    }
+    if let Some(id) = start_request_id {
+        let observed = start_status(id);
+        assert_eq!(
+            observed["result"]["type"], "agent_start_status",
+            "{observed}"
+        );
+        assert_eq!(
+            observed["result"]["state"], "authorized_attested",
+            "{observed}"
+        );
+        assert_eq!(observed["result"]["start_request_id"], id);
+        assert_eq!(observed["result"]["terminal_id"], *terminal);
+        assert_eq!(observed["result"]["launch_incarnation"], token);
+        assert_eq!(observed["result"]["agent"]["terminal_id"], *terminal);
+        assert_eq!(observed["result"]["agent"]["pane_id"], pane);
+        assert_eq!(observed["result"]["agent"]["name"], "launcher-handoff");
+        assert_eq!(observed["result"]["agent"]["launch_incarnation"], token);
+        assert_eq!(observed["result"]["agent"]["agent_session"]["value"], uuid);
+        assert_eq!(
+            terminal_input(&api_socket, "agent.start_with_launcher_tracked", params)["error"]
+                ["code"],
+            "start_request_already_recorded"
+        );
+    }
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"input-before", "method":"pane.send_input", "params":{
@@ -1869,7 +2093,7 @@ for line in sys.stdin:
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let observed = lookup();
-        if observed["result"]["agent"]["launch_incarnation"] == token.as_str() {
+        if observed["result"]["agent"]["launch_incarnation"] == token {
             break;
         }
         assert!(
@@ -1882,6 +2106,19 @@ for line in sys.stdin:
     let confirmed = lookup();
     assert_eq!(confirmed["result"]["confirmed"], true, "{confirmed}");
     assert_eq!(confirmed["result"]["binding"], before["result"]["binding"]);
+    if let Some(id) = start_request_id {
+        let observed = start_status(id);
+        if confirmed["result"]["agent"]["terminal_id"] == *terminal {
+            assert_eq!(
+                observed["result"]["state"], "authorized_attested",
+                "{observed}"
+            );
+            assert_eq!(observed["result"]["launch_incarnation"], token);
+        } else {
+            // The continuing process alone cannot vouch for the original terminal.
+            assert_eq!(observed["result"]["state"], "unknown", "{observed}");
+        }
+    }
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"input-after", "method":"pane.send_input", "params":{
