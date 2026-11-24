@@ -274,9 +274,13 @@ it.
 
 - Release binaries: Linux x86_64 and aarch64, macOS x86_64 and aarch64, and
   Windows x86_64 (a zip with `herdr.exe` and its ConPTY runtime).
-- Windows runs natively through ConPTY. The current draft calls it generally
-  available, with listed gaps: plugins are in preview, and direct terminal
-  attach and live handoff are not supported.
+- Windows runs natively through ConPTY. Windows support was a beta
+  ("experimental beta") through release 0.8.0, which is why its docs page is
+  still `windows-beta`. From 0.8.2 on, and in the current draft, the docs call
+  it generally available, with listed gaps: plugins are in preview; live cwd
+  after `cd`, IME anchoring and host cursor rendering are partial; Kitty
+  graphics depends on the outer terminal; direct terminal attach and live
+  handoff are not supported.
 - Install with `curl -fsSL https://herdr.dev/install.sh | sh`,
   `brew install herdr`, `mise use -g herdr`, the PowerShell installer on
   Windows, Nix, or a manual binary download.
